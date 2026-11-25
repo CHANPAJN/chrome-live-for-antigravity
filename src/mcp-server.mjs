@@ -46,50 +46,6 @@ const MCP_TOOLS = [
     }
   },
   {
-    name: 'chrome_live_ui_action',
-    title: 'Chrome Live UI Action',
-    description:
-      'App-only interactive callback endpoint used exclusively by the Chrome Live MCP App UI (hidden from the model).',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        tabId: { type: 'integer' },
-        action: {
-          type: 'string',
-          enum: [
-            'poll',
-            'screenshot',
-            'focus_tab',
-            'release_tab',
-            'relay_popout',
-            'relay_merge',
-            'remote_click',
-            'remote_wheel',
-            'remote_type',
-            'inspect_region'
-          ]
-        },
-        lastFrameTs: { type: 'number' },
-        rx: { type: 'number' },
-        ry: { type: 'number' },
-        rx1: { type: 'number' },
-        ry1: { type: 'number' },
-        rx2: { type: 'number' },
-        ry2: { type: 'number' },
-        deltaY: { type: 'number' },
-        text: { type: 'string' },
-        submit: { type: 'boolean' }
-      },
-      required: ['action'],
-      additionalProperties: false
-    },
-    _meta: {
-      ui: {
-        visibility: ['app']
-      }
-    }
-  },
-  {
     name: 'chrome_live_workspace',
     title: 'Chrome Live Console',
     description:
@@ -666,13 +622,6 @@ async function invokeTool(toolName, args, callDaemon) {
           structuredContent: sc
         }
       };
-    }
-    case 'chrome_live_ui_action':
-    case 'chrome_live_app_action': {
-      return await executeMonitorAppAction(args, callDaemon);
-    }
-    case 'chrome_live_app_poll': {
-      return await executeMonitorAppAction({ ...args, action: 'poll' }, callDaemon);
     }
     case 'chrome_live_status':
       return await callDaemon('GET', '/api/health');

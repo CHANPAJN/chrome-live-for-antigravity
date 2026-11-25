@@ -7,6 +7,8 @@ const MAX_SITES = 120;
 const MAX_ROUTES_PER_SITE = 18;
 const MAX_TIPS_PER_SITE = 12;
 const MAX_SELECTORS_PER_SITE = 12;
+const SENSITIVE_SELECTOR_RX =
+  /(?:password|passwd|passcode|pwd|one-time|otp|2fa|totp|cvv|cvc|secret|pin|token)/i;
 
 // Strip tracking noise AND sensitive auth/session query parameters before persisting locally
 const STRIP_QUERY_PATTERNS = [
@@ -283,9 +285,6 @@ export function learnFromPageVisit({ url, title, elements = [] } = {}) {
     changed = true;
   }
 
-const SENSITIVE_SELECTOR_RX =
-  /(?:password|passwd|passcode|pwd|one-time|otp|2fa|totp|cvv|cvc|secret|pin|token)/i;
-
   // Persist stable ID/name selectors if provided by snapshot (skip sensitive credential fields)
   if (Array.isArray(elements)) {
     for (const el of elements) {
@@ -377,6 +376,9 @@ export function saveManualPlaybook({ domain: rawDomain, route, tip, tipIndex, se
   if (selector && typeof selector === 'object' && selector.name && selector.css) {
     const name = String(selector.name).trim().slice(0, 48);
     const css = String(selector.css).trim().slice(0, 140);
+    if (SENSITIVE_SELECTOR_RX.test(name) || SENSITIVE_SELECTOR_RX.test(css)) {
+      throw new Error('Refusing to store sensitive password/OTP/token selector in playbook');
+    }
     if (selector.oldName && selector.oldName !== name && selector.oldName in bucket.selectors) {
       delete bucket.selectors[selector.oldName];
     }

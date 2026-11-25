@@ -1213,6 +1213,11 @@ async function executeBridgeRpc(method, params) {
 
   if (method === 'relay_popout') {
     const entry = resolveTargetEntry(params.tabId);
+    if (entry.paused && !entry.relayPopoutWinId) {
+      throw new Error(
+        'Tab automation is currently paused by user; resume inside Chrome before opening a relay window.'
+      );
+    }
     return await popoutRelayTab(entry, params.focus !== false);
   }
 
@@ -1654,7 +1659,31 @@ async function executeBridgeRpc(method, params) {
                 }
                 const root =
                   document.querySelector('article, main, [role="main"]') || document.body;
-                const SKIP_TAGS = new Set(['STYLE', 'SCRIPT', 'NOSCRIPT', 'TEMPLATE', 'SVG']);
+                const SKIP_TAGS = new Set([
+                  'STYLE',
+                  'SCRIPT',
+                  'NOSCRIPT',
+                  'TEMPLATE',
+                  'SVG',
+                  'TEXTAREA',
+                  'SELECT',
+                  'OPTION'
+                ]);
+                const SKIP_CLOSEST =
+                  'style, script, noscript, template, textarea, select, [contenteditable="true"], [hidden], [aria-hidden="true"], [data-chrome-live-hud]';
+                const visCache = new WeakMap();
+                const isElemVisible = (el) => {
+                  if (visCache.has(el)) return visCache.get(el);
+                  let v = true;
+                  if (typeof el.checkVisibility === 'function') {
+                    v = el.checkVisibility({ checkVisibilityCSS: true });
+                  } else {
+                    const cs = window.getComputedStyle(el);
+                    v = cs.display !== 'none' && cs.visibility !== 'hidden';
+                  }
+                  visCache.set(el, v);
+                  return v;
+                };
                 let text = '';
                 if (root) {
                   const parts = [];
@@ -1664,7 +1693,7 @@ async function executeBridgeRpc(method, params) {
                   while ((node = walker.nextNode())) {
                     const p = node.parentElement;
                     if (!p) continue;
-                    if (SKIP_TAGS.has(p.tagName) || p.closest('style, script, noscript, template, [data-chrome-live-hud]')) {
+                    if (SKIP_TAGS.has(p.tagName) || p.closest(SKIP_CLOSEST) || !isElemVisible(p)) {
                       continue;
                     }
                     const chunk = node.nodeValue || '';
@@ -1887,7 +1916,31 @@ async function executeBridgeRpc(method, params) {
         const alerts = Array.from(alertSet);
 
         const mainRoot = document.querySelector('main, article, [role="main"]') || document.body;
-        const SKIP_TAGS = new Set(['STYLE', 'SCRIPT', 'NOSCRIPT', 'TEMPLATE', 'SVG']);
+        const SKIP_TAGS = new Set([
+          'STYLE',
+          'SCRIPT',
+          'NOSCRIPT',
+          'TEMPLATE',
+          'SVG',
+          'TEXTAREA',
+          'SELECT',
+          'OPTION'
+        ]);
+        const SKIP_CLOSEST =
+          'style, script, noscript, template, textarea, select, [contenteditable="true"], [hidden], [aria-hidden="true"], [data-chrome-live-hud]';
+        const visCache = new WeakMap();
+        const isElemVisible = (el) => {
+          if (visCache.has(el)) return visCache.get(el);
+          let v = true;
+          if (typeof el.checkVisibility === 'function') {
+            v = el.checkVisibility({ checkVisibilityCSS: true });
+          } else {
+            const cs = window.getComputedStyle(el);
+            v = cs.display !== 'none' && cs.visibility !== 'hidden';
+          }
+          visCache.set(el, v);
+          return v;
+        };
         let excerpt = '';
         if (mainRoot) {
           const parts = [];
@@ -1897,7 +1950,7 @@ async function executeBridgeRpc(method, params) {
           while ((tNode = walker.nextNode())) {
             const p = tNode.parentElement;
             if (!p) continue;
-            if (SKIP_TAGS.has(p.tagName) || p.closest('style, script, noscript, template, [data-chrome-live-hud]')) {
+            if (SKIP_TAGS.has(p.tagName) || p.closest(SKIP_CLOSEST) || !isElemVisible(p)) {
               continue;
             }
             const v = tNode.nodeValue || '';
@@ -3017,26 +3070,29 @@ async function autoMergeClosedRelayTab(closedEntry) {
 
   const isWorker = closedEntry.substate === 'worker';
   if (isWorker) {
-    await placeInBackgroundTabGroup(created.id, targetWindowId, true, 'cyan', tr().groupTitle);
+    await placeInBackgroundTabGroup(created.id, targetWindowId, false, 'yellow', tr().groupPaused);
   } else if (prevOriginGroupId >= 0) {
     await chrome.tabs
       .group({ tabIds: [created.id], groupId: prevOriginGroupId })
       .catch(async () => {
-        await placeInBackgroundTabGroup(created.id, targetWindowId, false, 'cyan', tr().groupTitle);
+        await placeInBackgroundTabGroup(created.id, targetWindowId, false, 'yellow', tr().groupPaused);
       });
   } else {
-    await placeInBackgroundTabGroup(created.id, targetWindowId, false, 'cyan', tr().groupTitle);
+    await placeInBackgroundTabGroup(created.id, targetWindowId, false, 'yellow', tr().groupPaused);
   }
 
+  // Closing a paused relay window MUST preserve `paused: true` (and capture zero frames) until the user explicitly clicks Resume
   const restoredActivity =
-    currentLang === 'zh' ? '副屏已关闭 · 自动归队交还 AI' : 'Relay closed · Auto-merged back';
+    currentLang === 'zh'
+      ? '副屏已关闭 · 已归队（仍暂停，点继续恢复 AI）'
+      : 'Relay closed · Merged back (Paused · Click Resume in Chrome)';
   const restoredEntry = {
     tabId: created.id,
     substate: isWorker ? 'worker' : 'shared',
-    uiMode: 'working',
+    uiMode: 'paused',
     attachedCdp: false,
     screencastActive: false,
-    paused: false,
+    paused: true,
     title: created.title || closedEntry.title || '',
     url: created.url || restoreUrl,
     activity: restoredActivity,
@@ -3059,15 +3115,15 @@ async function autoMergeClosedRelayTab(closedEntry) {
   restoredEntry.url = updatedTab.url || restoredEntry.url;
   await syncHud(created.id, {
     visible: true,
-    mode: 'working',
+    mode: 'paused',
     activity: restoredEntry.activity
   });
   await syncLiveTabGroups();
-  await captureQuickFrame(created.id, restoredEntry);
   pushLocalAudit('relay_auto_merge', {
     previousTabId: closedEntry.tabId,
     tabId: created.id,
-    url: restoredEntry.url
+    url: restoredEntry.url,
+    paused: true
   });
   notifyPanelAndDaemon();
 }
@@ -3137,8 +3193,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
-    if (!msg || typeof msg.type !== 'string') {
-      sendResponse({ ok: false });
+    if (!msg || typeof msg.type !== 'string' || !sender || sender.id !== chrome.runtime.id) {
+      sendResponse({ ok: false, error: 'Invalid or unauthorized sender' });
       return;
     }
     if (msg.type === 'hud:user_event') {
@@ -3171,6 +3227,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       sendResponse({ ok: true });
       return;
+    }
+    // Enforce strict extension-page origin isolation: content scripts (`sender.tab`) MUST NEVER access `panel:*` RPCs or pairing tokens
+    if (msg.type.startsWith('panel:')) {
+      const expectedPanelPrefix = chrome.runtime.getURL('panel/');
+      if (sender.tab || typeof sender.url !== 'string' || !sender.url.startsWith(expectedPanelPrefix)) {
+        sendResponse({ ok: false, error: 'Unauthorized sender: extension panel context required' });
+        return;
+      }
     }
     if (msg.type === 'panel:get_state') {
       let playbook = { enabled: false, siteCount: 0 };

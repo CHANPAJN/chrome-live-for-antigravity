@@ -815,6 +815,7 @@
       };
 
       const onPauseClick = (ev) => {
+        if (!ev.isTrusted) return;
         ev.stopPropagation();
         if (selfDestructIfOrphan()) return;
         this._cancelHoldUnlock();
@@ -828,6 +829,7 @@
       };
 
       const onCloseAskClick = (ev) => {
+        if (!ev.isTrusted) return;
         ev.stopPropagation();
         if (selfDestructIfOrphan()) return;
         this._cancelHoldUnlock();
@@ -844,6 +846,7 @@
       };
 
       const onCancelConfirmClick = (ev) => {
+        if (!ev.isTrusted) return;
         ev.stopPropagation();
         if (selfDestructIfOrphan()) return;
         this._clearConfirmState();
@@ -851,6 +854,7 @@
       };
 
       const onConfirmReleaseClick = (ev) => {
+        if (!ev.isTrusted) return;
         ev.stopPropagation();
         if (selfDestructIfOrphan()) return;
         this._cancelHoldUnlock();
@@ -865,6 +869,7 @@
       let holdingPointerId = null;
 
       const onShieldPointerDown = (ev) => {
+        if (!ev.isTrusted) return;
         if (selfDestructIfOrphan()) return;
         ev.preventDefault();
         ev.stopPropagation();

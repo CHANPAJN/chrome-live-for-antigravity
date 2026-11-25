@@ -994,8 +994,8 @@ test('Multi-tab concurrency & form-state regressions: per-tab frame isolation, A
   assert.match(swSource, /Element is disabled:/);
   assert.match(swSource, /let fuzzyMatch = null/);
 
-  // 4. Clean text extraction strips inline <style>/<script> nodes via TreeWalker
-  assert.match(swSource, /new Set\(\['STYLE', 'SCRIPT', 'NOSCRIPT', 'TEMPLATE', 'SVG'\]\)/);
+  // 4. Clean text extraction strips inline <style>/<script> as well as <textarea>/<select>/<option> via TreeWalker
+  assert.match(swSource, /'STYLE',\s*'SCRIPT',\s*'NOSCRIPT',\s*'TEMPLATE',\s*'SVG',\s*'TEXTAREA',\s*'SELECT',\s*'OPTION'/);
   assert.match(swSource, /document\.createTreeWalker/);
 
   // 5. Daemon stores single binary buffer per frame (no duplicate base64 copy) with bounded cache
@@ -1236,6 +1236,42 @@ test('Security audit hardening: mutual HTTP/WS HMAC, replay defense, runtime boo
     assert.equal('User Password' in pbEntry.selectors, false);
     assert.equal('OTP Code' in pbEntry.selectors, false);
 
+    // Manual playbook save also rejects password/OTP/token selectors
+    const manualSensitiveSel = await httpJson(
+      port,
+      'POST',
+      '/api/playbook',
+      { token: testToken },
+      {
+        action: 'save',
+        domain: 'portal.example.com',
+        selector: { name: 'Login Password', css: '#password' }
+      }
+    );
+    assert.equal(manualSensitiveSel.statusCode, 500);
+    assert.match(manualSensitiveSel.json.error, /sensitive/i);
+
+    // Outgoing state & command results redact sensitive query params (?token= / ?code= / ?access_token=)
+    extWs.sendMaskedJson({
+      type: 'status_sync',
+      tabs: [
+        {
+          tabId: 301,
+          substate: 'shared',
+          paused: false,
+          title: 'OAuth Callback',
+          url: 'https://portal.example.com/oauth/cb?page=2&code=secret_oauth_code&access_token=tok_999'
+        }
+      ],
+      activeTabId: 301
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    const redactedState = await httpJson(port, 'GET', '/api/state', { token: testToken });
+    const tabUrlOut = redactedState.json.tabs[0].url;
+    assert.ok(!tabUrlOut.includes('secret_oauth_code'), 'Public state must redact OAuth code');
+    assert.ok(!tabUrlOut.includes('tok_999'), 'Public state must redact access_token');
+    assert.ok(tabUrlOut.includes('page=2'), 'Public state preserves benign query params');
+
     extWs.socket.destroy();
   } finally {
     await daemon.close();
@@ -1368,4 +1404,59 @@ test('Security audit hardening: mutual HTTP/WS HMAC, replay defense, runtime boo
   assert.equal(browserGestureEntry.paused, false);
   assert.equal(browserGestureEntry.uiMode, 'working');
   assert.equal(capturedFrameCount, 1);
+
+  // Closing a standalone relay window (`autoMergeClosedRelayTab`) MUST preserve paused=true and capture 0 frames
+  const autoMergeFnMatch = swSource.match(/async function autoMergeClosedRelayTab\(closedEntry\)[\s\S]*?\n\}/);
+  assert.ok(autoMergeFnMatch, 'Expected autoMergeClosedRelayTab in service-worker.js');
+  const tempManaged = new Map();
+  let autoMergeCaptured = 0;
+  const runAutoMergeHarness = vm.runInNewContext(`(${autoMergeFnMatch[0]})`, {
+    currentLang: 'en',
+    managedTabs: tempManaged,
+    checkTabUrlAllowed: () => ({ allowed: true }),
+    tr: () => ({ groupTitle: 'Live', groupPaused: 'Paused' }),
+    chrome: {
+      windows: {
+        get: async (id) => ({ id, type: 'normal' }),
+        getAll: async () => [{ id: 1, type: 'normal' }]
+      },
+      tabs: {
+        query: async () => [],
+        create: async (props) => ({ id: 555, url: props.url, title: 'Restored' }),
+        get: async (id) => ({ id, url: 'https://example.com/login', title: 'Restored' }),
+        group: async () => {}
+      }
+    },
+    placeInBackgroundTabGroup: async () => {},
+    waitForTabComplete: async () => {},
+    detachManagedTab: async () => {},
+    syncHud: async () => {},
+    syncLiveTabGroups: async () => {},
+    captureQuickFrame: async () => {
+      autoMergeCaptured += 1;
+    },
+    pushLocalAudit: () => {},
+    notifyPanelAndDaemon: () => {}
+  });
+  await runAutoMergeHarness({
+    tabId: 99,
+    substate: 'shared',
+    paused: true,
+    url: 'https://example.com/login',
+    originWindowId: 1,
+    originIndex: 0,
+    relayPopoutWinId: 888
+  });
+  const restored = tempManaged.get(555);
+  assert.ok(restored, 'Expected restored tab entry');
+  assert.equal(restored.paused, true, 'Closing relay window must keep restored tab paused');
+  assert.equal(restored.uiMode, 'paused');
+  assert.equal(autoMergeCaptured, 0, 'Closing paused relay window must not capture frames');
+
+  // Verify extension panel sender isolation, HUD isTrusted guard, and TreeWalker draft/hidden exclusions
+  assert.match(swSource, /const expectedPanelPrefix = chrome\.runtime\.getURL\('panel\/'\);/);
+  assert.match(swSource, /if \(sender\.tab \|\| typeof sender\.url !== 'string' \|\| !sender\.url\.startsWith\(expectedPanelPrefix\)\)/);
+  assert.match(swSource, /\[contenteditable="true"\], \[hidden\], \[aria-hidden="true"\]/);
+  const hudSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'hud.js'), 'utf8');
+  assert.match(hudSource, /if \(!ev\.isTrusted\) return;/);
 });

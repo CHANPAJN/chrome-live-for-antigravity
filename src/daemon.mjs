@@ -61,13 +61,31 @@ function isAllowedHostHeader(hostHeader, boundPort) {
   );
 }
 
-function resolveAllowedExtensionOrigin(originHeader) {
+function parseValidExtensionOrigin(originHeader) {
   if (!originHeader) return null;
   const trimmed = String(originHeader).trim();
   if (/^chrome-extension:\/\/[a-p]{32}$/i.test(trimmed)) {
-    return trimmed;
+    return trimmed.toLowerCase();
   }
   return null;
+}
+
+function redactPayloadUrls(node, depth = 0) {
+  if (!node || typeof node !== 'object' || depth > 5) return node;
+  if (Array.isArray(node)) {
+    return node.map((item) => redactPayloadUrls(item, depth + 1));
+  }
+  const out = {};
+  for (const [k, v] of Object.entries(node)) {
+    if ((k === 'url' || k === 'pageUrl' || k === 'finalUrl') && typeof v === 'string') {
+      out[k] = redactUrlForAudit(v);
+    } else if (v && typeof v === 'object' && !Buffer.isBuffer(v)) {
+      out[k] = redactPayloadUrls(v, depth + 1);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
 }
 
 function readRawBody(req) {
@@ -105,10 +123,20 @@ export function createDaemonServer(options = {}) {
   const authToken = options.token || ensureAuthToken();
 
   let extensionPeer = null;
+  let pairedExtensionOrigin = null;
   const liveViewPeers = new Set();
   const upgradeSockets = new Set();
   const pendingRpc = new Map();
   const auditLog = [];
+
+  function resolveAllowedExtensionOrigin(originHeader) {
+    const parsedOrigin = parseValidExtensionOrigin(originHeader);
+    if (!parsedOrigin) return null;
+    if (pairedExtensionOrigin && parsedOrigin !== pairedExtensionOrigin) {
+      return null;
+    }
+    return String(originHeader).trim();
+  }
 
   const MAX_TAB_FRAMES = 6;
 
@@ -200,13 +228,19 @@ export function createDaemonServer(options = {}) {
       connectedAt: state.connectedAt,
       updatedAt: state.updatedAt,
       activeTabId: state.activeTabId,
-      tabs: state.tabs,
+      tabs: Array.isArray(state.tabs)
+        ? state.tabs.map((t) =>
+            t && typeof t === 'object' && typeof t.url === 'string'
+              ? { ...t, url: redactUrlForAudit(t.url) }
+              : t
+          )
+        : [],
       hasFrame: Boolean(state.latestFrame),
       latestFrameMeta: state.latestFrame
         ? {
             tabId: state.latestFrame.tabId,
             title: state.latestFrame.title,
-            url: state.latestFrame.url,
+            url: redactUrlForAudit(state.latestFrame.url),
             activity: state.latestFrame.activity,
             capturedAt: state.latestFrame.capturedAt
           }
@@ -622,7 +656,7 @@ export function createDaemonServer(options = {}) {
           url: params.url ?? undefined,
           label: params.label ?? params.summary ?? undefined
         });
-        sendJson(req, res, 200, { ok: true, result });
+        sendJson(req, res, 200, { ok: true, result: redactPayloadUrls(result) });
         return;
       }
 
@@ -684,6 +718,10 @@ export function createDaemonServer(options = {}) {
 
     const attachAuthenticatedPeer = (authPayload = null) => {
       if (pathname === '/ws/extension') {
+        const verifiedOrigin = parseValidExtensionOrigin(req.headers.origin);
+        if (verifiedOrigin) {
+          pairedExtensionOrigin = verifiedOrigin;
+        }
         // Extension has persisted the pairing token into chrome.storage.local; shred any leftover bootstrap file
         consumeAndShredLocalRuntimeBootstrap();
         if (extensionPeer && !extensionPeer.closed) {
