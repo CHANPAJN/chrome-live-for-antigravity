@@ -2,7 +2,7 @@ export const INLINE_MONITOR_URI = 'ui://chrome-live/live-monitor.html';
 
 export function buildInlineMonitorHtml() {
   return `<!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -421,30 +421,30 @@ export function buildInlineMonitorHtml() {
         <span id="subEl" class="meta-sub"></span>
       </div>
       <div class="btn-row">
-        <button id="remoteBtn" type="button" disabled title="直接在画面上点击、滚轮或输入文字">
+        <button id="remoteBtn" type="button" disabled title="Click, scroll, or type directly on the live stream">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 2.5L12.5 7.5L8.4 8.8L6.8 12.8L3.5 2.5Z"/></svg>
-          <span class="lbl">接管</span>
+          <span class="lbl">Control</span>
         </button>
-        <button id="regionBtn" type="button" disabled title="单击或拖拽框选网页元素提取选择器">
+        <button id="regionBtn" type="button" disabled title="Click or drag to pick page elements and extract selectors">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 5V3.5a1 1 0 0 1 1-1H5M11 2.5h1.5a1 1 0 0 1 1 1V5M13.5 11v1.5a1 1 0 0 1-1 1H11M5 13.5H3.5a1 1 0 0 1-1-1V11"/></svg>
-          <span class="lbl">圈选</span>
+          <span class="lbl">Pick</span>
         </button>
-        <button id="attachBtn" type="button" disabled style="display:none" title="将当前网页标题与网址挂入下一条对话上下文">
+        <button id="attachBtn" type="button" disabled style="display:none" title="Attach the current page title and URL to the next prompt">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.5 4.5l-4.6 4.6a1.5 1.5 0 1 0 2.1 2.1l5-5a2.8 2.8 0 0 0-4-4l-5.3 5.3a4 4 0 0 0 5.7 5.7l4.3-4.3"/></svg>
-          <span class="lbl">挂入</span>
+          <span class="lbl">Attach</span>
         </button>
         <span class="btn-sep"></span>
-        <button id="relayBtn" type="button" data-relay="popout" disabled title="弹出独立副屏窗口人工操作，完成后一键归队">
+        <button id="relayBtn" type="button" data-relay="popout" disabled title="Pop out into a standalone window for manual login/2FA, then merge back">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 3.5H3.5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V9.5M9.5 2.5h4v4M13.5 2.5L7.5 8.5"/></svg>
-          <span class="lbl">副屏</span>
+          <span class="lbl">Popout</span>
         </button>
-        <button id="snapBtn" type="button" title="立即抓取当前最新画面">
+        <button id="snapBtn" type="button" title="Capture a fresh frame now">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13 8a5 5 0 1 1-1.3-3.4M13 2.8v2.6h-2.6"/></svg>
-          <span class="lbl">刷新</span>
+          <span class="lbl">Refresh</span>
         </button>
-        <button id="releaseBtn" type="button" disabled title="解除 AI 接管并保留该网页">
+        <button id="releaseBtn" type="button" disabled title="Release AI control while keeping this tab open">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3H3.5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1H6M10.5 11l3-3-3-3M13.5 8H6.5"/></svg>
-          <span class="lbl">释放</span>
+          <span class="lbl">Release</span>
         </button>
       </div>
     </div>
@@ -453,23 +453,23 @@ export function buildInlineMonitorHtml() {
 
     <div id="statusBar" class="status-banner" data-open="false" data-kind="info">
       <span id="statusMsg" class="status-msg"></span>
-      <button id="sendCtxNowBtn" class="action-btn" type="button" style="display:none">发给 AI</button>
+      <button id="sendCtxNowBtn" class="action-btn" type="button" style="display:none">Send to AI</button>
     </div>
 
     <div id="remoteBar" class="bottom-drawer">
-      <input id="remoteInput" type="text" class="remote-input" placeholder="输入验证码或文字发往网页当前输入框..." />
-      <button id="sendTypeBtn" class="action-btn" type="button">填入</button>
-      <button id="sendSubmitBtn" class="action-btn" type="button">填入并回车</button>
+      <input id="remoteInput" type="text" class="remote-input" placeholder="Type text or verification code to send to the active field..." />
+      <button id="sendTypeBtn" class="action-btn" type="button">Type</button>
+      <button id="sendSubmitBtn" class="action-btn" type="button">Type &amp; Enter</button>
     </div>
 
     <div id="regionBar" class="bottom-drawer">
-      <span id="regionText" class="region-summary">在下方画面单击或拖拽框选任意区域，自动提取内部元素</span>
-      <button id="askAiBtn" class="action-btn" type="button" style="display:none">发给 AI 处理</button>
+      <span id="regionText" class="region-summary">Click or drag anywhere on the stream to extract DOM selectors</span>
+      <button id="askAiBtn" class="action-btn" type="button" style="display:none">Ask AI</button>
     </div>
 
     <div id="viewport" class="viewport">
       <img id="screenImg" alt="Chrome Live Stream" />
-      <div id="emptyEl" class="empty-box">正在连接本地 Chrome 实时画面...</div>
+      <div id="emptyEl" class="empty-box">Connecting to local Chrome Live stream...</div>
       <div id="selectBox" class="select-box"></div>
       <span id="hudChip" class="hud-chip">LIVE · 0 Token</span>
     </div>
@@ -478,6 +478,7 @@ export function buildInlineMonitorHtml() {
   <script>
     (() => {
       const IS_ZH = /^zh\\b/i.test(navigator.language || '');
+      document.documentElement.lang = IS_ZH ? 'zh-CN' : 'en';
       const L = IS_ZH
         ? {
             remote: '接管',
@@ -488,6 +489,18 @@ export function buildInlineMonitorHtml() {
             relayBack: '归队',
             snap: '刷新',
             release: '释放',
+            remoteTitle: '直接在画面上点击、滚轮或输入文字',
+            regionTitle: '单击或拖拽框选网页元素提取选择器',
+            attachTitle: '将当前网页标题与网址挂入下一条对话上下文',
+            relayTitle: '弹出独立副屏窗口人工操作，完成后一键归队',
+            snapTitle: '立即抓取当前最新画面',
+            releaseTitle: '解除 AI 接管并保留该网页',
+            remotePlaceholder: '输入验证码或文字发往网页当前输入框...',
+            sendType: '填入',
+            sendSubmit: '填入并回车',
+            regionHint: '在下方画面单击或拖拽框选任意区域，自动提取内部元素',
+            askAi: '发给 AI 处理',
+            connecting: '正在连接本地 Chrome 实时画面...',
             offline: '本地桥接未响应',
             idle: '主 Chrome 在线 · 按 Alt+Shift+L 共享网页或直接派发任务即可在此实时同屏',
             active: '实时同屏中',
@@ -507,6 +520,18 @@ export function buildInlineMonitorHtml() {
             relayBack: 'Merge',
             snap: 'Refresh',
             release: 'Release',
+            remoteTitle: 'Click, scroll, or type directly on the live stream',
+            regionTitle: 'Click or drag to pick page elements and extract selectors',
+            attachTitle: 'Attach the current page title and URL to the next prompt',
+            relayTitle: 'Pop out into a standalone window for manual login/2FA, then merge back',
+            snapTitle: 'Capture a fresh frame now',
+            releaseTitle: 'Release AI control while keeping this tab open',
+            remotePlaceholder: 'Type text or verification code to send to the active field...',
+            sendType: 'Type',
+            sendSubmit: 'Type & Enter',
+            regionHint: 'Click or drag anywhere on the stream to extract DOM selectors',
+            askAi: 'Ask AI',
+            connecting: 'Connecting to local Chrome Live stream...',
             offline: 'Bridge offline',
             idle: 'Chrome connected · Share a tab (Alt+Shift+L) or run a browser task to stream live here',
             active: 'Streaming live',
@@ -557,6 +582,18 @@ export function buildInlineMonitorHtml() {
       setBtnLabel(relayBtn, L.relayOut);
       setBtnLabel(snapBtn, L.snap);
       setBtnLabel(releaseBtn, L.release);
+      remoteBtn.title = L.remoteTitle;
+      regionBtn.title = L.regionTitle;
+      attachBtn.title = L.attachTitle;
+      relayBtn.title = L.relayTitle;
+      snapBtn.title = L.snapTitle;
+      releaseBtn.title = L.releaseTitle;
+      remoteInput.placeholder = L.remotePlaceholder;
+      sendTypeBtn.textContent = L.sendType;
+      sendSubmitBtn.textContent = L.sendSubmit;
+      regionText.textContent = L.regionHint;
+      askAiBtn.textContent = L.askAi;
+      emptyEl.textContent = L.connecting;
       sendCtxNowBtn.textContent = IS_ZH ? '发给 AI' : 'Send to AI';
 
       let rpcSeq = 1;
