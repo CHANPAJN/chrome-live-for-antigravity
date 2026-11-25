@@ -1,52 +1,51 @@
-# Chrome Live (for Antigravity)
+<div align="center">
 
-[![Cross-Platform CI](https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml/badge.svg)](https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml) · [中文文档](./README.zh-CN.md) · **GPL-3.0** · **Zero Dependencies**
+# chrome-live-for-antigravity
 
-> Independent community project. Not affiliated with or endorsed by Google LLC or Meta Platforms, Inc.
+Zero-dependency Chrome MV3 bridge and native **Antigravity MCP App (`SEP-1865`)** for Windows, macOS, and Linux.  
+Connect **Google Antigravity** directly to your everyday signed-in Chrome or Edge browser — 0-token live preview in chat, anti-misclick lock, color-coded tab groups, standalone human-relay popout, and single-roundtrip `batch` automation with zero third-party npm packages.
 
-Connect Antigravity directly to your everyday signed-in Chrome or Edge browser—no blank sandbox profiles, no repeated login loops, and no third-party npm packages.
-
-<p align="center">
-  <img src="./docs/real-dual-demo.gif" alt="Chrome Live for Antigravity demo" width="880" />
+<p>
+  <b>English</b> ·
+  <a href="./README.zh-CN.md">简体中文</a>
 </p>
+
+<p>
+  <a href="https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml"><img src="https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml/badge.svg" alt="Cross-Platform CI" /></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="GPL-3.0 License" /></a>
+  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Dependencies-Zero%20(Node%20%3E%3D%2020)-2F855A?style=flat-square" alt="Zero Dependencies" /></a>
+  <a href="https://linux.do"><img src="https://img.shields.io/badge/Community-LINUX%20DO-1C1C1E?style=flat-square&logo=linux&logoColor=34D399" alt="LINUX DO Community" /></a>
+</p>
+
+<img src="./docs/real-dual-demo.gif" width="840" alt="chrome-live-for-antigravity Live Demo" />
+
+<sub>Independent community project. Not affiliated with or endorsed by Google LLC.</sub>
+
+</div>
 
 <details>
 <summary>View raw 1:1 Chrome window + live CLI capture</summary>
 <p align="center">
-  <img src="./docs/real-demo.gif" alt="Real Chrome window driven by CLI" width="880" />
+  <img src="./docs/real-demo.gif" width="840" alt="Real Chrome window driven by CLI" />
 </p>
 </details>
 
----
+## Features
 
-## Why I Built This
+- **Signed-In Tab Reuse & Anti-Misclick Lock**: Press `Alt+Shift+L` (`Option+Shift+L` on macOS) to share the active tab with Antigravity without blank headless profiles or repeated login loops. A transparent lock shield (`not-allowed` circle-slash cursor) prevents accidental clicks while the agent works; click **Pause** on the bottom floating HUD or hold left-click for 3 seconds to take over anytime. Running `done` detaches the debugger without closing your shared tab.
+- **Color-Coded Tab Groups & Auto-Collapse**: Active AI tabs sit inside a cyan **`Live · Active`** tab group, and background research tabs auto-collapse into a compact pill without stealing window focus. Pausing, holding left-click for 3 seconds, or popping out a relay window immediately switches the tab group and page border to yellow **`Live · Paused`** so control state is unmistakable.
+- **0-Token Live Preview in Antigravity (`SEP-1865`)**: Streams live frames inline in chat (`chrome_live_monitor`), docked in the side pane, or full-page in the sidebar (`chrome_live_workspace`) without burning model tokens. The toolbar includes 6 direct controls:
+  - **Control**: Click, scroll, and type directly on the live frame;
+  - **Pick**: Drag a box on the stream to extract real DOM selectors (traversing open Shadow DOM) straight into chat;
+  - **Attach**: Push the current tab's title, URL, and `tabId` into the next prompt via `ui/update-model-context`;
+  - **Popout / Merge**: Pop a controlled tab out into a standalone window for manual QR login, 2FA, or verification, then merge it back to its original tab index to resume AI control;
+  - **Refresh / Release**: Pull a fresh frame immediately or detach control on demand.
+- **Human-Like Motion, Single-Roundtrip `batch` & Clean Extraction**: Pointer movements follow Bezier curves with approach deceleration and staggered typing cadence. Pipe `open -> type -> click -> wait -> snapshot -> done` through stdin in a single turn, extract clean text and full-res image URLs across multiple background tabs via `extract`, and inspect `{DISABLED}`, `{checked}`, `{selected}`, `{expanded}`, and validation alerts through open Shadow DOM.
+- **Opt-In Local Site Playbooks (`playbook on`, Off by Default)**: Disabled (`false`) out of the box. When enabled in the extension side panel or via CLI, stores sanitized deep-link routes, stable CSS selectors, and widget tips locally in `~/.chrome-live-antigravity/site-playbooks.json` (`0600`) so repeat visits skip landing-page discovery.
 
-Running browser tasks through headless Playwright or sandboxed MCP servers gets frustrating quickly:
+## Benchmarks
 
-1. Every session starts logged out, hits captchas or 2FA prompts, and requires downloading hundreds of MBs of browser binaries.
-2. Step-by-step tool loops (`open -> snapshot -> type -> click -> wait -> snapshot`) burn 6–8 agent turns and hundreds of thousands of tokens for a simple search.
-3. Background tasks constantly steal window focus, and when a page hits a QR login or captcha, the whole workflow stalls.
-
-Chrome Live pairs a local Node.js daemon (`127.0.0.1:28196`) with a plain Manifest V3 extension to work alongside your real browser instead:
-
-- **Share one signed-in tab + anti-misclick lock**: Press `Alt+Shift+L` (`Option+Shift+L` on macOS) to hand the active tab to Antigravity. A transparent lock shield (`not-allowed` circle-slash cursor) prevents accidental clicks during automation; click **Pause** on the bottom floating HUD bar or hold left-click for 3 seconds to take over anytime. Running `done` detaches the debugger without closing your shared tab.
-- **Color-coded tab groups & auto-collapse**: Active AI tabs sit inside a cyan **`Live · Active`** tab group (background research tabs auto-collapse into a compact pill without pulling Chrome to the front). When you click Pause, hold left-click 3s to unlock, or pop out a standalone window for manual login/2FA, the tab group and page border switch to yellow **`Live · Paused`** so control state is unmistakable.
-- **Human-like pointer & typing cadence**: Cursor movement follows Bezier curves with approach deceleration, paired with staggered keystroke timing instead of instant synthetic jumps.
-- **Built-in Antigravity MCP App (SEP-1865)**: Streams a 0-token live preview inline in chat (`chrome_live_monitor`), docked in the side pane, or full-page in the sidebar (`chrome_live_workspace`), with 6 built-in controls:
-  - **Control**: Click, scroll, and type directly on the live stream;
-  - **Pick**: Drag a bounding box on the preview to extract real DOM selectors (traversing open Shadow DOM) straight into chat;
-  - **Attach**: Push the active tab's title, URL, and `tabId` into the next prompt via `ui/update-model-context`;
-  - **Popout / Merge**: Pop a controlled tab into a standalone window for manual 2FA/captcha, then merge it back to its original tab index for the agent to continue;
-  - **Refresh / Release**: Force an immediate frame refresh or detach control on demand.
-- **Single-roundtrip `batch` + opt-in local Site Playbooks**: Pipe `open -> type -> click -> wait -> snapshot -> done` through stdin in one turn. Turn on `playbook on` (disabled by default) to store learned routes and selectors locally in `~/.chrome-live-antigravity/site-playbooks.json` (sensitive query params stripped automatically).
-- **Concurrent clean extraction & full form state**: `extract` reads multiple pages in parallel background tabs (filtering `<style>`/`<script>` noise) and closes worker tabs when finished. `snapshot` traverses open Shadow DOM and exposes `{DISABLED}`, `{checked}`, `{selected}`, `{expanded}`, and validation alerts.
-- **Local guardrails & zero dependencies**: Built entirely on Node.js >= 20 standard modules and vanilla MV3 JavaScript—0 npm packages, 0 prebuilt binaries. Payment gateways (Stripe, PayPal, Alipay, banking portals), `chrome://`, and `/checkout` routes (including SPA hashes) are blocked locally before touching Chrome; CDP uploads reject `.ssh`, `.env`, and `.aws` paths.
-
----
-
-## Benchmarks (PyPI Multi-Step Workflow)
-
-Task: open `pypi.org` → type query → submit → wait → extract results → cleanup (measured from actual session token logs):
+Measured on a real multi-step `pypi.org` search workflow (`open -> type -> submit -> wait -> extract -> cleanup`) from underlying session token logs:
 
 | Mode | Agent Turns | Wall Time | Total Token Throughput | Non-Cached Tokens |
 | :--- | :---: | :---: | :---: | :---: |
@@ -56,21 +55,19 @@ Task: open `pypi.org` → type query → submit → wait → extract results →
 
 Background footprint: `< 0.01%` idle CPU (`0.0096%` measured), `~30–34 MB` private memory, `~3s` automatic extension reconnect after daemon restart, `< 100ms` local guardrail checks.
 
----
+## Install
 
-## Quick Start
+Requires `Node.js >= 20` and zero third-party npm packages.
 
-### Option 1: Let Antigravity install it for you
-
-Send this prompt to Antigravity:
+**AI Agent Setup** (paste into Antigravity; see [AI_INSTALL.md](./AI_INSTALL.md))
 
 ```text
 Read https://github.com/CHANPAJN/chrome-live-for-antigravity/blob/main/AI_INSTALL.md and follow it step by step to clone and configure chrome-live-for-antigravity, generate the local pairing token, start the bridge daemon, and return the local extension/ folder path for me to load in chrome://extensions.
 ```
 
-### Option 2: Manual 3-step setup
+**Manual Setup (3 Steps)**
 
-**1. Clone and generate a local pairing token**
+**Step 1 — Clone & generate local pairing token** (`~/.chrome-live-antigravity/auth.token`, `0600` + gitignored `extension/.local-runtime.json`)
 
 ```bash
 git clone https://github.com/CHANPAJN/chrome-live-for-antigravity.git
@@ -78,32 +75,21 @@ cd chrome-live-for-antigravity
 node ./bin/chrome-live.mjs setup
 ```
 
-`setup` creates a random 256-bit token at `~/.chrome-live-antigravity/auth.token` (`0600`) and writes a gitignored `extension/.local-runtime.json` so the extension connects automatically on first load.
-
-**2. Load the unpacked extension (Chrome / Edge / Brave)**
-
-> Recent Chrome stable builds (137+) removed the `--load-extension` CLI flag. Load it once from the extensions page:
-
-1. Open `chrome://extensions` (or `edge://extensions`);
-2. Enable **Developer mode**;
-3. Click **Load unpacked** and select this repository's `extension/` directory;
-4. Verify the bridge connection:
+**Step 2 — Load the unpacked extension (Chrome / Edge / Brave)**  
+Chrome `137+` removed `--load-extension`, so load it once from `chrome://extensions` (or `edge://extensions`): enable **Developer mode**, click **Load unpacked**, select this repository's `extension/` directory, then verify the handshake:
 
 ```bash
 node ./bin/chrome-live.mjs health
 ```
 
-**3. Connect to Antigravity**
-
-Nothing is written to `~/.gemini/config/` until you opt in:
-
-- **Install the Antigravity plugin (Skill + Live Monitor Sidecar)**:
+**Step 3 — Connect to Antigravity** (nothing is written to `~/.gemini/config/` until you opt in)
 
 ```bash
+# Option A: Install Antigravity plugin (SKILL.md + Live Monitor Sidecar)
 node ./bin/chrome-live.mjs install --with-plugin
 ```
 
-- **Or mount manually as a standard `stdio` MCP server**:
+Or mount manually as a standard `stdio` MCP server:
 
 ```json
 {
@@ -116,41 +102,30 @@ node ./bin/chrome-live.mjs install --with-plugin
 }
 ```
 
----
-
-## CLI Cheat Sheet
+## Usage & CLI
 
 ```bash
-node ./bin/chrome-live.mjs health                          # Check daemon & extension status
-node ./bin/chrome-live.mjs open "https://example.com"      # Open URL in collapsed background group
-node ./bin/chrome-live.mjs snapshot                        # Capture indexed elements [0],[1] & text
-node ./bin/chrome-live.mjs click 0                         # Click by index, CSS selector, or label
-node ./bin/chrome-live.mjs type "Search" "query" --submit  # Type into field and submit
-node ./bin/chrome-live.mjs upload "./demo.png"             # Attach local file via CDP
-node ./bin/chrome-live.mjs batch - --compact               # Run multi-step stdin pipeline in 1 turn
-node ./bin/chrome-live.mjs extract "https://a.com"         # Extract clean text & image URLs in parallel
-node ./bin/chrome-live.mjs relay popout                    # Pop tab out for manual 2FA / captcha
-node ./bin/chrome-live.mjs relay merge                     # Merge tab back and resume AI control
-node ./bin/chrome-live.mjs release                         # Detach control without closing tab
-node ./bin/chrome-live.mjs done "Task complete"            # Detach debugger & close worker tabs
+node ./bin/chrome-live.mjs health                           # Inspect daemon & extension connection status
+node ./bin/chrome-live.mjs open "https://example.com"       # Open URL inside collapsed background tab group
+node ./bin/chrome-live.mjs snapshot                         # Capture indexed elements [0],[1] & page text
+node ./bin/chrome-live.mjs click 0                          # Click by index, CSS selector, or visible label
+node ./bin/chrome-live.mjs type "Search" "query" --submit   # Type into input field and submit
+node ./bin/chrome-live.mjs upload "./demo.png"              # Attach local file via native CDP
+node ./bin/chrome-live.mjs batch - --compact                # Run multi-step stdin pipeline in 1 turn
+node ./bin/chrome-live.mjs extract "https://a.com"          # Extract clean text & image URLs in parallel
+node ./bin/chrome-live.mjs relay popout                     # Pop tab into standalone window for manual login/2FA
+node ./bin/chrome-live.mjs relay merge                      # Merge tab back to original index & resume AI
+node ./bin/chrome-live.mjs release                          # Detach control without closing the tab
+node ./bin/chrome-live.mjs done "Task complete"             # Detach debugger & close temporary worker tabs
 ```
 
----
+**Hiding the Chrome `"started debugging this browser"` Banner**
 
-## Security & Architecture Notes
+Chrome displays a top infobar whenever an extension attaches `chrome.debugger` (clicking **Cancel** detaches AI control immediately):
 
-- **On-demand debugger attachment**: `chrome.debugger` (1.3) attaches only during active commands or live streaming and auto-detaches after 18 seconds of idle time.
-- **Loopback isolation**: The daemon binds strictly to `127.0.0.1:28196` (override with `CHROME_LIVE_PORT`), validates the `Host` header, rejects browser `Origin` headers with `403`, and checks the local token using `crypto.timingSafeEqual`.
-- **Financial & internal-page guardrails**: Blocks payment gateways, banking portals, cloud billing consoles, `chrome://`/`edge://`, and `/checkout`, `/payment`, `/pay`, `/cashier`, `/billing` paths locally. If a controlled tab redirects to a protected domain, the debugger detaches immediately.
-- **No host binary patching & clean uninstall**: Never touches Antigravity binaries; closed Shadow DOM, cross-origin payment `<iframe>` elements, and native OS file dialogs stay isolated by the browser sandbox. To uninstall, run `node ./bin/chrome-live.mjs stop`, remove the extension in Chrome, and delete `~/.chrome-live-antigravity`.
-
-## Hiding the "started debugging this browser" Banner
-
-Whenever an extension attaches Chrome's native `chrome.debugger` API, Chrome displays a top infobar saying `"Chrome Live (for Antigravity)" started debugging this browser [Cancel]` (clicking **Cancel** immediately detaches AI control).
-
-- **Auto-dismiss by default**: You do not need to click Cancel—the extension detaches automatically on `done` or after 18 seconds of idle time, and the bar disappears on its own.
+- **Auto-dismiss by default**: You do not need to click Cancel — the extension detaches automatically on `done` or after 18 seconds of idle time, and the bar disappears on its own.
 - **Suppress permanently (optional)**: Fully quit Chrome and launch it with Chromium's built-in `--silent-debugger-extension-api` flag:
-  - **Windows**: Right-click your Chrome shortcut (Desktop or Taskbar) → **Properties** → append a space and `--silent-debugger-extension-api` **outside** the closing quote in **Target**, then restart Chrome:
+  - **Windows**: Right-click your Chrome shortcut (Desktop / Taskbar) → **Properties** → append a space and `--silent-debugger-extension-api` **outside** the closing quote in **Target**, then restart Chrome:
     ```text
     "C:\Program Files\Google\Chrome\Application\chrome.exe" --silent-debugger-extension-api
     ```
@@ -160,16 +135,18 @@ Whenever an extension attaches Chrome's native `chrome.debugger` API, Chrome dis
     ```
   - **Linux**: Run `google-chrome --silent-debugger-extension-api`, or append the flag to the `Exec=` line in your `.desktop` launcher under `~/.local/share/applications/`.
 
-## Tests
+## How It Works & Operational Transparency
+
+- **On-Demand Debugger Attachment**: `chrome.debugger` (`1.3`) attaches only during active commands or live streaming and auto-detaches after 18 seconds of idle time, keeping idle CPU under `0.01%`.
+- **Loopback Isolation & Timing-Safe Auth**: The daemon binds strictly to `127.0.0.1:28196` (override with `CHROME_LIVE_PORT`), validates the `Host` header, rejects all browser `Origin` headers with `403`, and verifies the local 256-bit token with `crypto.timingSafeEqual`.
+- **Dual-Layer Financial & Sensitive Path Guardrails**: Both the daemon and the extension block payment gateways (Stripe, PayPal, Alipay, WeChat Pay, banking portals, cloud billing consoles), `chrome://` / `edge://`, and `/checkout`, `/payment`, `/pay`, `/cashier`, `/billing` routes (including SPA hash paths) before touching the tab. If a controlled page redirects to a protected domain, the debugger detaches immediately. CDP file uploads also reject `.ssh`, `.env`, and `.aws` credential paths.
+- **Zero Host Patching & Clean Uninstall**: Built purely on Node.js `>= 20` standard modules and plain MV3 JavaScript — zero npm packages, zero prebuilt binaries, and zero edits to Antigravity binaries. Closed Shadow DOM, cross-origin payment `<iframe>` frames, and native OS file dialogs remain isolated by the browser sandbox. To verify or uninstall:
 
 ```bash
-npm test
+npm test                                                    # Run clean-room, guardrail & protocol test suite
+node ./bin/chrome-live.mjs stop                             # Stop daemon, then remove extension & ~/.chrome-live-antigravity
 ```
-
-## Acknowledgements
-
-Thanks to the [LINUX DO](https://linux.do/) developer community for real-world feedback on multi-agent browser workflows.
 
 ## License
 
-Released under [GNU General Public License v3.0](./LICENSE) (`GPL-3.0-only`).
+Released under the [GNU General Public License v3.0 (GPL-3.0)](./LICENSE). Community discussion & feedback: [LINUX DO](https://linux.do).
