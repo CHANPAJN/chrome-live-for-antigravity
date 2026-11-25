@@ -55,8 +55,10 @@ function tr() {
 }
 
 const BUILTIN_PROTECTED_DOMAINS = [
+  'stripe.com',
   'checkout.stripe.com',
   'billing.stripe.com',
+  'dashboard.stripe.com',
   'paypal.com',
   'venmo.com',
   'wise.com',
@@ -91,15 +93,27 @@ const CHECKOUT_SEGMENT_RX =
 
 const CHECKOUT_SUBDOMAIN_RX = /(?:^|\.)(?:checkout|pay|payment|payments|cashier|billing)\./i;
 
-function isHighEntropyPathSegment(segment) {
-  if (!segment || segment.length < 32) return false;
+function isHighEntropyPathSegment(rawSegment) {
+  if (!rawSegment || rawSegment.length < 32) return false;
+  let segment = String(rawSegment);
+  if (segment.includes('%')) {
+    try {
+      segment = decodeURIComponent(segment);
+    } catch {}
+  }
+  if (segment.length < 32) return false;
   if (/^eyJ[A-Za-z0-9._~+/=-]{10,}$/.test(segment)) return true;
   if (/^[0-9a-f]{32,}$/i.test(segment)) return true;
-  if (segment.length >= 40 && /^[A-Za-z0-9._~+-]+$/.test(segment)) {
+  if (segment.length >= 36 && /^[A-Za-z0-9._~+/=-]+$/.test(segment)) {
     const hasDigit = /\d/.test(segment);
     const hasUpper = /[A-Z]/.test(segment);
     const hasLower = /[a-z]/.test(segment);
-    if ((hasDigit && (hasUpper || hasLower)) || (hasUpper && hasLower && !segment.includes('-'))) {
+    const hasB64Punct = /[+/=]/.test(segment);
+    if (
+      (hasDigit && (hasUpper || hasLower)) ||
+      hasB64Punct ||
+      (hasUpper && hasLower && !segment.includes('-'))
+    ) {
       return true;
     }
   }
@@ -145,42 +159,106 @@ function canonicalizeRouteForGuardrail(rawSegment) {
 const SAFE_ATTR_SELECTOR_ALLOWLIST_RX =
   /^(?:id|class|name|type|role|placeholder|aria-(?:label|expanded|selected|checked|controls|current|disabled)|title|for|disabled|checked|selected|readonly|required|multiple|contenteditable|tabindex|data-(?:testid|test|cy|qa|clive-idx|index|id|action|role|tab|state)|target|alt)$/i;
 
+const SAFE_FUNCTIONAL_PSEUDO_RX =
+  /^(?:nth-child|nth-last-child|nth-of-type|nth-last-of-type|not|is|where)$/i;
+
 function assertSafeModelSelector(rawSelector) {
   if (typeof rawSelector !== 'string') return;
   const s = rawSelector.trim();
   if (!s) return;
-  // Block CSS backslash escapes and unclosed comments used to evade attribute inspection
-  if (s.includes('\\')) {
-    throw new Error('[GUARDRAIL] CSS escape sequences are blocked in automation selectors');
+  // Unconditionally forbid CSS escapes (`\`) and CSS comment tokens (`/*`, `*/`) anywhere in the string
+  // so quote-aware browser CSS lexers and guardrail checks can never diverge!
+  if (s.includes('\\') || s.includes('/*') || s.includes('*/')) {
+    throw new Error('[GUARDRAIL] CSS escape sequences and comments are blocked in automation selectors');
   }
-  if (s.includes('/*') && !/\*\/[\s\S]*$/.test(s)) {
-    throw new Error('[GUARDRAIL] Unclosed CSS comment in selector');
-  }
-  const stripped = s.replace(/\/\*[\s\S]*?\*\//g, ' ');
-  if (stripped.includes('/*')) {
-    throw new Error('[GUARDRAIL] Malformed CSS comment in selector');
-  }
-  // Block :has() relational pseudo-class (prevents boolean oracle probing of hidden elements/attributes)
-  if (/:has\s*\(/i.test(stripped)) {
-    throw new Error('[GUARDRAIL] Relational :has() selectors are blocked to prevent hidden-DOM probing');
-  }
-  // Strict allowlist on all [...] attribute selectors (blocks [|value^="a"], [content=...], [data-csrf=...], substring ops)
-  const attrBlocks = stripped.match(/\[[^\]]*\]/g);
-  if (attrBlocks) {
-    for (const block of attrBlocks) {
-      const inner = block.slice(1, -1).trim();
+
+  let quoteChar = '';
+  let bracketDepth = 0;
+  let parenDepth = 0;
+  let attrStart = -1;
+
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quoteChar) {
+      if (ch === quoteChar) quoteChar = '';
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quoteChar = ch;
+      continue;
+    }
+    if (ch === '[') {
+      if (bracketDepth === 0) attrStart = i + 1;
+      bracketDepth += 1;
+      if (bracketDepth > 1) {
+        throw new Error('[GUARDRAIL] Nested CSS attribute brackets are blocked');
+      }
+      continue;
+    }
+    if (ch === ']') {
+      if (bracketDepth <= 0) {
+        throw new Error('[GUARDRAIL] Unbalanced closing bracket in CSS selector');
+      }
+      bracketDepth -= 1;
+      const inner = s.slice(attrStart, i).trim();
       if (!inner) {
         throw new Error('[GUARDRAIL] Empty CSS attribute selector is blocked');
       }
-      if (/[*^$~|]=/.test(inner)) {
-        throw new Error('[GUARDRAIL] CSS attribute substring/prefix/suffix operators (*=, ^=, $=, ~=, |=) are blocked');
+      // Scan inner attribute expression outside quotes for operator & attribute name
+      let innerQuote = '';
+      let eqIndex = -1;
+      for (let j = 0; j < inner.length; j++) {
+        const ic = inner[j];
+        if (innerQuote) {
+          if (ic === innerQuote) innerQuote = '';
+          continue;
+        }
+        if (ic === '"' || ic === "'") {
+          innerQuote = ic;
+          continue;
+        }
+        if (ic === '=') {
+          const prevChar = j > 0 ? inner[j - 1] : '';
+          if (prevChar === '*' || prevChar === '^' || prevChar === '$' || prevChar === '~' || prevChar === '|') {
+            throw new Error('[GUARDRAIL] CSS attribute substring/prefix/suffix operators (*=, ^=, $=, ~=, |=) are blocked');
+          }
+          if (eqIndex !== -1) {
+            throw new Error('[GUARDRAIL] Malformed multiple "=" operators in CSS attribute selector');
+          }
+          eqIndex = j;
+        }
       }
-      const eqIdx = inner.indexOf('=');
-      const rawAttr = (eqIdx === -1 ? inner : inner.slice(0, eqIdx)).trim().replace(/^\*?\|/, '').trim();
+      const rawAttr = (eqIndex === -1 ? inner : inner.slice(0, eqIndex)).trim().replace(/^\*?\|/, '').trim();
       if (!SAFE_ATTR_SELECTOR_ALLOWLIST_RX.test(rawAttr)) {
         throw new Error(`[GUARDRAIL] CSS attribute selector on "${rawAttr}" is restricted for credential safety`);
       }
+      continue;
     }
+    if (bracketDepth === 0 && ch === ':') {
+      const rest = s.slice(i + 1);
+      const fnMatch = rest.match(/^:?([a-zA-Z_-][a-zA-Z0-9_-]*)\s*\(/);
+      if (fnMatch) {
+        const fnName = fnMatch[1];
+        if (!SAFE_FUNCTIONAL_PSEUDO_RX.test(fnName)) {
+          throw new Error(`[GUARDRAIL] Functional CSS pseudo-class ":${fnName}()" is blocked to prevent hidden-DOM probing`);
+        }
+      }
+      continue;
+    }
+    if (bracketDepth === 0 && ch === '(') {
+      parenDepth += 1;
+      continue;
+    }
+    if (bracketDepth === 0 && ch === ')') {
+      parenDepth -= 1;
+      if (parenDepth < 0) {
+        throw new Error('[GUARDRAIL] Unbalanced closing parenthesis in CSS selector');
+      }
+    }
+  }
+
+  if (quoteChar || bracketDepth !== 0 || parenDepth !== 0) {
+    throw new Error('[GUARDRAIL] Unbalanced quotes, brackets, or parentheses in CSS selector');
   }
 }
 
@@ -336,8 +414,28 @@ function redactAuditUrl(rawUrl) {
     }
     if (parsed.hash) {
       let cleanedHash = parsed.hash.replace(LOCAL_HASH_SENSITIVE_PAIR_RX, '$1$2=REDACTED');
-      if (cleanedHash === parsed.hash && /^#(?:eyJ[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{32,})$/.test(parsed.hash)) {
+      if (cleanedHash === parsed.hash && /^#!?(:?eyJ[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{32,})$/.test(parsed.hash)) {
         cleanedHash = '#REDACTED';
+      } else {
+        const prefixMatch = cleanedHash.match(/^(#!?)/);
+        const hashPrefix = prefixMatch ? prefixMatch[1] : '#';
+        const body = cleanedHash.slice(hashPrefix.length);
+        const qPos = body.indexOf('?');
+        const hPath = qPos === -1 ? body : body.slice(0, qPos);
+        const hQuery = qPos === -1 ? '' : body.slice(qPos);
+        if (hPath.length >= 32) {
+          const hParts = hPath.split('/');
+          let hChanged = false;
+          for (let i = 0; i < hParts.length; i++) {
+            if (isHighEntropyPathSegment(hParts[i])) {
+              hParts[i] = 'REDACTED';
+              hChanged = true;
+            }
+          }
+          if (hChanged) {
+            cleanedHash = `${hashPrefix}${hParts.join('/')}${hQuery}`;
+          }
+        }
       }
       if (cleanedHash !== parsed.hash) {
         parsed.hash = cleanedHash;
@@ -392,7 +490,7 @@ function checkTabUrlAllowed(rawUrl) {
   if (!canonPath.ok) {
     return { allowed: false, reason: 'Malformed percent-encoding in URL pathname' };
   }
-  const rawHash = parsed.hash ? parsed.hash.replace(/^#+/, '') : '';
+  const rawHash = parsed.hash ? parsed.hash.replace(/^#+!?/, '') : '';
   const canonHash = rawHash ? canonicalizeRouteForGuardrail(rawHash) : { ok: true, rawPath: '', path: '' };
   if (!canonHash.ok) {
     return { allowed: false, reason: 'Malformed percent-encoding in URL fragment' };
@@ -403,7 +501,7 @@ function checkTabUrlAllowed(rawUrl) {
     (canonHash.rawPath && CHECKOUT_SEGMENT_RX.test(canonHash.rawPath)) ||
     (canonHash.path && CHECKOUT_SEGMENT_RX.test(canonHash.path))
   ) {
-    return { allowed: false, reason: `Protected checkout/payment route (${parsed.pathname}${parsed.hash})` };
+    return { allowed: false, reason: 'Protected checkout/payment route' };
   }
   return { allowed: true, reason: '' };
 }
@@ -703,6 +801,10 @@ async function runHudScriptSafe(tabId, opts, timeoutMs = 1200) {
 
 async function syncHudNow(tabId, payload) {
   const entry = managedTabs.get(tabId);
+  // Never re-lock or re-show HUD on a tab that has already been released/detached!
+  if ((!entry || entry.detached) && payload?.visible !== false) {
+    return;
+  }
   // Never allow an in-flight working update to overwrite a user-initiated pause or detach
   if (
     entry &&
@@ -1342,60 +1444,25 @@ function assertStillActiveAndUnpaused(entry) {
   }
 }
 
-async function assertTabReadyForAction(entry) {
-  await pollHudUserEvents(entry.tabId, entry);
-  assertStillActiveAndUnpaused(entry);
-  const liveTab = await chrome.tabs.get(entry.tabId);
-  if (liveTab.discarded) {
-    await chrome.tabs.reload(entry.tabId).catch(() => {});
-    await waitForTabComplete(entry.tabId, 9000);
-  }
-  entry.title = liveTab.title || '';
-  entry.url = liveTab.url || '';
-  const safety = checkTabUrlAllowed(entry.url);
-  if (!safety.allowed) {
-    await detachManagedTab(entry.tabId, safety.reason, true);
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(
-        JSON.stringify({
-          type: 'guardrail_trip',
-          tabId: entry.tabId,
-          url: entry.url,
-          reason: safety.reason
-        })
-      );
-    }
-    throw new Error(`[GUARDRAIL] Detached tab because it navigated to ${safety.reason}`);
-  }
-
-  // 1. Inspect ALL live browser sub-frames via webNavigation (catches cross-origin 302 redirects & form-targeted frames!)
+async function inspectEmbeddedFramesSafety(tabId) {
   if (chrome.webNavigation?.getAllFrames) {
-    const navFrames = await chrome.webNavigation.getAllFrames({ tabId: entry.tabId }).catch(() => null);
+    const navFrames = await chrome.webNavigation.getAllFrames({ tabId }).catch(() => null);
     if (Array.isArray(navFrames)) {
       for (const nf of navFrames) {
         if (!nf || !nf.url || nf.url === 'about:blank' || nf.errorOccurred) continue;
         const nfSafety = checkTabUrlAllowed(nf.url);
         if (!nfSafety.allowed) {
-          const reason = `Embedded payment/protected sub-frame: ${nfSafety.reason}`;
-          await detachManagedTab(entry.tabId, reason, true);
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(
-              JSON.stringify({
-                type: 'guardrail_trip',
-                tabId: entry.tabId,
-                url: redactAuditUrl(nf.url),
-                reason
-              })
-            );
-          }
-          throw new Error(`[GUARDRAIL] Detached tab due to ${reason}`);
+          return {
+            allowed: false,
+            frameUrl: nf.url,
+            reason: `Embedded payment/protected sub-frame: ${nfSafety.reason}`
+          };
         }
       }
     }
   }
 
-  // 2. Also inspect visible embedded <iframe>/<frame> (including open Shadow DOM & <form target> actions)
-  const iframeRes = await runHudScriptSafe(entry.tabId, {
+  const iframeRes = await runHudScriptSafe(tabId, {
     func: () => {
       const urls = [];
       const collectFrames = (root, depth = 0) => {
@@ -1429,21 +1496,57 @@ async function assertTabReadyForAction(entry) {
     for (const fUrl of embeddedUrls) {
       const fSafety = checkTabUrlAllowed(fUrl);
       if (!fSafety.allowed) {
-        const reason = `Embedded payment/protected iframe: ${fSafety.reason}`;
-        await detachManagedTab(entry.tabId, reason, true);
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(
-            JSON.stringify({
-              type: 'guardrail_trip',
-              tabId: entry.tabId,
-              url: redactAuditUrl(fUrl),
-              reason
-            })
-          );
-        }
-        throw new Error(`[GUARDRAIL] Detached tab due to ${reason}`);
+        return {
+          allowed: false,
+          frameUrl: fUrl,
+          reason: `Embedded payment/protected iframe: ${fSafety.reason}`
+        };
       }
     }
+  }
+  return { allowed: true, frameUrl: '', reason: '' };
+}
+
+async function assertTabReadyForAction(entry) {
+  await pollHudUserEvents(entry.tabId, entry);
+  assertStillActiveAndUnpaused(entry);
+  const liveTab = await chrome.tabs.get(entry.tabId);
+  if (liveTab.discarded) {
+    await chrome.tabs.reload(entry.tabId).catch(() => {});
+    await waitForTabComplete(entry.tabId, 9000);
+  }
+  entry.title = liveTab.title || '';
+  entry.url = liveTab.url || '';
+  const safety = checkTabUrlAllowed(entry.url);
+  if (!safety.allowed) {
+    await detachManagedTab(entry.tabId, safety.reason, true);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: 'guardrail_trip',
+          tabId: entry.tabId,
+          url: redactAuditUrl(entry.url),
+          reason: safety.reason
+        })
+      );
+    }
+    throw new Error(`[GUARDRAIL] Detached tab because it navigated to ${safety.reason}`);
+  }
+
+  const subCheck = await inspectEmbeddedFramesSafety(entry.tabId);
+  if (!subCheck.allowed) {
+    await detachManagedTab(entry.tabId, subCheck.reason, true);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: 'guardrail_trip',
+          tabId: entry.tabId,
+          url: redactAuditUrl(subCheck.frameUrl || entry.url),
+          reason: subCheck.reason
+        })
+      );
+    }
+    throw new Error(`[GUARDRAIL] Detached tab due to ${subCheck.reason}`);
   }
 
   // Re-verify pause/detach after async frame inspection so mid-check user pauses are never overwritten!
@@ -1647,6 +1750,10 @@ async function executeBridgeRpc(method, params) {
             ceIdx >= 0
               ? document.querySelectorAll('[contenteditable]:not([contenteditable="false"])')[ceIdx]
               : document.activeElement;
+          const initialActiveHost = el;
+          while (el && el.shadowRoot && el.shadowRoot.activeElement) {
+            el = el.shadowRoot.activeElement;
+          }
           if (
             !el ||
             el === document.body ||
@@ -1659,28 +1766,44 @@ async function executeBridgeRpc(method, params) {
           if (!el) return { ok: false, error: 'No active input field' };
           const st = window.getComputedStyle(el);
           const tSec = String(st.webkitTextSecurity || st.getPropertyValue('-webkit-text-security') || '').toLowerCase();
-          const autoAttr = String(el.getAttribute?.('autocomplete') || '').toLowerCase();
-          const labelParts = [];
-          if (el.labels) {
-            for (const lb of Array.from(el.labels)) labelParts.push(lb.textContent || '');
+          const metaTokens = [];
+          const autoTokens = [];
+          const visitedNodes = new Set();
+          const harvestNodeHints = (node) => {
+            if (!node || !(node instanceof Element) || visitedNodes.has(node)) return;
+            visitedNodes.add(node);
+            autoTokens.push(node.getAttribute('autocomplete') || '');
+            metaTokens.push(
+              node.getAttribute('name'),
+              node.id,
+              node.getAttribute('placeholder'),
+              node.getAttribute('aria-label'),
+              node.getAttribute('title')
+            );
+            if (node.labels) {
+              for (const lb of Array.from(node.labels)) metaTokens.push(lb.textContent || '');
+            }
+            const wrapLb = node.closest?.('label');
+            if (wrapLb) metaTokens.push(wrapLb.textContent || '');
+            const labelledBy = node.getAttribute('aria-labelledby') || '';
+            const rootNode = node.getRootNode?.();
+            for (const lid of labelledBy.split(/\s+/).filter(Boolean)) {
+              const lNode =
+                (rootNode && typeof rootNode.getElementById === 'function' ? rootNode.getElementById(lid) : null) ||
+                document.getElementById(lid);
+              if (lNode) metaTokens.push(lNode.textContent || '');
+            }
+          };
+          let cursorNode = el;
+          for (let hop = 0; hop < 8 && cursorNode; hop++) {
+            harvestNodeHints(cursorNode);
+            const rn = cursorNode.getRootNode?.();
+            cursorNode =
+              cursorNode.parentElement || (rn && rn instanceof ShadowRoot ? rn.host : null);
           }
-          const wrapLb = el.closest?.('label');
-          if (wrapLb) labelParts.push(wrapLb.textContent || '');
-          const labelledBy = el.getAttribute?.('aria-labelledby') || '';
-          for (const lid of labelledBy.split(/\s+/).filter(Boolean)) {
-            const lNode = document.getElementById(lid);
-            if (lNode) labelParts.push(lNode.textContent || '');
-          }
-          const rawMeta = [
-            el.getAttribute?.('name'),
-            el.id,
-            el.getAttribute?.('placeholder'),
-            el.getAttribute?.('aria-label'),
-            el.getAttribute?.('title'),
-            ...labelParts
-          ]
-            .filter(Boolean)
-            .join(' ');
+          if (initialActiveHost) harvestNodeHints(initialActiveHost);
+          const autoAttr = autoTokens.join(' ').toLowerCase();
+          const rawMeta = metaTokens.filter(Boolean).join(' ');
           const decamelMeta = rawMeta
             .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
             .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2');
@@ -1899,12 +2022,24 @@ async function executeBridgeRpc(method, params) {
     const stepResults = [];
     let finalSnapshot = null;
 
+    const ALLOWED_BATCH_ACTIONS = new Set([
+      'open',
+      'navigate',
+      'type',
+      'click',
+      'upload',
+      'scroll',
+      'wait',
+      'snapshot',
+      'screenshot',
+      'done'
+    ]);
     for (let i = 0; i < steps.length; i++) {
       const rawStep = steps[i];
       if (!rawStep || typeof rawStep !== 'object') continue;
       const action = String(rawStep.action || rawStep.method || rawStep.cmd || '').trim();
-      if (!action || action === 'batch') {
-        throw new Error(`Invalid batch step action at index ${i}: "${action}"`);
+      if (!ALLOWED_BATCH_ACTIONS.has(action)) {
+        throw new Error(`[GUARDRAIL] Action "${action}" at batch step ${i} is not permitted inside batch pipelines`);
       }
 
       const stepParams = { ...rawStep };
@@ -1968,6 +2103,11 @@ async function executeBridgeRpc(method, params) {
     if (!postCheck.allowed) {
       await chrome.tabs.remove(created.id).catch(() => {});
       throw new Error(`[GUARDRAIL] Redirected to protected URL: ${postCheck.reason}`);
+    }
+    const openSubCheck = await inspectEmbeddedFramesSafety(created.id);
+    if (!openSubCheck.allowed) {
+      await chrome.tabs.remove(created.id).catch(() => {});
+      throw new Error(`[GUARDRAIL] Opened page embeds protected frame: ${openSubCheck.reason}`);
     }
 
     const activity = tr().workingPrefix(params.label);
@@ -2045,11 +2185,18 @@ async function executeBridgeRpc(method, params) {
               url: targetUrl,
               active: false
             });
+            if (hostWindowId !== extractWindowId && typeof workerTab.id === 'number') {
+              await placeInBackgroundTabGroup(workerTab.id, workerTab.windowId);
+            }
             await waitForTabComplete(workerTab.id, 15000);
             const finalTab = await chrome.tabs.get(workerTab.id);
             const postSafety = checkTabUrlAllowed(finalTab.url || '');
             if (!postSafety.allowed) {
               return { url: targetUrl, error: postSafety.reason };
+            }
+            const preExtractSubCheck = await inspectEmbeddedFramesSafety(workerTab.id);
+            if (!preExtractSubCheck.allowed) {
+              return { url: targetUrl, error: `[GUARDRAIL] ${preExtractSubCheck.reason}` };
             }
 
             const injected = await chrome.scripting.executeScript({ target: { tabId: workerTab.id  }, injectImmediately: true,
@@ -2967,7 +3114,8 @@ async function executeBridgeRpc(method, params) {
           }
         }
 
-        // Drill into inner native input/textarea if target matched a wrapper custom element
+        // Drill into inner native input/textarea if target matched a wrapper custom element (while preserving outer host metadata!)
+        const outerMatchedEl = el;
         if (
           el &&
           !(el instanceof HTMLInputElement) &&
@@ -2984,28 +3132,48 @@ async function executeBridgeRpc(method, params) {
         if (!el) return { ok: false, error: `Input element not found: ${tgt}` };
         const elStyle = window.getComputedStyle(el);
         const elTextSec = String(elStyle.webkitTextSecurity || elStyle.getPropertyValue('-webkit-text-security') || '').toLowerCase();
-        const elAuto = String(el.getAttribute?.('autocomplete') || '').toLowerCase();
-        const elLabelParts = [];
-        if (el.labels) {
-          for (const lb of Array.from(el.labels)) elLabelParts.push(lb.textContent || '');
+        const elMetaBucket = [];
+        const elAutoBucket = [];
+        const seenAncestors = new Set();
+        const collectFromNode = (node) => {
+          if (!node || typeof node.getAttribute !== 'function' || seenAncestors.has(node)) return;
+          seenAncestors.add(node);
+          elAutoBucket.push(node.getAttribute('autocomplete') || '');
+          elMetaBucket.push(
+            node.getAttribute('name'),
+            node.id,
+            node.getAttribute('placeholder'),
+            node.getAttribute('aria-label'),
+            node.getAttribute('title')
+          );
+          if (node.labels) {
+            for (const lb of Array.from(node.labels)) elLabelPush(lb.textContent || '');
+          }
+          const wLb = node.closest?.('label');
+          if (wLb) elLabelPush(wLb.textContent || '');
+          const labelledBy = node.getAttribute('aria-labelledby') || '';
+          const rootObj = node.getRootNode?.();
+          for (const lid of labelledBy.split(/\s+/).filter(Boolean)) {
+            const lNode =
+              (rootObj && typeof rootObj.getElementById === 'function' ? rootObj.getElementById(lid) : null) ||
+              document.getElementById(lid);
+            if (lNode) elLabelPush(lNode.textContent || '');
+          }
+        };
+        function elLabelPush(txt) {
+          if (txt) elMetaBucket.push(txt);
         }
-        const wrapLabel = el.closest?.('label');
-        if (wrapLabel) elLabelParts.push(wrapLabel.textContent || '');
-        const ariaLabelledBy = el.getAttribute?.('aria-labelledby') || '';
-        for (const lid of ariaLabelledBy.split(/\s+/).filter(Boolean)) {
-          const lNode = document.getElementById(lid);
-          if (lNode) elLabelParts.push(lNode.textContent || '');
+        let walkNode = el;
+        for (let hop = 0; hop < 8 && walkNode; hop++) {
+          collectFromNode(walkNode);
+          const rn = walkNode.getRootNode?.();
+          walkNode = walkNode.parentElement || (rn && rn.host ? rn.host : null);
         }
-        const rawMetaHints = [
-          el.getAttribute?.('name'),
-          el.id,
-          el.getAttribute?.('placeholder'),
-          el.getAttribute?.('aria-label'),
-          el.getAttribute?.('title'),
-          ...elLabelParts
-        ]
-          .filter(Boolean)
-          .join(' ');
+        if (typeof outerMatchedEl !== 'undefined' && outerMatchedEl) {
+          collectFromNode(outerMatchedEl);
+        }
+        const elAuto = elAutoBucket.join(' ').toLowerCase();
+        const rawMetaHints = elMetaBucket.filter(Boolean).join(' ');
         const decamelMetaHints = rawMetaHints
           .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
           .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2');
@@ -3650,6 +3818,11 @@ async function executeBridgeRpc(method, params) {
     if (!postSafety.allowed) {
       await detachManagedTab(entry.tabId, postSafety.reason, true);
       throw new Error(`[GUARDRAIL] Blocked redirect: ${postSafety.reason}`);
+    }
+    const navSubCheck = await inspectEmbeddedFramesSafety(entry.tabId);
+    if (!navSubCheck.allowed) {
+      await detachManagedTab(entry.tabId, navSubCheck.reason, true);
+      throw new Error(`[GUARDRAIL] Blocked embedded payment frame: ${navSubCheck.reason}`);
     }
     entry.activity = tr().loaded(entry.title.slice(0, 28));
     await syncHud(entry.tabId, { visible: true, mode: 'working', activity: entry.activity });

@@ -87,19 +87,19 @@ const TEXT_URL_SCRUB_KEYS = new Set([
   'learnedLabel'
 ]);
 
+const BINARY_PAYLOAD_KEYS = new Set(['data', 'base64', 'frameDataUrl']);
+
 function redactPayloadUrls(node, depth = 0) {
   if (!node || typeof node !== 'object' || depth > 10) return node;
   if (Array.isArray(node)) {
-    return node.map((item) => redactPayloadUrls(item, depth + 1));
+    return node.map((item) => (typeof item === 'string' ? redactUrlsInText(item) : redactPayloadUrls(item, depth + 1)));
   }
   const out = {};
   for (const [k, v] of Object.entries(node)) {
-    if (URL_FIELD_KEYS.has(k) && typeof v === 'string') {
+    if (BINARY_PAYLOAD_KEYS.has(k)) {
+      out[k] = v;
+    } else if (URL_FIELD_KEYS.has(k) && typeof v === 'string') {
       out[k] = redactUrlForAudit(v);
-    } else if (TEXT_URL_SCRUB_KEYS.has(k) && typeof v === 'string') {
-      out[k] = redactUrlsInText(v);
-    } else if (k === 'alerts' && Array.isArray(v)) {
-      out[k] = v.map((msg) => (typeof msg === 'string' ? redactUrlsInText(msg) : msg));
     } else if (URL_ARRAY_KEYS.has(k) && Array.isArray(v)) {
       out[k] = v.map((u) => (typeof u === 'string' ? redactUrlForAudit(u) : u));
     } else if (k === 'routes' && v && typeof v === 'object' && !Array.isArray(v)) {
@@ -109,6 +109,8 @@ function redactPayloadUrls(node, depth = 0) {
         cleanRoutes[cleanKey] = typeof rv === 'string' ? redactUrlForAudit(rv) : rv;
       }
       out[k] = cleanRoutes;
+    } else if (typeof v === 'string') {
+      out[k] = redactUrlsInText(v);
     } else if (v && typeof v === 'object' && !Buffer.isBuffer(v)) {
       out[k] = redactPayloadUrls(v, depth + 1);
     } else {
@@ -381,7 +383,9 @@ export function createDaemonServer(options = {}) {
     const extOrigin = resolveAllowedExtensionOrigin(req.headers.origin);
     const headers = {
       'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': 'no-store'
+      'Cache-Control': 'no-store',
+      'Cross-Origin-Resource-Policy': 'same-origin',
+      'X-Content-Type-Options': 'nosniff'
     };
     if (extOrigin) {
       headers['Access-Control-Allow-Origin'] = extOrigin;
@@ -457,6 +461,19 @@ export function createDaemonServer(options = {}) {
         const st = fs.fstatSync(fd);
         if (!st.isFile()) {
           throw new Error(`Upload path is not a regular file: ${check.resolvedPath}`);
+        }
+        // Secondary post-open canonical & symlink verification (covers Windows where O_NOFOLLOW is 0)
+        const lstatAfterOpen = fs.lstatSync(check.resolvedPath);
+        if (lstatAfterOpen.isSymbolicLink()) {
+          throw new Error('[GUARDRAIL:SYMLINK_BLOCKED] Uploading symbolic links is blocked by local guardrails');
+        }
+        const realAfterOpen = (fs.realpathSync.native || fs.realpathSync)(check.resolvedPath);
+        if (
+          (process.platform === 'win32'
+            ? realAfterOpen.toLowerCase() !== check.resolvedPath.toLowerCase()
+            : realAfterOpen !== check.resolvedPath)
+        ) {
+          throw new Error('[GUARDRAIL:SYMLINK_BLOCKED] Upload path canonical target changed during open');
         }
         if (typeof st.nlink === 'number' && st.nlink > 1) {
           recordAudit('upload', { file: String(item || ''), code: 'HARDLINK_BLOCKED' }, 'blocked');
@@ -552,9 +569,30 @@ export function createDaemonServer(options = {}) {
             }
           }
         } else if (method === 'batch' && Array.isArray(params.steps)) {
+          const ALLOWED_BATCH_STEP_ACTIONS = new Set([
+            'open',
+            'navigate',
+            'type',
+            'click',
+            'upload',
+            'scroll',
+            'wait',
+            'snapshot',
+            'screenshot',
+            'done'
+          ]);
           for (const step of params.steps) {
             if (!step || typeof step !== 'object') continue;
             const stepAction = String(step.action || step.method || step.cmd || '').trim();
+            if (!ALLOWED_BATCH_STEP_ACTIONS.has(stepAction)) {
+              purgeUploadSnapshots();
+              reject(
+                new Error(
+                  `[GUARDRAIL:FORBIDDEN_BATCH_ACTION] Action "${stepAction}" is not permitted inside batch pipelines`
+                )
+              );
+              return;
+            }
             if (typeof step.url === 'string') {
               const safety = evaluateUrlSafety(step.url, state.customBlockedDomains);
               if (!safety.allowed) {
@@ -624,9 +662,17 @@ export function createDaemonServer(options = {}) {
       return;
     }
 
-    // Block arbitrary web page cross-origin requests; only allow non-browser local clients or valid chrome-extension:// origins
-    if (req.headers.origin && !parseValidExtensionOrigin(req.headers.origin)) {
-      res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+    // Block arbitrary web page cross-origin requests (including no-cors <script>/fetch via Sec-Fetch-Site)
+    const secFetchSite = String(req.headers['sec-fetch-site'] || '').trim().toLowerCase();
+    if (
+      (req.headers.origin && !parseValidExtensionOrigin(req.headers.origin)) ||
+      (secFetchSite === 'cross-site' && !parseValidExtensionOrigin(req.headers.origin))
+    ) {
+      res.writeHead(403, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cross-Origin-Resource-Policy': 'same-origin',
+        'X-Content-Type-Options': 'nosniff'
+      });
       res.end('Cross-origin web access is prohibited');
       return;
     }
@@ -652,12 +698,14 @@ export function createDaemonServer(options = {}) {
     const parsedUrl = new URL(req.url || '/', `http://127.0.0.1:${boundPort}`);
     const pathname = parsedUrl.pathname;
 
-    // Unauthenticated minimal liveness ping (reveals zero sensitive state, zero CORS headers to unpaired extensions)
+    // Unauthenticated minimal liveness ping (reveals zero sensitive state, blocks cross-site no-cors probing via CORP)
     if (req.method === 'GET' && pathname === '/api/ping') {
       const pingPayload = Buffer.from(JSON.stringify({ ok: true, service: 'chrome-live-for-antigravity' }), 'utf8');
       res.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
         'Cache-Control': 'no-store',
+        'Cross-Origin-Resource-Policy': 'same-origin',
+        'X-Content-Type-Options': 'nosniff',
         'Content-Length': String(pingPayload.length)
       });
       res.end(pingPayload);
@@ -783,7 +831,11 @@ export function createDaemonServer(options = {}) {
       if (req.method === 'GET' && pathname === '/api/frame') {
         const targetFrame = resolveFrame(parsedUrl.searchParams.get('tabId'));
         if (!targetFrame || !targetFrame.buffer) {
-          const noContentHeaders = { 'Cache-Control': 'no-store' };
+          const noContentHeaders = {
+            'Cache-Control': 'no-store',
+            'Cross-Origin-Resource-Policy': 'same-origin',
+            'X-Content-Type-Options': 'nosniff'
+          };
           attachServerProofHeader(req, 204, noContentHeaders);
           res.writeHead(204, noContentHeaders);
           res.end();
@@ -792,7 +844,9 @@ export function createDaemonServer(options = {}) {
         const headers = {
           'Content-Type': targetFrame.mimeType || 'image/jpeg',
           'Content-Length': String(targetFrame.buffer.length),
-          'Cache-Control': 'no-store'
+          'Cache-Control': 'no-store',
+          'Cross-Origin-Resource-Policy': 'same-origin',
+          'X-Content-Type-Options': 'nosniff'
         };
         if (typeof targetFrame.tabId === 'number') {
           headers['X-Chrome-Live-Tab-Id'] = String(targetFrame.tabId);
@@ -1109,12 +1163,13 @@ export function createDaemonServer(options = {}) {
     }
 
     if (msg.type === 'screencast_frame' && typeof msg.data === 'string' && msg.data.length > 0) {
-      if (typeof msg.tabId === 'number') {
-        const matchingTab = Array.isArray(state.tabs) ? state.tabs.find((t) => t && t.tabId === msg.tabId) : null;
-        // Drop late in-flight frames arriving after a tab was paused or released
-        if (matchingTab?.paused || (Array.isArray(state.tabs) && state.tabs.length > 0 && !matchingTab)) {
-          return;
-        }
+      // Strict active-tab allowlist: drop any frame missing a valid integer tabId or belonging to a paused/released tab
+      if (typeof msg.tabId !== 'number' || !Number.isInteger(msg.tabId)) {
+        return;
+      }
+      const matchingTab = Array.isArray(state.tabs) ? state.tabs.find((t) => t && t.tabId === msg.tabId) : null;
+      if (!matchingTab || matchingTab.paused) {
+        return;
       }
       const mimeType = msg.mimeType === 'image/png' ? 'image/png' : 'image/jpeg';
       const buffer = Buffer.from(msg.data, 'base64');

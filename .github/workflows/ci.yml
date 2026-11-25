@@ -32,7 +32,7 @@ jobs:
           CHROME_LIVE_PORT: "28496"
           CHROME_LIVE_HOME: ${{ runner.temp }}/chrome-live-ci-home
         run: |
-          node ./bin/chrome-live.mjs token > /dev/null
+          node ./bin/chrome-live.mjs setup > /dev/null
           node ./bin/chrome-live.mjs start
           node ./bin/chrome-live.mjs health
           node ./bin/chrome-live.mjs playbook status

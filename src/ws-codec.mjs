@@ -270,7 +270,7 @@ export class NativeWsPeer extends EventEmitter {
         peerCode = payload.readUInt16BE(0);
         const validWireCloseCode =
           (peerCode >= 1000 && peerCode <= 1003) ||
-          (peerCode >= 1007 && peerCode <= 1011) ||
+          (peerCode >= 1007 && peerCode <= 1014) ||
           (peerCode >= 3000 && peerCode <= 4999);
         if (!validWireCloseCode) {
           this.close(1002, 'Invalid RFC 6455 close code');

@@ -439,6 +439,7 @@ export function startMcpStdioServer({ callDaemon }) {
   const MAX_MCP_MESSAGE_BYTES = 16 * 1024 * 1024;
   const MAX_MCP_HEADER_BYTES = 8192;
   let lockedFramingMode = null; // null until first valid message locks 'line' or 'header'
+  let discardingOversizedLine = false;
 
   process.stdin.on('data', (chunk) => {
     rawBuffer = rawBuffer.length === 0 ? chunk : Buffer.concat([rawBuffer, chunk]);
@@ -536,11 +537,27 @@ export function startMcpStdioServer({ callDaemon }) {
         handleRpc(parsedMsg);
       } else {
         const nlIdx = rawBuffer.indexOf(0x0a);
+        if (discardingOversizedLine) {
+          if (nlIdx === -1) {
+            rawBuffer = Buffer.alloc(0);
+            return;
+          }
+          rawBuffer = rawBuffer.subarray(nlIdx + 1);
+          discardingOversizedLine = false;
+          writeMessage({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Message exceeds maximum byte limit' } });
+          continue;
+        }
         if (nlIdx === -1) {
           if (rawBuffer.length > MAX_MCP_MESSAGE_BYTES) {
             rawBuffer = Buffer.alloc(0);
+            discardingOversizedLine = true;
           }
           return;
+        }
+        if (nlIdx > MAX_MCP_MESSAGE_BYTES) {
+          rawBuffer = rawBuffer.subarray(nlIdx + 1);
+          writeMessage({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Message exceeds maximum byte limit' } });
+          continue;
         }
         const line = rawBuffer.subarray(0, nlIdx).toString('utf8').replace(/^\uFEFF/, '').trim();
         rawBuffer = rawBuffer.subarray(nlIdx + 1);
@@ -562,14 +579,18 @@ async function buildMonitorStructuredState(callDaemon, lastFrameTs = 0, targetTa
   const hasExplicitTab = typeof targetTabId === 'number' && Number.isInteger(targetTabId);
   const baseState = await callDaemon('GET', '/api/state');
   const tabs = Array.isArray(baseState?.tabs) ? baseState.tabs : [];
-  // Never silently fall back to capturing a different shared tab when an explicit tabId was closed or released
+  // Never silently fall back to capturing a different shared tab when an explicit tabId was closed or released,
+  // and do NOT auto-pick/screenshot a tab when multiple tabs exist and no explicit targetTabId was given!
   const resolvedPrimary = hasExplicitTab
     ? tabs.find((t) => t.tabId === targetTabId) || null
-    : tabs.find((t) => t.substate === 'shared') || tabs[0] || null;
+    : tabs.length === 1
+      ? tabs[0]
+      : tabs.find((t) => t.substate === 'shared') || tabs[0] || null;
   const effectiveTabId = resolvedPrimary ? resolvedPrimary.tabId : undefined;
   const hasTab = typeof effectiveTabId === 'number' && Number.isInteger(effectiveTabId);
+  const canAutoSnap = hasTab && !resolvedPrimary?.paused && (hasExplicitTab || tabs.length === 1);
 
-  if (forceSnap && hasTab && !resolvedPrimary?.paused) {
+  if (forceSnap && canAutoSnap) {
     await callDaemon('POST', '/api/command', {
       method: 'screenshot',
       params: { tabId: effectiveTabId }
@@ -592,14 +613,12 @@ async function buildMonitorStructuredState(callDaemon, lastFrameTs = 0, targetTa
     if (lastFrameTs === 0 || targetServerTs !== lastFrameTs) {
       fullState = await callDaemon('GET', `/api/state?includeFrame=1${tabQuery}`);
     }
-  } else if (hasTab && !resolvedPrimary?.paused && lastFrameTs === 0) {
+  } else if (canAutoSnap && lastFrameTs === 0) {
     await callDaemon('POST', '/api/command', {
       method: 'screenshot',
       params: { tabId: effectiveTabId }
     }).catch(() => {});
     fullState = await callDaemon('GET', `/api/state?includeFrame=1${tabQuery}`);
-  } else if (!hasExplicitTab && !hasTab && targetServerTs && targetServerTs !== lastFrameTs) {
-    fullState = await callDaemon('GET', '/api/state?includeFrame=1');
   }
   if (hasExplicitTab && fullState && typeof fullState === 'object') {
     fullState.requestedTabId = targetTabId;
@@ -704,6 +723,13 @@ async function invokeTool(toolName, args, callDaemon) {
         toolName === 'chrome_live_workspace'
           ? 'Chrome Live workspace app opened'
           : 'Inline live Chrome monitor mounted in chat';
+      // Keep model-visible `structuredContent` 100% 0-token lightweight (strip Base64 `frameDataUrl`);
+      // pass initial frame + `uiSecret` exclusively inside `_meta` for the isolated `ui://` iframe!
+      const modelSafeSc = sc && typeof sc === 'object' ? { ...sc } : {};
+      const initFrameDataUrl = modelSafeSc.frameDataUrl || null;
+      const initFrameTabId = modelSafeSc.frameTabId ?? null;
+      const initFrameCapturedAt = modelSafeSc.frameCapturedAt ?? 0;
+      delete modelSafeSc.frameDataUrl;
       return {
         __mcpRawResult: {
           content: [
@@ -712,8 +738,17 @@ async function invokeTool(toolName, args, callDaemon) {
               text: `${label} (connected=${Boolean(sc?.extensionConnected)}, activeTabs=${tabCount}).`
             }
           ],
-          structuredContent: sc && typeof sc === 'object' ? sc : {},
-          _meta: { uiSecret: UI_CAPABILITY_SECRET }
+          structuredContent: modelSafeSc,
+          _meta: {
+            uiSecret: UI_CAPABILITY_SECRET,
+            ...(initFrameDataUrl
+              ? {
+                  frameDataUrl: initFrameDataUrl,
+                  frameTabId: initFrameTabId,
+                  frameCapturedAt: initFrameCapturedAt
+                }
+              : {})
+          }
         }
       };
     }
@@ -789,7 +824,29 @@ async function invokeTool(toolName, args, callDaemon) {
         },
         timeoutMs: 85000
       }, 90000);
-    case 'chrome_live_batch':
+    case 'chrome_live_batch': {
+      const ALLOWED_BATCH_ACTIONS = new Set([
+        'open',
+        'navigate',
+        'type',
+        'click',
+        'upload',
+        'scroll',
+        'wait',
+        'snapshot',
+        'screenshot',
+        'done'
+      ]);
+      if (!Array.isArray(args?.steps) || args.steps.length === 0) {
+        throw new Error('chrome_live_batch requires a non-empty steps array');
+      }
+      for (let i = 0; i < args.steps.length; i++) {
+        const s = args.steps[i];
+        const act = String(s?.action || s?.method || s?.cmd || '').trim();
+        if (!ALLOWED_BATCH_ACTIONS.has(act)) {
+          throw new Error(`[GUARDRAIL] Action "${act}" at step ${i} is not permitted inside chrome_live_batch`);
+        }
+      }
       return await callDaemon(
         'POST',
         '/api/command',
@@ -803,6 +860,7 @@ async function invokeTool(toolName, args, callDaemon) {
         },
         95000
       );
+    }
     case 'chrome_live_playbook': {
       const act = args.action;
       if (act === 'status' || act === 'list') {

@@ -239,8 +239,10 @@
             const s = await resp.json();
             if (!s || s.daemonOffline) {
               led.dataset.on = 'false';
+              lastCapturedAt = 0;
               statusTitle.textContent = TXT.waking;
               emptyMsg.textContent = TXT.waking;
+              liveImg.removeAttribute('src');
               liveImg.style.display = 'none';
               emptyMsg.style.display = 'block';
               focusBtn.disabled = true;
@@ -253,12 +255,20 @@
             tabBadge.textContent = `${tabs.length} ${TXT.tabsSuffix}`;
 
             if (!connected) {
+              lastCapturedAt = 0;
               statusTitle.textContent = TXT.extOffline;
               emptyMsg.textContent = TXT.extOffline;
+              liveImg.removeAttribute('src');
               liveImg.style.display = 'none';
               emptyMsg.style.display = 'block';
               focusBtn.disabled = true;
               return;
+            }
+
+            // When all controlled tabs have been closed/released, reset pin lock so future sessions mount cleanly
+            if (tabs.length === 0) {
+              pinnedTabId = null;
+              pinnedTabClosed = false;
             }
 
             let target = null;
@@ -271,6 +281,20 @@
             }
             activeTabId = target ? target.tabId : null;
             focusBtn.disabled = activeTabId === null || Boolean(target && target.paused);
+
+            // Allow clicking tabBadge to cycle through remaining tabs when multiple tabs are open
+            tabBadge.style.cursor = tabs.length > 0 ? 'pointer' : 'default';
+            tabBadge.onclick = () => {
+              if (tabs.length === 0) return;
+              const curIdx = tabs.findIndex((t) => t.tabId === pinnedTabId);
+              const nextTab = tabs[(curIdx + 1) % tabs.length];
+              if (nextTab) {
+                pinnedTabId = nextTab.tabId;
+                pinnedTabClosed = false;
+                lastCapturedAt = 0;
+                poll(true);
+              }
+            };
 
             if (!target) {
               lastCapturedAt = 0;

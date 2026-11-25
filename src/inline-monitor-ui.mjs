@@ -771,10 +771,17 @@ export function buildInlineMonitorHtml() {
           titleEl.textContent = L.offline;
           subEl.textContent = '';
           hasActiveTabs = false;
+          lastFrameTs = 0;
+          lastFrameTabId = null;
+          screenImg.removeAttribute('src');
+          screenImg.style.display = 'none';
+          emptyEl.textContent = L.offline;
+          emptyEl.style.display = 'block';
           remoteBtn.disabled = true;
           regionBtn.disabled = true;
           attachBtn.disabled = true;
           relayBtn.disabled = true;
+          snapBtn.disabled = true;
           releaseBtn.disabled = true;
           return;
         }
@@ -782,6 +789,13 @@ export function buildInlineMonitorHtml() {
         const tabs = Array.isArray(data.tabs) ? data.tabs : [];
         hasActiveTabs = tabs.length > 0;
         const prevInRelay = Boolean(currentTab && currentTab.inRelayPopout);
+
+        // When all controlled tabs have been released/closed and no specific missing tab was requested,
+        // clear the pin lock so future newly opened tabs mount cleanly without getting stuck!
+        if (tabs.length === 0 && !data.requestedTabMissing) {
+          selectedTabId = null;
+          pinnedTabClosed = false;
+        }
 
         if (typeof data.requestedTabId === 'number' && selectedTabId === null) {
           selectedTabId = data.requestedTabId;
@@ -923,13 +937,23 @@ export function buildInlineMonitorHtml() {
         }
 
         if (msg.method === 'ui/notifications/tool-result') {
-          const metaSecret = msg.params && msg.params._meta && msg.params._meta.uiSecret;
+          const metaObj = msg.params && msg.params._meta;
+          const metaSecret = metaObj && metaObj.uiSecret;
           if (typeof metaSecret === 'string' && metaSecret) {
             uiSecret = metaSecret;
           }
-          const sc = msg.params && (msg.params.structuredContent || msg.params);
-          if (sc) {
-            renderSnapshot(sc);
+          const rawSc = msg.params && (msg.params.structuredContent || msg.params);
+          if (rawSc) {
+            const mergedSc =
+              metaObj && metaObj.frameDataUrl && !rawSc.frameDataUrl
+                ? {
+                    ...rawSc,
+                    frameDataUrl: metaObj.frameDataUrl,
+                    frameTabId: metaObj.frameTabId ?? rawSc.frameTabId,
+                    frameCapturedAt: metaObj.frameCapturedAt ?? rawSc.frameCapturedAt
+                  }
+                : rawSc;
+            renderSnapshot(mergedSc);
             scheduleNextPoll();
           }
         }

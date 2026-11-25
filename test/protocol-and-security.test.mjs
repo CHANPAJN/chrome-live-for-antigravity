@@ -893,8 +893,13 @@ test('MCP stdio server isolates model-visible monitor from app-only UI actions, 
     );
 
     const monitorCall = await rpc(4, 'tools/call', { name: 'chrome_live_monitor', arguments: { tabId: 77 } });
-    assert.ok(monitorCall.result.structuredContent.frameDataUrl.startsWith('data:image/jpeg;base64,'));
-    assert.equal(monitorCall.result.structuredContent.frameTabId, 77);
+    assert.equal(
+      monitorCall.result.structuredContent.frameDataUrl,
+      undefined,
+      'Model-visible structuredContent must omit Base64 frameDataUrl (0-token guarantee)'
+    );
+    assert.ok(monitorCall.result._meta.frameDataUrl.startsWith('data:image/jpeg;base64,'));
+    assert.equal(monitorCall.result._meta.frameTabId, 77);
     const uiSecret = monitorCall.result._meta?.uiSecret;
     assert.match(uiSecret, /^[0-9a-f]{64}$/, 'Expected 256-bit uiSecret inside CallToolResult._meta');
     assert.equal(
@@ -913,9 +918,10 @@ test('MCP stdio server isolates model-visible monitor from app-only UI actions, 
       'Model-visible text content MUST NOT include uiSecret'
     );
 
-    // Entrypoint launches invoke chrome_live_workspace with empty {}
+    // Entrypoint launches invoke chrome_live_workspace with empty {} (and must NOT implicitly screenshot when >1 tabs exist)
     const wsCall = await rpc(21, 'tools/call', { name: 'chrome_live_workspace', arguments: {} });
-    assert.ok(wsCall.result.structuredContent.frameDataUrl.startsWith('data:image/jpeg;base64,'));
+    assert.equal(wsCall.result.structuredContent.frameDataUrl, undefined);
+    assert.ok(wsCall.result._meta.uiSecret);
 
     // Authenticated iframe UI actions succeed when carrying the ephemeral UI capability secret
     const pollCall = await rpc(22, 'tools/call', {
@@ -1885,7 +1891,8 @@ test('Blind-audit round-1 regressions: multi-tab release isolation, paused frame
       });
       const uiSecret = monInit.result._meta?.uiSecret;
       assert.equal(monInit.result.structuredContent.uiSecret, undefined);
-      assert.equal(monInit.result.structuredContent.frameTabId, 88);
+      assert.equal(monInit.result.structuredContent.frameDataUrl, undefined);
+      assert.equal(monInit.result._meta.frameTabId, 88);
 
       // Releasing tab 88 while tab 77 is still active MUST NOT trigger screenshot on tab 77 or leak tab 77's frame
       rpcCallsSeen.length = 0;
@@ -2434,6 +2441,217 @@ test('Blind-audit round-3 regressions: matrix/encoded dot-segment checkout bypas
       } catch {}
       mcpProc.kill();
     }
+      await daemon.close();
+    fs.rmSync(tempStateDir, { recursive: true, force: true });
+  }
+});
+
+test('Blind-audit round-4 regressions: quote-aware CSS comment/pseudo lexer, batch privileged-action allowlist, Shadow DOM Web Component OTP host-chain block, single-tab post-release late frame drop, released-tab syncHudNow guard, SPA hash/base64 token redaction & CORP/Sec-Fetch-Site isolation', async () => {
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+
+  // 1. Quote-aware CSS selector lexer defeats cross-quote comment smuggle `[title="/*"], body:has(meta[content^="eyJ"]), [title="*/"]`
+  const extGuardMatch = swSource.match(
+    /const CHECKOUT_SEGMENT_RX =[\s\S]*?function assertSafeModelSelector[\s\S]*?\n\}/
+  );
+  const extCheckTabMatch = swSource.match(/function checkTabUrlAllowed\(rawUrl\)[\s\S]*?\n\}/);
+  assert.ok(extGuardMatch && extCheckTabMatch);
+  const extVm = vm.createContext({
+    URL,
+    decodeURIComponent,
+    BUILTIN_PROTECTED_DOMAINS: ['stripe.com', 'alipay.com'],
+    customBlockedDomains: [],
+    bridgeConfig: { port: 28196 }
+  });
+  vm.runInContext(`${extGuardMatch[0]}\n${extCheckTabMatch[0]}`, extVm);
+
+  for (const smuggledCss of [
+    '[title="/*"], body:has(meta[name="csrf-token"][content^="eyJ"]), [title="*/"]',
+    '[placeholder="/*"] input[value^="a"] [placeholder="*/"]',
+    'button:not([value="secret"])',
+    'div:is([data-secret="123"])',
+    'input[name="unclosed'
+  ]) {
+    assert.throws(() => extVm.assertSafeModelSelector(smuggledCss), /\[GUARDRAIL\]/, `Must block: ${smuggledCss}`);
+  }
+  // Safe selectors with quotes or structural pseudos pass
+  extVm.assertSafeModelSelector('button[aria-label="Submit: Order (1)"]:not([disabled])');
+
+  // Hashbang `#!checkout` & `dashboard.stripe.com` & no hash leak in guardrail error reason
+  const hashLeakCheck = evaluateUrlSafety('https://shop.example.com/checkout#access_token=PAY_SECRET_999');
+  assert.equal(hashLeakCheck.allowed, false);
+  assert.equal(hashLeakCheck.reason.includes('PAY_SECRET_999'), false, 'Guardrail reason must never echo raw hash secrets');
+  assert.equal(evaluateUrlSafety('https://shop.example.com/#!checkout').allowed, false);
+  assert.equal(extVm.checkTabUrlAllowed('https://shop.example.com/#!checkout').allowed, false);
+  assert.equal(evaluateUrlSafety('https://dashboard.stripe.com/payouts').allowed, false);
+
+  // 2. SPA hash path tokens, Base64 `=`/`%` path keys, and uppercase `HTTPS://` text URL scrubbing
+  const spaInviteUrl = 'https://seller.example.com/app/#/invite/9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c';
+  assert.equal(redactUrlForAudit(spaInviteUrl).includes('9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c'), false);
+  assert.equal(sanitizeRouteUrl(spaInviteUrl).includes('9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c'), false);
+
+  const spaJwtQueryUrl = 'https://seller.example.com/app/#/verify/eyJhbGciOiJIUzI1NiJ9.secretpayload?foo=1';
+  assert.equal(redactUrlForAudit(spaJwtQueryUrl).includes('eyJhbGci'), false);
+
+  const b64PathKeyUrl = 'https://example.com/reset/K7gNU3sdo+OL0wNhqoVWhr3g6s1xYv72ol%2Fpe%2FUnols=/confirm';
+  assert.equal(redactUrlForAudit(b64PathKeyUrl).includes('K7gNU3sdo'), false);
+
+  const upperTextUrl = 'Redirecting to HTTPS://sso.example.com/cb?access_token=UPPER_SECRET_123 now';
+  const { redactUrlsInText } = await import('../src/guardrails.mjs');
+  assert.equal(redactUrlsInText(upperTextUrl).includes('UPPER_SECRET_123'), false);
+
+  // 3. Shadow DOM Web Component (`<x-otp-input name="smsCode">`) host-chain & ShadowRoot `aria-labelledby` OTP typing block
+  const typeGuardMatch = swSource.match(
+    /if \(!el\) return \{ ok: false, error: `Input element not found: \$\{tgt\}` \};\s*(const elStyle = window\.getComputedStyle\(el\);[\s\S]*?return \{\s*ok: false,\s*error:\s*'\[GUARDRAIL\] Automated typing into password[\s\S]*?\};\s*\})/
+  );
+  assert.ok(typeGuardMatch);
+  const checkShadowType = vm.runInNewContext(
+    `(function(el, outerMatchedEl, document, window, HTMLInputElement) { ${typeGuardMatch[1]} return { ok: true }; })`
+  );
+  class MockInput {}
+  const shadowHost = {
+    id: '',
+    labels: [],
+    parentElement: null,
+    closest: () => null,
+    getRootNode: () => ({}),
+    getAttribute(k) {
+      return k === 'name' ? 'smsCode' : '';
+    }
+  };
+  const shadowRootWithHost = {
+    host: shadowHost,
+    getElementById(id) {
+      return id === 'inner-lbl' ? { textContent: '动态验证码' } : null;
+    }
+  };
+  const anonymousInnerInput = Object.assign(new MockInput(), {
+    type: 'text',
+    id: '',
+    labels: [],
+    parentElement: null,
+    closest: () => null,
+    getRootNode: () => shadowRootWithHost,
+    getAttribute: () => ''
+  });
+  assert.equal(
+    checkShadowType(
+      anonymousInnerInput,
+      shadowHost,
+      { getElementById: () => null },
+      { getComputedStyle: () => ({ webkitTextSecurity: 'none', getPropertyValue: () => 'none' }) },
+      MockInput
+    ).ok,
+    false,
+    'Anonymous inner input inside <x-otp-input name="smsCode"> Shadow DOM must inherit host OTP block'
+  );
+
+  // Also test inner ShadowRoot `aria-labelledby="inner-lbl"` when host has zero attributes
+  const plainHost = { id: '', labels: [], parentElement: null, closest: () => null, getRootNode: () => ({}), getAttribute: () => '' };
+  const shadowRootLabelOnly = {
+    host: plainHost,
+    getElementById: (id) => (id === 'inner-lbl' ? { textContent: '请输入安全码' } : null)
+  };
+  const innerLabelledInput = Object.assign(new MockInput(), {
+    type: 'tel',
+    id: '',
+    labels: [],
+    parentElement: null,
+    closest: () => null,
+    getRootNode: () => shadowRootLabelOnly,
+    getAttribute: (k) => (k === 'aria-labelledby' ? 'inner-lbl' : '')
+  });
+  assert.equal(
+    checkShadowType(
+      innerLabelledInput,
+      plainHost,
+      { getElementById: () => null },
+      { getComputedStyle: () => ({ webkitTextSecurity: 'none', getPropertyValue: () => 'none' }) },
+      MockInput
+    ).ok,
+    false,
+    'ShadowRoot-local aria-labelledby must be resolved and blocked'
+  );
+
+  // 4. `syncHudNow` MUST NOT re-lock a tab after it has been removed from `managedTabs` (`!entry`)
+  const syncHudNowMatch = swSource.match(/async function syncHudNow\(tabId, payload\)[\s\S]*?\n\}/);
+  assert.ok(syncHudNowMatch);
+  let injectedOnReleasedTab = false;
+  const emptyManaged = new Map();
+  const runSyncHud = vm.runInNewContext(`(${syncHudNowMatch[0]})`, {
+    managedTabs: emptyManaged,
+    currentLang: 'zh',
+    runHudScriptSafe: async () => {
+      injectedOnReleasedTab = true;
+      return [{ result: { updated: true } }];
+    }
+  });
+  await runSyncHud(999, { visible: true, mode: 'working', activity: 'Late update after release' });
+  assert.equal(injectedOnReleasedTab, false, 'Late working syncHudNow must never re-inject shield on released tab');
+
+  // 5. Daemon blocks privileged `remote_interact`/`focus_tab` inside `batch`, drops late frames when `tabs: []`, and blocks `Sec-Fetch-Site: cross-site`
+  const tempStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-r4-daemon-'));
+  const tok = crypto.randomBytes(32).toString('hex');
+  const daemon = createDaemonServer({ host: '127.0.0.1', port: 0, stateDir: tempStateDir, token: tok });
+  const port = await daemon.listen();
+  let extWs = null;
+  try {
+    // Cross-site no-cors probe (no Origin header, Sec-Fetch-Site: cross-site) MUST get 403 even on /api/ping!
+    const crossSitePing = await new Promise((resolve, reject) => {
+      http
+        .get(
+          {
+            host: '127.0.0.1',
+            port,
+            path: '/api/ping',
+            agent: false,
+            headers: { 'Sec-Fetch-Site': 'cross-site' }
+          },
+          (res) => {
+            res.resume();
+            resolve({ status: res.statusCode, corp: res.headers['cross-origin-resource-policy'] });
+          }
+        )
+        .on('error', reject);
+    });
+    assert.equal(crossSitePing.status, 403, 'Sec-Fetch-Site: cross-site probe must be rejected with 403');
+    assert.equal(crossSitePing.corp, 'same-origin');
+
+    extWs = await connectTestWsClient(port, '/ws/extension', tok);
+    extWs.sendMaskedJson({
+      type: 'hello',
+      version: '1.0.0',
+      tabs: [{ tabId: 101, substate: 'shared', paused: false, title: 'Shop', url: 'https://shop.example.com/items' }]
+    });
+    await new Promise((r) => setTimeout(r, 25));
+
+    // Attempting to smuggle UI-only `remote_interact` or `focus_tab` inside `batch` MUST fail with FORBIDDEN_BATCH_ACTION
+    const smuggledBatch = await httpJson(port, 'POST', '/api/command', { token: tok }, {
+      method: 'batch',
+      params: { steps: [{ action: 'remote_interact', kind: 'click', rx: 0.5, ry: 0.5 }] }
+    });
+    assert.equal(smuggledBatch.statusCode, 500);
+    assert.match(smuggledBatch.json.error, /FORBIDDEN_BATCH_ACTION/);
+
+    // Release sole tab 101 -> `tabs: []`; then send a late in-flight `screencast_frame` for tab 101 -> MUST be dropped!
+    extWs.sendMaskedJson({ type: 'status_sync', tabs: [], activeTabId: null });
+    extWs.sendMaskedJson({
+      type: 'screencast_frame',
+      tabId: 101,
+      mimeType: 'image/jpeg',
+      data: Buffer.from('late-frame-after-release').toString('base64'),
+      title: 'Shop',
+      url: 'https://shop.example.com/items'
+    });
+    await new Promise((r) => setTimeout(r, 30));
+
+    const postReleaseFrame = await httpJson(port, 'GET', '/api/frame?tabId=101', { token: tok });
+    assert.equal(postReleaseFrame.statusCode, 204, 'Late screencast_frame after sole tab release must be dropped');
+    const postReleaseAnyFrame = await httpJson(port, 'GET', '/api/frame', { token: tok });
+    assert.equal(postReleaseAnyFrame.statusCode, 204);
+  } finally {
+    try {
+      extWs?.socket?.destroy();
+    } catch {}
     await daemon.close();
     fs.rmSync(tempStateDir, { recursive: true, force: true });
   }

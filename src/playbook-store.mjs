@@ -186,10 +186,12 @@ export function sanitizeRouteUrl(rawUrl, customBlockedDomains = []) {
   u.username = '';
   u.password = '';
   if (u.hash) {
-    // Only retain pure SPA route paths like #/orders/list; strip all opaque anchors/tokens/params (e.g. #9f8e7d...)
+    // Only retain short pure SPA route paths like #/orders/list; strip any hash containing high-entropy or hex tokens
+    const hashSegs = u.hash.replace(/^#+!?/, '').split('/');
+    const hasTokenSeg = hashSegs.some((seg) => isHighEntropyPathToken(seg) || /[0-9a-f]{20,}/i.test(seg) || /^eyJ/i.test(seg));
     const pureSpaRoute =
+      !hasTokenSeg &&
       /^#\/[A-Za-z0-9/_-]{1,64}$/.test(u.hash) &&
-      !/^#\/?(?:eyJ|[0-9a-f]{24,})/i.test(u.hash) &&
       !AUDIT_SENSITIVE_PARAM_RX.test(u.hash);
     if (!pureSpaRoute) {
       u.hash = '';

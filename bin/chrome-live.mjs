@@ -173,8 +173,14 @@ function copyDirectoryRecursive(srcDir, destDir, replacements = {}) {
       const ext = path.extname(entry.name).toLowerCase();
       if (['.md', '.json', '.mjs', '.js', '.html', '.svg'].includes(ext)) {
         let content = fs.readFileSync(srcFull, 'utf8');
-        for (const [placeholder, val] of Object.entries(replacements)) {
-          content = content.split(placeholder).join(val);
+        for (const [placeholder, rawVal] of Object.entries(replacements)) {
+          let safeVal = String(rawVal);
+          if (ext === '.json') {
+            safeVal = JSON.stringify(safeVal).slice(1, -1);
+          } else if (ext === '.mjs' || ext === '.js') {
+            safeVal = safeVal.replace(/\\/g, '/').replace(/'/g, "\\'");
+          }
+          content = content.split(placeholder).join(safeVal);
         }
         fs.writeFileSync(destFull, content, 'utf8');
       } else {

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { getStateDir } from './token-store.mjs';
+import { DEFAULT_PORT, getStateDir } from './token-store.mjs';
 
 export function expandLeadingTilde(rawPath) {
   if (typeof rawPath !== 'string') return '';
@@ -30,8 +30,10 @@ const BLOCKED_PORTS = new Set(['9222', '9229', '28196']);
 
 export const DEFAULT_BLOCKED_DOMAINS = Object.freeze([
   // Global payment & checkout gateways
+  'stripe.com',
   'checkout.stripe.com',
   'billing.stripe.com',
+  'dashboard.stripe.com',
   'paypal.com',
   'venmo.com',
   'wise.com',
@@ -75,15 +77,27 @@ export const AUDIT_SENSITIVE_PARAM_RX =
 const HASH_SENSITIVE_PAIR_RX =
   /([#?&])([^=&#]*(?:token|secret|passw|pwd|apikey|api[-_]?key|access[-_]?key|private[-_]?key|auth|code|state|sig|jwt|bearer|ticket|session|sid|csrf|xsrf|otp|credential|hmac|(?:^|[-_.])(?:key|pass|pin|hash)(?:$|[-_.]))[^=&#]*)=([^&#]*)/gi;
 
-export function isHighEntropyPathToken(segment) {
-  if (!segment || segment.length < 32) return false;
+export function isHighEntropyPathToken(rawSegment) {
+  if (!rawSegment || rawSegment.length < 32) return false;
+  let segment = String(rawSegment);
+  if (segment.includes('%')) {
+    try {
+      segment = decodeURIComponent(segment);
+    } catch {}
+  }
+  if (segment.length < 32) return false;
   if (/^eyJ[A-Za-z0-9._~+/=-]{10,}$/.test(segment)) return true;
   if (/^[0-9a-f]{32,}$/i.test(segment)) return true;
-  if (segment.length >= 40 && /^[A-Za-z0-9._~+-]+$/.test(segment)) {
+  if (segment.length >= 36 && /^[A-Za-z0-9._~+/=-]+$/.test(segment)) {
     const hasDigit = /\d/.test(segment);
     const hasUpper = /[A-Z]/.test(segment);
     const hasLower = /[a-z]/.test(segment);
-    if ((hasDigit && (hasUpper || hasLower)) || (hasUpper && hasLower && !segment.includes('-'))) {
+    const hasB64Punct = /[+/=]/.test(segment);
+    if (
+      (hasDigit && (hasUpper || hasLower)) ||
+      hasB64Punct ||
+      (hasUpper && hasLower && !segment.includes('-'))
+    ) {
       return true;
     }
   }
@@ -161,8 +175,29 @@ export function redactUrlForAudit(rawUrl) {
     }
     if (parsed.hash) {
       let cleanedHash = parsed.hash.replace(HASH_SENSITIVE_PAIR_RX, '$1$2=REDACTED');
-      if (cleanedHash === parsed.hash && /^#(?:eyJ[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{32,})$/.test(parsed.hash)) {
+      if (cleanedHash === parsed.hash && /^#!?(:?eyJ[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{32,})$/.test(parsed.hash)) {
         cleanedHash = '#REDACTED';
+      } else {
+        // Also scrub high-entropy token segments inside SPA hash paths (e.g. #/invite/9f8e7d... or #/verify/eyJ...?foo=1)
+        const prefixMatch = cleanedHash.match(/^(#!?)/);
+        const hashPrefix = prefixMatch ? prefixMatch[1] : '#';
+        const body = cleanedHash.slice(hashPrefix.length);
+        const qPos = body.indexOf('?');
+        const hPath = qPos === -1 ? body : body.slice(0, qPos);
+        const hQuery = qPos === -1 ? '' : body.slice(qPos);
+        if (hPath.length >= 32) {
+          const hParts = hPath.split('/');
+          let hChanged = false;
+          for (let i = 0; i < hParts.length; i++) {
+            if (isHighEntropyPathToken(hParts[i])) {
+              hParts[i] = 'REDACTED';
+              hChanged = true;
+            }
+          }
+          if (hChanged) {
+            cleanedHash = `${hashPrefix}${hParts.join('/')}${hQuery}`;
+          }
+        }
       }
       if (cleanedHash !== parsed.hash) {
         parsed.hash = cleanedHash;
@@ -176,7 +211,7 @@ export function redactUrlForAudit(rawUrl) {
 }
 
 export function redactUrlsInText(rawText) {
-  if (typeof rawText !== 'string' || !rawText.includes('http')) return rawText;
+  if (typeof rawText !== 'string' || !/https?:\/\//i.test(rawText)) return rawText;
   return rawText.replace(/https?:\/\/[^\s"'<>)\]]+/gi, (m) => redactUrlForAudit(m));
 }
 
@@ -213,7 +248,8 @@ export function evaluateUrlSafety(rawUrl, customBlockedDomains = []) {
     };
   }
 
-  if (parsed.port && BLOCKED_PORTS.has(parsed.port)) {
+  const activePortStr = String(process.env.CHROME_LIVE_PORT || DEFAULT_PORT || 28196).trim();
+  if (parsed.port && (BLOCKED_PORTS.has(parsed.port) || parsed.port === activePortStr)) {
     return {
       allowed: false,
       code: 'BLOCKED_PORT',
@@ -246,23 +282,24 @@ export function evaluateUrlSafety(rawUrl, customBlockedDomains = []) {
   if (!canonPath.ok) {
     return { allowed: false, code: 'MALFORMED_URL', reason: 'Malformed percent-encoding in URL pathname' };
   }
-  const rawHashBody = parsed.hash ? parsed.hash.replace(/^#+/, '') : '';
+  const rawHashBody = parsed.hash ? parsed.hash.replace(/^#+!?/, '') : '';
   const canonHash = rawHashBody ? canonicalizePathForGuardrail(rawHashBody) : { ok: true, rawPath: '', path: '' };
   if (!canonHash.ok) {
     return { allowed: false, code: 'MALFORMED_URL', reason: 'Malformed percent-encoding in URL fragment' };
   }
 
-  // Inspect BOTH uncollapsed and dot-collapsed routes so `/checkout/..;x=1` and `/cashier%2f..` cannot pop sensitive segments!
+  // Inspect BOTH uncollapsed and dot-collapsed routes so `/checkout/..;x=1`, `/cashier%2f..`, and `#!checkout` cannot bypass!
   if (
     CHECKOUT_SEGMENT_RX.test(canonPath.rawPath) ||
     CHECKOUT_SEGMENT_RX.test(canonPath.path) ||
     (canonHash.rawPath && CHECKOUT_SEGMENT_RX.test(canonHash.rawPath)) ||
     (canonHash.path && CHECKOUT_SEGMENT_RX.test(canonHash.path))
   ) {
+    // Never echo raw parsed.hash into error messages to avoid leaking #access_token=... fragments
     return {
       allowed: false,
       code: 'PAYMENT_PATH',
-      reason: `URL route "${parsed.pathname}${parsed.hash}" matches protected payment/checkout guardrail`
+      reason: 'URL route matches protected payment/checkout guardrail'
     };
   }
 
