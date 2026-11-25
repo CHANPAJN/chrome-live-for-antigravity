@@ -283,11 +283,17 @@ export function learnFromPageVisit({ url, title, elements = [] } = {}) {
     changed = true;
   }
 
-  // Persist stable ID/name selectors if provided by snapshot
+const SENSITIVE_SELECTOR_RX =
+  /(?:password|passwd|passcode|pwd|one-time|otp|2fa|totp|cvv|cvc|secret|pin|token)/i;
+
+  // Persist stable ID/name selectors if provided by snapshot (skip sensitive credential fields)
   if (Array.isArray(elements)) {
     for (const el of elements) {
       if (el && el.stableSelector && el.label && Object.keys(bucket.selectors).length < MAX_SELECTORS_PER_SITE) {
         const key = String(el.label).slice(0, 40);
+        if (SENSITIVE_SELECTOR_RX.test(key) || SENSITIVE_SELECTOR_RX.test(String(el.stableSelector))) {
+          continue;
+        }
         if (bucket.selectors[key] !== el.stableSelector) {
           bucket.selectors[key] = el.stableSelector;
           changed = true;
@@ -315,6 +321,9 @@ export function learnInteractionSelector({ url, label, selector } = {}) {
   const cleanKey = String(label).replace(/\s+/g, ' ').trim().slice(0, 42);
   const cleanCss = String(selector).trim().slice(0, 140);
   if (!cleanKey || !cleanCss) return false;
+  if (/(?:password|passwd|passcode|pwd|one-time|otp|2fa|totp|cvv|cvc|secret|pin|token)/i.test(`${cleanKey} ${cleanCss}`)) {
+    return false;
+  }
 
   const bucket = ensureSiteBucket(store, domain);
   if (bucket.selectors[cleanKey] === cleanCss) return false;

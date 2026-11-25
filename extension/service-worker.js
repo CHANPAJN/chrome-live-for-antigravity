@@ -96,8 +96,48 @@ let bridgeConfig = {
 let customBlockedDomains = [];
 
 let ws = null;
+let wsAuthed = false;
 let wsReconnectTimer = null;
 let localAudit = [];
+
+function generateRandomHex(byteLen = 32) {
+  const bytes = new Uint8Array(byteLen);
+  crypto.getRandomValues(bytes);
+  let hex = '';
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, '0');
+  }
+  return hex;
+}
+
+async function hmacSha256Hex(secret, message) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(String(secret || '')),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(String(message || '')));
+  const bytes = new Uint8Array(sig);
+  let hex = '';
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, '0');
+  }
+  return hex;
+}
+
+function constantTimeHexEqual(a, b) {
+  const sa = String(a || '');
+  const sb = String(b || '');
+  if (!sa || sa.length !== sb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < sa.length; i++) {
+    diff |= sa.charCodeAt(i) ^ sb.charCodeAt(i);
+  }
+  return diff === 0;
+}
 
 // tabId -> { tabId, substate: 'shared'|'worker', uiMode: string, attachedCdp: boolean, screencastActive: boolean, paused: boolean, title: string, url: string, activity: string, idleTimer: any }
 const managedTabs = new Map();
@@ -303,7 +343,7 @@ function notifyPanelAndDaemon() {
   syncActionBadge();
   persistSessionState();
   const tabs = serializeTabs();
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  if (ws && ws.readyState === WebSocket.OPEN && wsAuthed) {
     ws.send(
       JSON.stringify({
         type: 'status_sync',
@@ -353,27 +393,52 @@ async function connectWebSocket() {
   try {
     const sock = new WebSocket(wsUrl);
     ws = sock;
+    wsAuthed = false;
+    const clientNonce = generateRandomHex(32);
 
     sock.addEventListener('open', () => {
       if (ws !== sock) return;
-      // First-frame token auth avoids placing the pairing token in WebSocket URL query strings
-      sock.send(
-        JSON.stringify({
-          type: 'auth',
-          token: bridgeConfig.token,
-          version: EXT_VERSION,
-          tabs: serializeTabs(),
-          customBlockedDomains
-        })
-      );
-      chrome.runtime.sendMessage({ type: 'sw:state_updated' }).catch(() => {});
+      // Mutual HMAC-SHA256 challenge-response: never send pairing token or tabs until daemon proves its identity
+      sock.send(JSON.stringify({ type: 'auth_init', clientNonce }));
     });
 
     sock.addEventListener('message', async (ev) => {
+      if (ws !== sock) return;
       let msg;
       try {
         msg = JSON.parse(String(ev.data));
       } catch {
+        return;
+      }
+      if (!wsAuthed) {
+        if (msg && msg.type === 'auth_challenge' && typeof msg.serverNonce === 'string' && typeof msg.serverProof === 'string') {
+          const expectedServerProof = await hmacSha256Hex(
+            bridgeConfig.token,
+            `chrome-live:server:${clientNonce}:${msg.serverNonce}`
+          );
+          if (!constantTimeHexEqual(msg.serverProof, expectedServerProof)) {
+            pushLocalAudit('auth_rejected', { reason: 'Daemon serverProof mismatch' }, 'blocked');
+            sock.close(4003, 'Daemon identity verification failed');
+            return;
+          }
+          const clientProof = await hmacSha256Hex(
+            bridgeConfig.token,
+            `chrome-live:client:${clientNonce}:${msg.serverNonce}`
+          );
+          wsAuthed = true;
+          sock.send(
+            JSON.stringify({
+              type: 'auth_response',
+              clientProof,
+              version: EXT_VERSION,
+              tabs: serializeTabs(),
+              customBlockedDomains
+            })
+          );
+          chrome.runtime.sendMessage({ type: 'sw:state_updated' }).catch(() => {});
+          return;
+        }
+        sock.close(4003, 'Expected auth_challenge');
         return;
       }
       if (msg.type === 'rpc_request' && msg.id) {
@@ -396,6 +461,7 @@ async function connectWebSocket() {
     sock.addEventListener('close', () => {
       if (ws === sock) {
         ws = null;
+        wsAuthed = false;
         chrome.runtime.sendMessage({ type: 'sw:state_updated' }).catch(() => {});
         scheduleReconnect(3500);
       }
@@ -560,10 +626,15 @@ async function pollHudUserEvents(tabId, entry) {
     for (const ev of state.events) {
       if (ev === 'pause') {
         entry.paused = true;
+        entry.uiMode = 'paused';
+        await stopCdpForTab(tabId, entry);
         await syncLiveTabGroups();
+        notifyPanelAndDaemon();
       } else if (ev === 'resume') {
         entry.paused = false;
+        entry.uiMode = 'working';
         await syncLiveTabGroups();
+        notifyPanelAndDaemon();
       } else if (ev === 'release') {
         await detachManagedTab(tabId, tr().released);
       }
@@ -579,6 +650,9 @@ function resetCdpIdleTimer(entry) {
 }
 
 async function ensureCdpForTab(tabId, entry) {
+  if (entry.paused) {
+    throw new Error('Tab automation is currently paused by user in the HUD');
+  }
   resetCdpIdleTimer(entry);
   if (entry.attachedCdp) return;
   await chrome.debugger.attach({ tabId }, '1.3');
@@ -598,25 +672,28 @@ async function ensureCdpForTab(tabId, entry) {
     .catch(() => {});
 }
 
-async function stopCdpForTab(tabId) {
-  const entry = managedTabs.get(tabId);
-  if (!entry) return;
-  if (entry.idleTimer) {
+async function stopCdpForTab(tabId, entryOverride = null) {
+  const entry = entryOverride || managedTabs.get(tabId) || null;
+  if (entry?.idleTimer) {
     clearTimeout(entry.idleTimer);
     entry.idleTimer = null;
   }
-  if (entry.screencastActive) {
+  const shouldStopStream = entry ? entry.screencastActive : true;
+  const shouldDetach = entry ? entry.attachedCdp : true;
+  if (entry) {
     entry.screencastActive = false;
+    entry.attachedCdp = false;
+  }
+  if (shouldStopStream) {
     await chrome.debugger.sendCommand({ tabId }, 'Page.stopScreencast').catch(() => {});
   }
-  if (entry.attachedCdp) {
-    entry.attachedCdp = false;
+  if (shouldDetach) {
     await chrome.debugger.detach({ tabId }).catch(() => {});
   }
 }
 
 async function captureQuickFrame(tabId, entry, timeoutMs = 1200) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return null;
+  if (!ws || ws.readyState !== WebSocket.OPEN || !wsAuthed || entry?.paused) return null;
   try {
     await Promise.race([
       ensureCdpForTab(tabId, entry),
@@ -721,11 +798,10 @@ function rememberDetachedTab(tabId, reason = '', isGuardrail = false) {
 
 async function detachManagedTab(tabId, reason = '', isGuardrail = false) {
   const entry = managedTabs.get(tabId);
+  // Stop screencast and detach chrome.debugger BEFORE deleting entry from managedTabs
+  await stopCdpForTab(tabId, entry);
   managedTabs.delete(tabId);
   rememberDetachedTab(tabId, reason, isGuardrail);
-  if (entry) {
-    await stopCdpForTab(tabId);
-  }
   await syncHud(tabId, { visible: false, activity: reason || tr().released });
   // Ungroup tab from the Live group immediately upon release
   try {
@@ -838,6 +914,8 @@ async function popoutRelayTab(entry, focus = true) {
   entry.paused = true;
   entry.uiMode = 'paused';
   entry.activity = currentLang === 'zh' ? '副屏接力操控中 · 点继续归队' : 'Relay window · Resume to merge back';
+  // Immediately stop screencast and detach CDP before handing control to the user
+  await stopCdpForTab(entry.tabId, entry);
 
   await chrome.tabs.ungroup(entry.tabId).catch(() => {});
   const origWin = await chrome.windows.get(tab.windowId).catch(() => null);
@@ -859,7 +937,6 @@ async function popoutRelayTab(entry, focus = true) {
     activity: entry.activity
   });
   await syncLiveTabGroups();
-  await captureQuickFrame(entry.tabId, entry);
   pushLocalAudit('relay_popout', { tabId: entry.tabId, url: entry.url });
   notifyPanelAndDaemon();
   return { tabId: entry.tabId, inRelayPopout: true, relayWindowId: entry.relayPopoutWinId };
@@ -1043,17 +1120,9 @@ async function executeBridgeRpc(method, params) {
   }
 
   if (method === 'share_active') {
-    let [activeTab] = await chrome.tabs.query({
-      active: true,
-      lastFocusedWindow: true,
-      windowType: 'normal'
-    });
-    if (!activeTab) {
-      [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-    }
-    if (!activeTab) throw new Error('No active Chrome tab found');
-    await shareTab(activeTab, false);
-    return { tabId: activeTab.id, title: activeTab.title, shared: true };
+    throw new Error(
+      'Sharing an existing signed-in tab requires explicit user confirmation in Chrome (press Alt+Shift+L or click "Share Current Tab" in the extension panel).'
+    );
   }
 
   if (method === 'focus_tab') {
@@ -1221,24 +1290,7 @@ async function executeBridgeRpc(method, params) {
 
   if (method === 'inspect_region') {
     const entry = resolveTargetEntry(params.tabId);
-    const liveTab = await chrome.tabs.get(entry.tabId);
-    entry.title = liveTab.title || '';
-    entry.url = liveTab.url || '';
-    const safety = checkTabUrlAllowed(entry.url);
-    if (!safety.allowed) {
-      await detachManagedTab(entry.tabId, safety.reason, true);
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify({
-            type: 'guardrail_trip',
-            tabId: entry.tabId,
-            url: entry.url,
-            reason: safety.reason
-          })
-        );
-      }
-      throw new Error(`[GUARDRAIL] Detached tab because it navigated to ${safety.reason}`);
-    }
+    await assertTabReadyForAction(entry);
     const rx1 = Math.min(1, Math.max(0, Number(params.rx1) || 0));
     const ry1 = Math.min(1, Math.max(0, Number(params.ry1) || 0));
     const rx2 = Math.min(1, Math.max(0, Number(params.rx2) || 1));
@@ -1276,19 +1328,35 @@ async function executeBridgeRpc(method, params) {
           const overlapW = Math.min(r.right, xMax) - Math.max(r.left, xMin);
           const overlapH = Math.min(r.bottom, yMax) - Math.max(r.top, yMin);
           if (overlapW < 3 || overlapH < 3) continue;
+          const tagLower = el.tagName.toLowerCase();
+          const inputType = tagLower === 'input' ? String(el.type || 'text').toLowerCase() : '';
+          const autoAttr = String(el.getAttribute('autocomplete') || '').toLowerCase();
+          const isSensitiveInput =
+            inputType === 'password' ||
+            /(?:password|one-time-code|cc-number|cc-csc|cc-exp)/i.test(autoAttr);
+          const isButtonInput =
+            tagLower === 'input' && /^(?:button|submit|reset)$/i.test(inputType);
+          const isUserValueField =
+            (tagLower === 'input' && !isButtonInput) ||
+            tagLower === 'textarea' ||
+            tagLower === 'select' ||
+            el.isContentEditable;
+          // Never read user-typed .value or editable textContent from input/password/OTP fields
+          const safeValueLabel = isButtonInput ? el.value || '' : '';
+          const safeTextLabel = isUserValueField ? '' : el.textContent || '';
           const rawLabel = (
             el.getAttribute('aria-label') ||
             el.getAttribute('placeholder') ||
-            el.textContent ||
-            el.value ||
+            safeTextLabel ||
+            safeValueLabel ||
+            el.getAttribute('title') ||
             el.getAttribute('name') ||
             el.id ||
-            ''
+            (isSensitiveInput ? '(password)' : '')
           )
             .replace(/\s+/g, ' ')
             .trim()
             .slice(0, 72);
-          const tagLower = el.tagName.toLowerCase();
           const isFormField =
             tagLower === 'input' || tagLower === 'textarea' || tagLower === 'select' || el.isContentEditable;
           const label =
@@ -1632,22 +1700,37 @@ async function executeBridgeRpc(method, params) {
           }
 
           node.setAttribute('data-clive-idx', String(idx));
+          const inputType = tagLower === 'input' ? String(node.type || 'text').toLowerCase() : '';
+          const autoAttr = String(node.getAttribute('autocomplete') || '').toLowerCase();
+          const isSensitiveField =
+            inputType === 'password' ||
+            /(?:password|one-time-code|cc-number|cc-csc|cc-exp)/i.test(autoAttr);
+          const isButtonInput =
+            tagLower === 'input' && /^(?:button|submit|reset)$/i.test(inputType);
+          const isUserValueField =
+            (tagLower === 'input' && !isButtonInput) ||
+            tagLower === 'textarea' ||
+            tagLower === 'select' ||
+            node.isContentEditable;
+          // Never expose user-entered password/OTP/input values as element labels
           const rawLabel =
             node.getAttribute('aria-label') ||
             node.getAttribute('placeholder') ||
-            node.textContent ||
-            node.value ||
+            (isUserValueField ? '' : node.textContent) ||
+            (isButtonInput ? node.value : '') ||
             node.getAttribute('title') ||
+            (isSensitiveField ? '(password)' : '') ||
             '';
           const label = String(rawLabel).replace(/\s+/g, ' ').trim().slice(0, 90);
           const roleAttr = (node.getAttribute('role') || '').trim().toLowerCase();
           let stableSelector;
           const isControl =
-            tagLower === 'input' ||
-            tagLower === 'textarea' ||
-            tagLower === 'select' ||
-            tagLower === 'button' ||
-            /^(?:textbox|searchbox|combobox|switch|radio|checkbox|option|menuitem)$/.test(roleAttr);
+            !isSensitiveField &&
+            (tagLower === 'input' ||
+              tagLower === 'textarea' ||
+              tagLower === 'select' ||
+              tagLower === 'button' ||
+              /^(?:textbox|searchbox|combobox|switch|radio|checkbox|option|menuitem)$/.test(roleAttr));
           const testId = node.getAttribute('data-testid');
           if (isControl && testId && /^[\w.:-]{1,64}$/.test(testId)) {
             stableSelector = `[data-testid="${CSS.escape(testId)}"]`;
@@ -2713,7 +2796,11 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     chrome.debugger
       .sendCommand({ tabId }, 'Page.screencastFrameAck', { sessionId: params.sessionId })
       .catch(() => {});
-    if (ws && ws.readyState === WebSocket.OPEN && params.data) {
+    if (entry.paused) {
+      stopCdpForTab(tabId, entry).catch(() => {});
+      return;
+    }
+    if (ws && ws.readyState === WebSocket.OPEN && wsAuthed && params.data) {
       ws.send(
         JSON.stringify({
           type: 'screencast_frame',
@@ -2729,11 +2816,15 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   }
 });
 
-chrome.debugger.onDetach.addListener((source) => {
-  if (source.tabId && managedTabs.has(source.tabId)) {
-    const entry = managedTabs.get(source.tabId);
+chrome.debugger.onDetach.addListener((source, reason) => {
+  const tabId = source?.tabId;
+  if (tabId && managedTabs.has(tabId)) {
+    const entry = managedTabs.get(tabId);
     entry.attachedCdp = false;
     entry.screencastActive = false;
+    if (reason === 'canceled_by_user') {
+      detachManagedTab(tabId, 'Canceled by user in Chrome banner').catch(() => {});
+    }
   }
 });
 
@@ -2950,6 +3041,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           entry.paused = true;
           entry.uiMode = 'paused';
           entry.activity = currentLang === 'zh' ? '已暂停 · 人工接管中' : 'Paused · Manual control';
+          await stopCdpForTab(senderTabId, entry);
           await syncLiveTabGroups();
           notifyPanelAndDaemon();
         } else if (msg.event === 'resume') {
@@ -2972,7 +3064,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     if (msg.type === 'panel:get_state') {
       let playbook = { enabled: false, siteCount: 0 };
-      if (bridgeConfig.token && ws && ws.readyState === WebSocket.OPEN) {
+      if (bridgeConfig.token && ws && ws.readyState === WebSocket.OPEN && wsAuthed) {
         try {
           const r = await fetch(`http://${bridgeConfig.host}:${bridgeConfig.port}/api/health`, {
             headers: { 'X-Chrome-Live-Token': bridgeConfig.token },
@@ -3027,7 +3119,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return;
     }
     if (msg.type === 'panel:get_playbooks_full') {
-      if (!bridgeConfig.token) {
+      if (!bridgeConfig.token || !wsAuthed) {
         sendResponse({ ok: false, sites: {} });
         return;
       }
@@ -3044,8 +3136,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return;
     }
     if (msg.type === 'panel:playbook_action') {
-      if (!bridgeConfig.token) {
-        sendResponse({ ok: false, error: 'Not paired' });
+      if (!bridgeConfig.token || !wsAuthed) {
+        sendResponse({ ok: false, error: 'Daemon not verified or not paired' });
         return;
       }
       try {
@@ -3132,6 +3224,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const entry = managedTabs.get(msg.tabId);
         entry.paused = !entry.paused;
         entry.uiMode = entry.paused ? 'paused' : 'working';
+        if (entry.paused) {
+          await stopCdpForTab(entry.tabId, entry);
+        }
         entry.activity = entry.paused
           ? currentLang === 'zh'
             ? '已暂停 · 人工接管中'

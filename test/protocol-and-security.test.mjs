@@ -7,9 +7,9 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { createDaemonServer } from '../src/daemon.mjs';
+import { computeChallengeHmac, createDaemonServer } from '../src/daemon.mjs';
 import { evaluateUploadFileSafety, evaluateUrlSafety } from '../src/guardrails.mjs';
-import { sanitizeRouteUrl } from '../src/playbook-store.mjs';
+import { learnFromPageVisit, learnInteractionSelector, lookupDomainPlaybook, sanitizeRouteUrl, setPlaybookEnabled } from '../src/playbook-store.mjs';
 import { computeWebSocketAccept, encodeWsFrame, NativeWsPeer } from '../src/ws-codec.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -31,7 +31,7 @@ function collectSourceFiles(dir, out = []) {
   return out;
 }
 
-function connectTestWsClient(port, routePath, token, { authMode = 'first-frame' } = {}) {
+function connectTestWsClient(port, routePath, token, { authMode = 'challenge' } = {}) {
   return new Promise((resolve, reject) => {
     const secKey = crypto.randomBytes(16).toString('base64');
     const expectedAccept = computeWebSocketAccept(secKey);
@@ -71,9 +71,35 @@ function connectTestWsClient(port, routePath, token, { authMode = 'first-frame' 
         socket.write(encodeWsFrame(0x01, Buffer.from(JSON.stringify(obj), 'utf8'), true));
       };
       if (rest.length > 0) peer._onData(rest);
-      if (authMode === 'first-frame' && token) {
-        peer.sendMaskedJson({ type: 'auth', token, version: '1.0.0', tabs: [] });
+
+      if (authMode === 'challenge' && token) {
+        const clientNonce = crypto.randomBytes(32).toString('hex');
+        const onChallenge = (raw) => {
+          let msg;
+          try {
+            msg = JSON.parse(String(raw));
+          } catch {
+            return;
+          }
+          if (msg && msg.type === 'auth_challenge') {
+            peer.removeListener('message', onChallenge);
+            const expectedServerProof = computeChallengeHmac(token, 'server', clientNonce, msg.serverNonce);
+            if (msg.serverProof !== expectedServerProof) {
+              socket.destroy();
+              reject(new Error('Daemon serverProof verification failed'));
+              return;
+            }
+            const clientProof = computeChallengeHmac(token, 'client', clientNonce, msg.serverNonce);
+            peer.sendMaskedJson({ type: 'auth_response', clientProof, version: '1.0.0', tabs: [] });
+            resolve(peer);
+          }
+        };
+        peer.on('message', onChallenge);
+        peer.once('close', () => reject(new Error('Closed during challenge-response auth')));
+        peer.sendMaskedJson({ type: 'auth_init', clientNonce });
+        return;
       }
+
       resolve(peer);
     }
 
@@ -845,12 +871,25 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
       /401/
     );
 
-    // 2b. WS first-frame auth rejects wrong token without hijacking extensionPeer
-    const badAuthWs = await connectTestWsClient(port, '/ws/extension', '', { authMode: 'none' });
-    const badClosed = new Promise((resolve) => badAuthWs.on('close', resolve));
-    badAuthWs.sendMaskedJson({ type: 'auth', token: 'wrong-token' });
-    await badClosed;
-    assert.equal(badAuthWs.closed, true);
+    // 2b. WS rejects legacy plaintext auth and invalid HMAC clientProof without hijacking extensionPeer
+    const badPlainWs = await connectTestWsClient(port, '/ws/extension', '', { authMode: 'none' });
+    const badPlainClosed = new Promise((resolve) => badPlainWs.on('close', resolve));
+    badPlainWs.sendMaskedJson({ type: 'auth', token: testToken });
+    await badPlainClosed;
+    assert.equal(badPlainWs.closed, true);
+
+    const badProofWs = await connectTestWsClient(port, '/ws/extension', '', { authMode: 'none' });
+    const badProofClosed = new Promise((resolve) => badProofWs.on('close', resolve));
+    const gotChallenge = new Promise((resolve) => {
+      badProofWs.once('message', (raw) => resolve(JSON.parse(String(raw))));
+    });
+    badProofWs.sendMaskedJson({ type: 'auth_init', clientNonce: crypto.randomBytes(32).toString('hex') });
+    const ch = await gotChallenge;
+    assert.equal(ch.type, 'auth_challenge');
+    assert.ok(typeof ch.serverNonce === 'string' && typeof ch.serverProof === 'string');
+    badProofWs.sendMaskedJson({ type: 'auth_response', clientProof: '0'.repeat(64) });
+    await badProofClosed;
+    assert.equal(badProofWs.closed, true);
 
     // 2c. RFC 6455: Unmasked client WS frame must be rejected by server with protocol error close
     const unmaskedWs = await connectTestWsClient(port, '/ws/extension', testToken, { authMode: 'header' });
@@ -859,8 +898,8 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
     await unmaskedClosed;
     assert.equal(unmaskedWs.closed, true);
 
-    // 2d. Valid first-frame auth connects extensionPeer cleanly
-    const extWs = await connectTestWsClient(port, '/ws/extension', testToken, { authMode: 'first-frame' });
+    // 2d. Valid mutual HMAC-SHA256 challenge-response connects extensionPeer cleanly
+    const extWs = await connectTestWsClient(port, '/ws/extension', testToken, { authMode: 'challenge' });
     await new Promise((r) => setTimeout(r, 40));
 
     extWs.on('message', (txt) => {
@@ -870,7 +909,7 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
       }
     });
 
-    // 2e. Daemon-level guardrail blocks protected URLs inside extract's urls array before reaching extension
+    // 2e. Daemon-level guardrail blocks protected URLs inside extract & batch (including cmd alias)
     const blockedExtract = await httpJson(
       port,
       'POST',
@@ -884,7 +923,52 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
     assert.equal(blockedExtract.statusCode, 500);
     assert.match(blockedExtract.json.error, /GUARDRAIL:SENSITIVE_DOMAIN/);
 
-    // 2f. Daemon audit log redacts sensitive query params in stored URLs
+    const blockedBatchCmdUpload = await httpJson(
+      port,
+      'POST',
+      '/api/command',
+      { 'X-Chrome-Live-Token': testToken },
+      {
+        method: 'batch',
+        params: { steps: [{ cmd: 'upload', files: [path.join(REPO_ROOT, 'extension', '.local-runtime.json')] }] }
+      }
+    );
+    assert.equal(blockedBatchCmdUpload.statusCode, 500);
+    assert.match(blockedBatchCmdUpload.json.error, /GUARDRAIL:SENSITIVE_FILE/);
+
+    // 2f. Upload guardrails: .local-runtime.json, .pem, symlinks, and CHROME_LIVE_UPLOAD_DIR allowlist
+    assert.equal(evaluateUploadFileSafety(path.join(REPO_ROOT, 'extension', '.local-runtime.json')).allowed, false);
+    assert.equal(evaluateUploadFileSafety('/tmp/server-private.pem').allowed, false);
+
+    const sandboxDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-upload-dir-'));
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-outside-dir-'));
+    try {
+      const safeFile = path.join(sandboxDir, 'photo.png');
+      const outsideFile = path.join(outsideDir, 'other.png');
+      const secretFile = path.join(outsideDir, '.env');
+      fs.writeFileSync(safeFile, 'ok');
+      fs.writeFileSync(outsideFile, 'outside');
+      fs.writeFileSync(secretFile, 'SECRET=1');
+
+      assert.equal(evaluateUploadFileSafety(safeFile, { allowedDirs: [sandboxDir] }).allowed, true);
+      const outsideCheck = evaluateUploadFileSafety(outsideFile, { allowedDirs: [sandboxDir] });
+      assert.equal(outsideCheck.allowed, false);
+      assert.equal(outsideCheck.code, 'UPLOAD_DIR_RESTRICTED');
+
+      // Test symlink resolution when platform permits symlink creation
+      const linkPath = path.join(sandboxDir, 'innocent.png');
+      try {
+        fs.symlinkSync(secretFile, linkPath);
+        const symCheck = evaluateUploadFileSafety(linkPath, { allowedDirs: [sandboxDir] });
+        assert.equal(symCheck.allowed, false);
+        assert.equal(symCheck.code, 'SENSITIVE_FILE');
+      } catch {}
+    } finally {
+      fs.rmSync(sandboxDir, { recursive: true, force: true });
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+
+    // 2g. Daemon audit log redacts sensitive query params in stored URLs
     const okOpen = await httpJson(
       port,
       'POST',
@@ -900,7 +984,7 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
     assert.ok(!openAudit.detail.url.includes('oauth123'), 'Audit log must redact code param');
     assert.ok(openAudit.detail.url.includes('page=2'), 'Audit log preserves benign query params');
 
-    // 2g. Playbook manual save is refused while playbooks are disabled
+    // 2h. Playbook refuses save while disabled and never stores password/OTP selectors when enabled
     const saveWhileOff = await httpJson(
       port,
       'POST',
@@ -911,6 +995,21 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
     assert.equal(saveWhileOff.statusCode, 500);
     assert.match(saveWhileOff.json.error, /disabled/i);
 
+    setPlaybookEnabled(true);
+    learnFromPageVisit({
+      url: 'https://portal.example.com/account/profile',
+      title: 'Account Profile',
+      elements: [
+        { label: 'User Password', stableSelector: '#user-password' },
+        { label: 'Display Name', stableSelector: '#display-name' }
+      ]
+    });
+    assert.equal(learnInteractionSelector({ url: 'https://portal.example.com/login', label: 'OTP Code', selector: '#otp' }), false);
+    const pbEntry = lookupDomainPlaybook('https://portal.example.com/account/profile');
+    assert.ok(pbEntry && pbEntry.selectors['Display Name'] === '#display-name');
+    assert.equal('User Password' in pbEntry.selectors, false);
+    assert.equal('OTP Code' in pbEntry.selectors, false);
+
     extWs.socket.destroy();
   } finally {
     await daemon.close();
@@ -919,11 +1018,18 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
     fs.rmSync(tempHome, { recursive: true, force: true });
   }
 
-  // 3. Extension remote_interact enforces assertTabReadyForAction (paused + HUD sync + guardrail)
+  // 3. Extension security gates: paused remote/inspect/screencast, detach order, banner cancel, no remote share_active, no plaintext input values
   const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
   assert.match(
     swSource,
     /if \(method === 'remote_interact'\) \{\s*const entry = resolveTargetEntry\(params\.tabId\);\s*await assertTabReadyForAction\(entry\);/
   );
+  assert.match(
+    swSource,
+    /if \(method === 'inspect_region'\) \{\s*const entry = resolveTargetEntry\(params\.tabId\);\s*await assertTabReadyForAction\(entry\);/
+  );
+  assert.match(swSource, /if \(reason === 'canceled_by_user'\)/);
+  assert.match(swSource, /await stopCdpForTab\(tabId, entry\);\s*managedTabs\.delete\(tabId\);/);
+  assert.match(swSource, /Sharing an existing signed-in tab requires explicit user confirmation/);
   assert.ok(!swSource.includes('/ws/extension?token='), 'Extension WS must not pass token in query string');
 });

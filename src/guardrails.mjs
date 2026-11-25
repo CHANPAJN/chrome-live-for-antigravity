@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 
 const BLOCKED_PROTOCOLS = new Set([
@@ -153,23 +154,76 @@ export function evaluateUrlSafety(rawUrl, customBlockedDomains = []) {
 const SENSITIVE_FILE_DIR_RX =
   /(?:^|\/)(?:\.ssh|\.gnupg|\.aws|\.kube|\.chrome-live-antigravity)(?:\/|$)/i;
 const SENSITIVE_FILE_NAME_RX =
-  /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|auth\.token|agent_vault\.enc|\.env(?:\..+)?|\.npmrc|\.pypirc|\.netrc|Cookies|Login Data|Web Data)$/i;
+  /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|auth\.token|\.local-runtime\.json|agent_vault\.enc|\.env(?:\..+)?|\.npmrc|\.pypirc|\.netrc|Cookies(?:-journal)?|Login Data(?:\s+For\s+Account)?|Web Data|.*\.(?:pem|key|p12|pfx|kdbx|ovpn|jks|keystore))$/i;
 
-export function evaluateUploadFileSafety(rawFilePath) {
+function resolveCanonicalPath(targetPath) {
+  try {
+    return fs.realpathSync(targetPath);
+  } catch {
+    // If file does not exist yet or symlink is dangling, still canonicalize its parent directory
+    try {
+      const parentReal = fs.realpathSync(path.dirname(targetPath));
+      return path.join(parentReal, path.basename(targetPath));
+    } catch {
+      return targetPath;
+    }
+  }
+}
+
+function isPathInsideDir(candidatePath, dirPath) {
+  const rel = path.relative(dirPath, candidatePath);
+  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+function parseAllowedUploadDirs(explicitDirs) {
+  const rawList = Array.isArray(explicitDirs)
+    ? explicitDirs
+    : typeof process.env.CHROME_LIVE_UPLOAD_DIR === 'string' && process.env.CHROME_LIVE_UPLOAD_DIR.trim()
+      ? process.env.CHROME_LIVE_UPLOAD_DIR.split(path.delimiter)
+      : [];
+  const dirs = [];
+  for (const raw of rawList) {
+    const trimmed = String(raw || '').trim();
+    if (!trimmed) continue;
+    const abs = path.resolve(trimmed);
+    dirs.push(resolveCanonicalPath(abs));
+  }
+  return dirs;
+}
+
+export function evaluateUploadFileSafety(rawFilePath, options = {}) {
   if (!rawFilePath || typeof rawFilePath !== 'string' || !rawFilePath.trim()) {
     return { allowed: false, code: 'INVALID_FILE', reason: 'Empty file path' };
   }
   const resolvedPath = path.resolve(rawFilePath.trim());
-  const normalized = resolvedPath.replace(/\\/g, '/');
-  const baseName = path.basename(resolvedPath);
+  const realPath = resolveCanonicalPath(resolvedPath);
+  const candidates = realPath === resolvedPath ? [resolvedPath] : [resolvedPath, realPath];
 
-  if (SENSITIVE_FILE_DIR_RX.test(normalized) || SENSITIVE_FILE_NAME_RX.test(baseName)) {
-    return {
-      allowed: false,
-      code: 'SENSITIVE_FILE',
-      reason: `Uploading sensitive credential or key file "${baseName}" is blocked by local guardrails`
-    };
+  for (const candidate of candidates) {
+    const normalized = candidate.replace(/\\/g, '/');
+    const baseName = path.basename(candidate);
+    if (SENSITIVE_FILE_DIR_RX.test(normalized) || SENSITIVE_FILE_NAME_RX.test(baseName)) {
+      return {
+        allowed: false,
+        code: 'SENSITIVE_FILE',
+        reason: `Uploading sensitive credential or key file "${baseName}" is blocked by local guardrails`
+      };
+    }
   }
 
-  return { allowed: true, code: 'OK', reason: '', resolvedPath };
+  const allowedDirs = parseAllowedUploadDirs(options.allowedDirs);
+  if (allowedDirs.length > 0) {
+    const insideAllowed = allowedDirs.some(
+      (dir) => isPathInsideDir(realPath, dir) && isPathInsideDir(resolvedPath, dir)
+    );
+    if (!insideAllowed) {
+      return {
+        allowed: false,
+        code: 'UPLOAD_DIR_RESTRICTED',
+        reason: `Upload path is outside allowed CHROME_LIVE_UPLOAD_DIR boundary`
+      };
+    }
+  }
+
+  return { allowed: true, code: 'OK', reason: '', resolvedPath: realPath };
 }

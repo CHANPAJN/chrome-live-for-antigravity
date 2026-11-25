@@ -28,6 +28,13 @@ const MAX_AUDIT_ENTRIES = 80;
 const MAX_BODY_BYTES = 12 * 1024 * 1024;
 const HEARTBEAT_INTERVAL_MS = 25000;
 
+export function computeChallengeHmac(token, role, clientNonce, serverNonce) {
+  return crypto
+    .createHmac('sha256', String(token || ''))
+    .update(`chrome-live:${role}:${clientNonce}:${serverNonce}`, 'utf8')
+    .digest('hex');
+}
+
 function isAllowedHostHeader(hostHeader, boundPort) {
   if (!hostHeader || typeof hostHeader !== 'string') return false;
   const normalized = hostHeader.trim().toLowerCase();
@@ -336,6 +343,7 @@ export function createDaemonServer(options = {}) {
         } else if (method === 'batch' && Array.isArray(params.steps)) {
           for (const step of params.steps) {
             if (!step || typeof step !== 'object') continue;
+            const stepAction = String(step.action || step.method || step.cmd || '').trim();
             if (typeof step.url === 'string') {
               const safety = evaluateUrlSafety(step.url, state.customBlockedDomains);
               if (!safety.allowed) {
@@ -344,7 +352,18 @@ export function createDaemonServer(options = {}) {
                 return;
               }
             }
-            if ((step.action || step.method) === 'upload') {
+            if (stepAction === 'extract' && Array.isArray(step.urls)) {
+              for (const rawUrl of step.urls) {
+                const urlStr = String(rawUrl || '');
+                const safety = evaluateUrlSafety(urlStr, state.customBlockedDomains);
+                if (!safety.allowed) {
+                  recordAudit('batch', { url: urlStr, code: safety.code }, 'blocked');
+                  reject(new Error(`[GUARDRAIL:${safety.code}] ${safety.reason}`));
+                  return;
+                }
+              }
+            }
+            if (stepAction === 'upload') {
               prepareUploadParams(step);
             }
           }
@@ -679,6 +698,7 @@ export function createDaemonServer(options = {}) {
     };
 
     let authenticated = preAuthed;
+    let pendingChallenge = null; // { clientNonce, serverNonce }
     let authTimer = null;
     if (authenticated) {
       attachAuthenticatedPeer(null);
@@ -703,18 +723,44 @@ export function createDaemonServer(options = {}) {
         return;
       }
       if (!authenticated) {
-        const candidate = msg && msg.type === 'auth' ? String(msg.token || '') : '';
-        if (!timingSafeEqualToken(candidate, authToken)) {
-          if (authTimer) clearTimeout(authTimer);
-          peer.close(4001, 'Unauthorized');
+        // Mutual HMAC-SHA256 challenge-response (zero plaintext token over WebSocket)
+        if (msg && msg.type === 'auth_init' && !pendingChallenge) {
+          const clientNonce = typeof msg.clientNonce === 'string' ? msg.clientNonce.trim() : '';
+          if (clientNonce.length < 16 || clientNonce.length > 128) {
+            if (authTimer) clearTimeout(authTimer);
+            peer.close(4001, 'Invalid client nonce');
+            return;
+          }
+          const serverNonce = crypto.randomBytes(32).toString('hex');
+          pendingChallenge = { clientNonce, serverNonce };
+          const serverProof = computeChallengeHmac(authToken, 'server', clientNonce, serverNonce);
+          peer.sendJson({ type: 'auth_challenge', serverNonce, serverProof });
           return;
         }
-        authenticated = true;
-        if (authTimer) {
-          clearTimeout(authTimer);
-          authTimer = null;
+        if (msg && msg.type === 'auth_response' && pendingChallenge) {
+          const clientProof = typeof msg.clientProof === 'string' ? msg.clientProof.trim() : '';
+          const expectedClientProof = computeChallengeHmac(
+            authToken,
+            'client',
+            pendingChallenge.clientNonce,
+            pendingChallenge.serverNonce
+          );
+          if (!timingSafeEqualToken(clientProof, expectedClientProof)) {
+            if (authTimer) clearTimeout(authTimer);
+            peer.close(4001, 'Unauthorized');
+            return;
+          }
+          authenticated = true;
+          pendingChallenge = null;
+          if (authTimer) {
+            clearTimeout(authTimer);
+            authTimer = null;
+          }
+          attachAuthenticatedPeer(msg);
+          return;
         }
-        attachAuthenticatedPeer(msg);
+        if (authTimer) clearTimeout(authTimer);
+        peer.close(4001, 'Unauthorized');
         return;
       }
       if (pathname === '/ws/extension') {

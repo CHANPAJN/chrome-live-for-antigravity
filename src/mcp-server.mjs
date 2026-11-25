@@ -495,31 +495,40 @@ export function startMcpStdioServer({ callDaemon }) {
 }
 
 async function buildMonitorStructuredState(callDaemon, lastFrameTs = 0, targetTabId = undefined, forceSnap = false) {
-  const hasTab = typeof targetTabId === 'number' && Number.isInteger(targetTabId);
-  if (forceSnap && hasTab) {
+  const hasExplicitTab = typeof targetTabId === 'number' && Number.isInteger(targetTabId);
+  const baseState = await callDaemon('GET', '/api/state');
+  const tabs = Array.isArray(baseState?.tabs) ? baseState.tabs : [];
+  const resolvedPrimary =
+    (hasExplicitTab && tabs.find((t) => t.tabId === targetTabId)) ||
+    tabs.find((t) => t.substate === 'shared') ||
+    tabs[0] ||
+    null;
+  const effectiveTabId = resolvedPrimary ? resolvedPrimary.tabId : (hasExplicitTab ? targetTabId : undefined);
+  const hasTab = typeof effectiveTabId === 'number' && Number.isInteger(effectiveTabId);
+
+  if (forceSnap && hasTab && !resolvedPrimary?.paused) {
     await callDaemon('POST', '/api/command', {
       method: 'screenshot',
-      params: { tabId: targetTabId }
+      params: { tabId: effectiveTabId }
     }).catch(() => {});
   }
-  const tabQuery = hasTab ? `&tabId=${encodeURIComponent(String(targetTabId))}` : '';
-  const baseState = await callDaemon('GET', '/api/state');
+
+  const tabQuery = hasTab ? `&tabId=${encodeURIComponent(String(effectiveTabId))}` : '';
   const serverFrameTs = baseState?.latestFrameMeta?.capturedAt || 0;
   const cachedIds = Array.isArray(baseState?.cachedFrameTabIds) ? baseState.cachedFrameTabIds : [];
   let fullState = baseState;
-  if (hasTab && cachedIds.includes(targetTabId)) {
-    if (lastFrameTs === 0 || serverFrameTs !== lastFrameTs) {
+  if (hasTab && cachedIds.includes(effectiveTabId)) {
+    if (lastFrameTs === 0 || serverFrameTs !== lastFrameTs || baseState?.latestFrameMeta?.tabId !== effectiveTabId) {
       fullState = await callDaemon('GET', `/api/state?includeFrame=1${tabQuery}`);
     }
-  } else if (serverFrameTs && serverFrameTs !== lastFrameTs) {
-    fullState = await callDaemon('GET', `/api/state?includeFrame=1${tabQuery}`);
-  } else if (!baseState?.hasFrame && Array.isArray(baseState?.tabs) && baseState.tabs.length > 0 && lastFrameTs === 0) {
-    const snapTid = hasTab ? targetTabId : baseState.tabs[0].tabId;
+  } else if (hasTab && !resolvedPrimary?.paused && lastFrameTs === 0) {
     await callDaemon('POST', '/api/command', {
       method: 'screenshot',
-      params: { tabId: snapTid }
+      params: { tabId: effectiveTabId }
     }).catch(() => {});
-    fullState = await callDaemon('GET', `/api/state?includeFrame=1&tabId=${encodeURIComponent(String(snapTid))}`);
+    fullState = await callDaemon('GET', `/api/state?includeFrame=1${tabQuery}`);
+  } else if (!hasTab && serverFrameTs && serverFrameTs !== lastFrameTs) {
+    fullState = await callDaemon('GET', '/api/state?includeFrame=1');
   }
   return fullState;
 }

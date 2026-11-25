@@ -793,8 +793,8 @@ export function buildInlineMonitorHtml() {
           titleEl.textContent = primary.title || 'Chrome Live';
           subEl.textContent = primary.activity || primary.url || L.active;
           remoteBtn.disabled = isPaused;
-          if (isPaused && interactionMode === 'remote') setMode('watch');
-          regionBtn.disabled = false;
+          regionBtn.disabled = isPaused;
+          if (isPaused && interactionMode !== 'watch') setMode('watch');
           attachBtn.disabled = false;
           relayBtn.disabled = false;
           releaseBtn.disabled = false;
@@ -830,15 +830,25 @@ export function buildInlineMonitorHtml() {
           data.latestFrameMeta && data.latestFrameMeta.capturedAt
             ? data.latestFrameMeta.capturedAt
             : 0;
-        if (data.frameDataUrl && (ts !== lastFrameTs || frameTabId !== lastFrameTabId)) {
+        const frameMatchesPrimary = Boolean(primary && frameTabId === primary.tabId);
+        if (frameMatchesPrimary && data.frameDataUrl && (ts !== lastFrameTs || frameTabId !== lastFrameTabId)) {
           lastFrameTs = ts || Date.now();
           lastFrameTabId = frameTabId;
           screenImg.onload = () => reportSize();
           screenImg.src = data.frameDataUrl;
           screenImg.style.display = 'block';
           emptyEl.style.display = 'none';
-        } else if (!lastFrameTs) {
+        } else if (!primary || lastFrameTabId !== primary.tabId) {
+          // Never display a stale frame from a different tabId (prevents cross-tab click mismatch)
+          lastFrameTs = 0;
+          lastFrameTabId = null;
+          screenImg.removeAttribute('src');
           screenImg.style.display = 'none';
+          emptyEl.textContent = primary
+            ? (isPaused
+                ? (IS_ZH ? '已暂停 · 人工接管期间实时画面流已停止' : 'Paused · Live stream stopped during manual control')
+                : (IS_ZH ? '正在同步当前标签页画面...' : 'Syncing frame for selected tab...'))
+            : L.idle;
           emptyEl.style.display = 'block';
         }
         reportSize();
@@ -1025,7 +1035,7 @@ export function buildInlineMonitorHtml() {
       // Remote click & Region drag selection on live viewport
       let dragStart = null;
       viewport.addEventListener('pointerdown', async (ev) => {
-        if (ev.button !== 0 || !currentTab) return;
+        if (ev.button !== 0 || !currentTab || currentTab.paused || lastFrameTabId !== currentTab.tabId) return;
         const pt = clientPointToNormalized(ev.clientX, ev.clientY, interactionMode === 'region');
         if (!pt) return;
 
@@ -1132,7 +1142,7 @@ export function buildInlineMonitorHtml() {
       viewport.addEventListener(
         'wheel',
         async (ev) => {
-          if (interactionMode !== 'remote' || !currentTab) return;
+          if (interactionMode !== 'remote' || !currentTab || currentTab.paused || lastFrameTabId !== currentTab.tabId) return;
           ev.preventDefault();
           if (wheelBusy) return;
           wheelBusy = true;

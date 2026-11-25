@@ -144,9 +144,9 @@ node ./bin/chrome-live.mjs done "任务完成"                  # 断开调试�
 
 ## 架构与透明边界
 
-- **按需挂载调试器**：仅在执行命令或拉取实时画面期间挂载 `chrome.debugger`（`1.3`），空闲满 18 秒自动卸载释放，保持 `< 0.01%` 空闲 CPU 占用。
-- **本地回环隔离与常量时间鉴权**：守护进程严格监听 `127.0.0.1:28196`（可用环境变量 `CHROME_LIVE_PORT` 修改），校验 `Host` 头，对所有网页来源的 `Origin` 请求返回 `403`，按 RFC 6455 强制校验客户端帧掩码，并仅通过请求头或 WebSocket 首帧鉴权（拒绝 URL `?token=` 查询串）配合 `crypto.timingSafeEqual` 核验本地 256 位随机口令；`auth.token` 与 `extension/.local-runtime.json` 均设 `0600` 权限，内存审计流水自动脱敏敏感查询参数。
-- **双层金融与敏感路由拦截**：守护进程与扩展后台在 `open`、`navigate`、`batch` 与 `extract` 全链路均双层内置支付网关（支付宝、微信支付、Stripe、PayPal、网银、云账单）、`chrome://` / `edge://` 及 `/checkout`、`/pay`、`/payment`、`/cashier`、`/billing`（含 SPA Hash 路由）拦截；若受控页面发生跳转进入受保护域名，扩展会立即断开调试器交还人工。CDP 文件上传同样拦截 `.ssh`、`.env`、`.aws` 等凭据路径。
+- **按需挂载调试器 & 硬暂停/硬取消**：仅在执行命令或拉流期间挂载 `chrome.debugger`（`1.3`），空闲 18 秒自动卸载释放（空闲 CPU `< 0.01%`）。一旦点暂停、长按左键 3 秒或弹出副屏，扩展会立即停止画面流并卸载调试器（同时阻断自动点击、远程输入与区域读取）；点击 Chrome 顶部原生横幅的「取消」会彻底撤销该页授权，绝不偷偷重挂。共享已有登录标签页必须由你在浏览器内手动按快捷键或点扩展按钮确认。
+- **本地回环隔离与双向挑战-响应鉴权**：守护进程严格监听 `127.0.0.1:28196`（可用 `CHROME_LIVE_PORT` 修改），校验 `Host` 头、拒绝所有网页 `Origin`（`403`）、按 RFC 6455 强制校验客户端帧掩码，扩展与守护进程采用 **HMAC-SHA256 双向挑战-响应** 握手（扩展先验明守护进程身份，通不过绝不发送任何凭证或标签页，且全程零明文 Token 走 WebSocket 或 URL 查询串）。`auth.token` 与 `.local-runtime.json` 均设 `0600` 权限，快照/圈选绝不读取密码框及用户输入值作标签，审计流水自动脱敏敏感查询参数。
+- **双层金融与上传护栏（及如实边界说明）**：守护进程与扩展在 `open`、`navigate`、`batch` 与 `extract` 全链路双层拦截支付网关（支付宝、微信支付、Stripe、PayPal、网银、云账单）、`chrome://` / `edge://` 及 `/checkout`、`/pay`、`/payment`、`/cashier`、`/billing`（含 SPA Hash 路由）。CDP 文件上传穿透符号链接（`realpath`）拦截 `.ssh`、`.env`、`.aws`、`.local-runtime.json` 与各类私钥文件，并支持配置环境变量 `CHROME_LIVE_UPLOAD_DIR` 将上传严格锁定在指定白名单目录内。需注意：域名与路由护栏无法识别普通商家后台里的改价、发货、退款等业务按钮；高敏感账号建议放在独立 Chrome 用户配置中并配置 `CHROME_LIVE_UPLOAD_DIR`。
 - **零客户端修改、零第三方依赖 & 干净卸载**：全部代码基于 Node.js `>= 20` 内置标准库与明文 MV3 JavaScript 编写，不修改 Antigravity 客户端任何文件；关闭式 Shadow DOM、跨源支付 `<iframe>` 与系统级文件对话框均受浏览器沙箱隔离不可访问。运行测试或彻底卸载：
 
 ```bash
