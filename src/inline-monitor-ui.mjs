@@ -774,6 +774,7 @@ export function buildInlineMonitorHtml() {
 
         const tabs = Array.isArray(data.tabs) ? data.tabs : [];
         hasActiveTabs = tabs.length > 0;
+        const prevInRelay = Boolean(currentTab && currentTab.inRelayPopout);
         const primary =
           (selectedTabId !== null && tabs.find((t) => t.tabId === selectedTabId)) ||
           tabs.find((t) => t.substate === 'shared') ||
@@ -785,7 +786,7 @@ export function buildInlineMonitorHtml() {
         renderTabStrip(tabs);
 
         const isPaused = Boolean(primary && primary.paused);
-        led.dataset.live = String(Boolean(data.extensionConnected && !isPaused));
+        led.dataset.live = String(Boolean(data.extensionConnected && primary && !isPaused));
         led.dataset.paused = String(isPaused);
 
         if (primary) {
@@ -802,16 +803,25 @@ export function buildInlineMonitorHtml() {
           } else {
             relayBtn.dataset.relay = 'popout';
             setBtnLabel(relayBtn, L.relayOut);
+            if (prevInRelay) {
+              showStatus(IS_ZH ? '副屏已归队，AI 恢复接管' : 'Relay merged back; AI resumed', 'ok', false);
+            }
           }
         } else {
           titleEl.textContent = 'Chrome Live';
-          subEl.textContent = data.extensionConnected ? L.active : L.offline;
+          subEl.textContent = data.extensionConnected
+            ? (IS_ZH ? '空闲 · 无受控标签页' : 'Idle · No active tab')
+            : L.offline;
           emptyEl.textContent = L.idle;
           remoteBtn.disabled = true;
           regionBtn.disabled = true;
           attachBtn.disabled = true;
           relayBtn.disabled = true;
+          relayBtn.dataset.relay = 'popout';
+          setBtnLabel(relayBtn, L.relayOut);
           releaseBtn.disabled = true;
+          if (interactionMode !== 'watch') setMode('watch');
+          if (prevInRelay) showStatus('');
         }
 
         const frameTabId = data.frameTabId ?? (data.latestFrameMeta && data.latestFrameMeta.tabId) ?? null;

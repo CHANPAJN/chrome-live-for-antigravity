@@ -2760,11 +2760,120 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   }
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => {
+async function autoMergeClosedRelayTab(closedEntry) {
+  const restoreUrl = typeof closedEntry?.url === 'string' ? closedEntry.url.trim() : '';
+  if (!/^https?:\/\//i.test(restoreUrl)) return;
+  const safety = checkTabUrlAllowed(restoreUrl);
+  if (!safety.allowed) return;
+
+  const prevOriginWinId = closedEntry.originWindowId;
+  const prevOriginIndex = closedEntry.originIndex;
+  const prevOriginGroupId = typeof closedEntry.originGroupId === 'number' ? closedEntry.originGroupId : -1;
+  const prevRelayWinId = closedEntry.relayPopoutWinId;
+
+  let targetWindowId = null;
+  if (typeof prevOriginWinId === 'number') {
+    const origExists = await chrome.windows.get(prevOriginWinId).catch(() => null);
+    if (origExists && origExists.type === 'normal') {
+      targetWindowId = origExists.id;
+    }
+  }
+  if (targetWindowId === null) {
+    const allNormal = await chrome.windows.getAll({ windowTypes: ['normal'] }).catch(() => []);
+    const fallbackWin = allNormal.find((w) => w.id !== prevRelayWinId);
+    if (fallbackWin) targetWindowId = fallbackWin.id;
+  }
+  if (targetWindowId === null) return;
+
+  let targetIndex;
+  if (typeof prevOriginIndex === 'number' && prevOriginIndex >= 0) {
+    const winTabs = await chrome.tabs.query({ windowId: targetWindowId }).catch(() => []);
+    targetIndex = Math.min(prevOriginIndex, winTabs.length);
+  }
+
+  const createProps = {
+    windowId: targetWindowId,
+    url: restoreUrl,
+    active: false
+  };
+  if (typeof targetIndex === 'number') createProps.index = targetIndex;
+
+  const created = await chrome.tabs.create(createProps).catch(() => null);
+  if (!created || typeof created.id !== 'number') return;
+
+  const isWorker = closedEntry.substate === 'worker';
+  if (isWorker) {
+    await placeInBackgroundTabGroup(created.id, targetWindowId, true, 'cyan', tr().groupTitle);
+  } else if (prevOriginGroupId >= 0) {
+    await chrome.tabs
+      .group({ tabIds: [created.id], groupId: prevOriginGroupId })
+      .catch(async () => {
+        await placeInBackgroundTabGroup(created.id, targetWindowId, false, 'cyan', tr().groupTitle);
+      });
+  } else {
+    await placeInBackgroundTabGroup(created.id, targetWindowId, false, 'cyan', tr().groupTitle);
+  }
+
+  const restoredActivity =
+    currentLang === 'zh' ? '副屏已关闭 · 自动归队交还 AI' : 'Relay closed · Auto-merged back';
+  const restoredEntry = {
+    tabId: created.id,
+    substate: isWorker ? 'worker' : 'shared',
+    uiMode: 'working',
+    attachedCdp: false,
+    screencastActive: false,
+    paused: false,
+    title: created.title || closedEntry.title || '',
+    url: created.url || restoreUrl,
+    activity: restoredActivity,
+    idleTimer: null
+  };
+  managedTabs.set(created.id, restoredEntry);
+  notifyPanelAndDaemon();
+
+  await waitForTabComplete(created.id, 12000).catch(() => {});
+  const updatedTab = await chrome.tabs.get(created.id).catch(() => null);
+  if (!updatedTab || !managedTabs.has(created.id)) return;
+
+  const postSafety = checkTabUrlAllowed(updatedTab.url || '');
+  if (!postSafety.allowed) {
+    await detachManagedTab(created.id, postSafety.reason, true);
+    return;
+  }
+
+  restoredEntry.title = updatedTab.title || restoredEntry.title;
+  restoredEntry.url = updatedTab.url || restoredEntry.url;
+  await syncHud(created.id, {
+    visible: true,
+    mode: 'working',
+    activity: restoredEntry.activity
+  });
+  await syncLiveTabGroups();
+  await captureQuickFrame(created.id, restoredEntry);
+  pushLocalAudit('relay_auto_merge', {
+    previousTabId: closedEntry.tabId,
+    tabId: created.id,
+    url: restoredEntry.url
+  });
+  notifyPanelAndDaemon();
+}
+
+chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
   if (managedTabs.has(tabId)) {
     const entry = managedTabs.get(tabId);
     if (entry.idleTimer) clearTimeout(entry.idleTimer);
+    const shouldAutoMergeRelay =
+      typeof entry.relayPopoutWinId === 'number' &&
+      (removeInfo?.isWindowClosing || removeInfo?.windowId === entry.relayPopoutWinId);
     managedTabs.delete(tabId);
+    if (shouldAutoMergeRelay) {
+      autoMergeClosedRelayTab(entry).catch(() => {
+        rememberDetachedTab(tabId, 'Tab closed', false);
+        syncLiveTabGroups();
+        notifyPanelAndDaemon();
+      });
+      return;
+    }
     rememberDetachedTab(tabId, 'Tab closed', false);
     syncLiveTabGroups();
     notifyPanelAndDaemon();
