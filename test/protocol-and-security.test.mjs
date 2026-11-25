@@ -818,19 +818,16 @@ test('MCP stdio server isolates model-visible monitor from app-only UI actions, 
 
     const toolsList = await rpc(20, 'tools/list');
     const monitorTool = toolsList.result.tools.find((t) => t.name === 'chrome_live_monitor');
-    const uiActionTool = toolsList.result.tools.find((t) => t.name === 'chrome_live_ui_action');
     const wsTool = toolsList.result.tools.find((t) => t.name === 'chrome_live_workspace');
     assert.ok(monitorTool, 'Expected chrome_live_monitor tool');
-    assert.deepEqual(monitorTool._meta?.ui?.visibility, ['model']);
+    assert.deepEqual(monitorTool._meta?.ui?.visibility, ['model', 'app']);
     assert.equal('action' in (monitorTool.inputSchema?.properties || {}), false, 'Model monitor schema must not expose UI actions');
-    assert.ok(uiActionTool, 'Expected app-only chrome_live_ui_action tool');
-    assert.deepEqual(uiActionTool._meta?.ui?.visibility, ['app']);
     assert.ok(wsTool, 'Expected chrome_live_workspace entrypoint tool');
     assert.equal(wsTool._meta?.ui?.resourceUri, 'ui://chrome-live/live-monitor.html');
     const epTypes = (wsTool._meta?.['com.google.antigravity/ui']?.entrypoints || []).map((e) => e.type);
     assert.deepEqual(epTypes.sort(), ['aux_pane', 'global']);
 
-    // Model attempting to sneak an action into chrome_live_monitor must be rejected
+    // Model attempting to sneak an action into chrome_live_monitor without the iframe UI capability secret MUST be rejected
     const forbiddenModelAction = await rpc(29, 'tools/call', {
       name: 'chrome_live_monitor',
       arguments: { tabId: 77, action: 'relay_merge' }
@@ -842,9 +839,12 @@ test('MCP stdio server isolates model-visible monitor from app-only UI actions, 
     assert.equal(resList.result.resources[0].mimeType, 'text/html;profile=mcp-app');
 
     const resRead = await rpc(3, 'resources/read', { uri: 'ui://chrome-live/live-monitor.html' });
-    assert.match(resRead.result.contents[0].text, /ui\/initialize/);
-    assert.match(resRead.result.contents[0].text, /chrome_live_ui_action/);
-    assert.match(resRead.result.contents[0].text, /pinnedTabClosed/);
+    const appHtml = resRead.result.contents[0].text;
+    assert.match(appHtml, /ui\/initialize/);
+    assert.match(appHtml, /pinnedTabClosed/);
+    const secretMatch = appHtml.match(/const UI_SECRET = "([0-9a-f]{64})";/);
+    assert.ok(secretMatch, 'Expected 256-bit UI capability secret inside sandboxed iframe HTML');
+    const uiSecret = secretMatch[1];
 
     const monitorCall = await rpc(4, 'tools/call', { name: 'chrome_live_monitor', arguments: { tabId: 77 } });
     assert.ok(monitorCall.result.structuredContent.frameDataUrl.startsWith('data:image/jpeg;base64,'));
@@ -854,24 +854,24 @@ test('MCP stdio server isolates model-visible monitor from app-only UI actions, 
     const wsCall = await rpc(21, 'tools/call', { name: 'chrome_live_workspace', arguments: {} });
     assert.ok(wsCall.result.structuredContent.frameDataUrl.startsWith('data:image/jpeg;base64,'));
 
-    // App-only UI actions route through chrome_live_ui_action
+    // Authenticated iframe UI actions succeed when carrying the ephemeral UI capability secret
     const pollCall = await rpc(22, 'tools/call', {
-      name: 'chrome_live_ui_action',
-      arguments: { action: 'poll', lastFrameTs: 0, tabId: 77 }
+      name: 'chrome_live_monitor',
+      arguments: { action: 'poll', lastFrameTs: 0, tabId: 77, uiSecret }
     });
     assert.equal(pollCall.result.structuredContent.frameTabId, 77);
 
     const regionCall = await rpc(5, 'tools/call', {
-      name: 'chrome_live_ui_action',
-      arguments: { action: 'inspect_region', tabId: 77, rx1: 0.1, ry1: 0.1, rx2: 0.5, ry2: 0.5 }
+      name: 'chrome_live_monitor',
+      arguments: { action: 'inspect_region', tabId: 77, rx1: 0.1, ry1: 0.1, rx2: 0.5, ry2: 0.5, uiSecret }
     });
     assert.equal(regionCall.result.structuredContent.regionResult.elements[0].selector, '#confirm-btn');
 
     // Release error MUST propagate instead of silently reporting success
     simulateReleaseError = true;
     const failedRelease = await rpc(25, 'tools/call', {
-      name: 'chrome_live_ui_action',
-      arguments: { action: 'release_tab', tabId: 77 }
+      name: 'chrome_live_monitor',
+      arguments: { action: 'release_tab', tabId: 77, uiSecret }
     });
     assert.equal(Boolean(failedRelease.error || failedRelease.result?.isError), true);
     const errText = JSON.stringify(failedRelease);
@@ -887,8 +887,8 @@ test('MCP stdio server isolates model-visible monitor from app-only UI actions, 
     await new Promise((r) => setTimeout(r, 40));
 
     const closedTabPoll = await rpc(26, 'tools/call', {
-      name: 'chrome_live_ui_action',
-      arguments: { action: 'poll', lastFrameTs: 0, tabId: 88 }
+      name: 'chrome_live_monitor',
+      arguments: { action: 'poll', lastFrameTs: 0, tabId: 88, uiSecret }
     });
     assert.equal(closedTabPoll.result.structuredContent.requestedTabMissing, true);
     assert.equal(closedTabPoll.result.structuredContent.frameDataUrl ?? null, null);

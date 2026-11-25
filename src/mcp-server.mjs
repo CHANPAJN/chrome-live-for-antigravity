@@ -1,4 +1,11 @@
+import crypto from 'node:crypto';
 import { buildInlineMonitorHtml, INLINE_MONITOR_URI } from './inline-monitor-ui.mjs';
+import { timingSafeEqualToken } from './token-store.mjs';
+
+// Ephemeral 256-bit capability token injected exclusively into the isolated `ui://` iframe document.
+// Because models never receive `resources/read` HTML for `ui://` apps, any model-forged `action` call
+// lacking this secret is deterministically rejected while keeping `chrome_live_monitor` enabled on all hosts.
+const UI_CAPABILITY_SECRET = crypto.randomBytes(32).toString('hex');
 
 const SERVER_INFO = {
   name: 'chrome-live-for-antigravity',
@@ -29,13 +36,12 @@ const MCP_TOOLS = [
       type: 'object',
       properties: {
         tabId: { type: 'integer', description: 'Optional target tabId to focus in the inline stream' }
-      },
-      additionalProperties: false
+      }
     },
     _meta: {
       ui: {
         resourceUri: INLINE_MONITOR_URI,
-        visibility: ['model']
+        visibility: ['model', 'app']
       }
     }
   },
@@ -412,7 +418,7 @@ export function startMcpStdioServer({ callDaemon }) {
               {
                 uri: INLINE_MONITOR_URI,
                 mimeType: 'text/html;profile=mcp-app',
-                text: buildInlineMonitorHtml(),
+                text: buildInlineMonitorHtml(UI_CAPABILITY_SECRET),
                 _meta: {
                   ui: {
                     prefersBorder: false
@@ -634,9 +640,13 @@ async function invokeTool(toolName, args, callDaemon) {
     case 'chrome_live_monitor':
     case 'chrome_live_workspace': {
       if (args && typeof args.action === 'string' && args.action.length > 0) {
-        throw new Error(
-          'Interactive UI actions are restricted to the app-only chrome_live_ui_action endpoint and cannot be invoked via chrome_live_monitor.'
-        );
+        const providedSecret = typeof args.uiSecret === 'string' ? args.uiSecret : '';
+        if (!timingSafeEqualToken(providedSecret, UI_CAPABILITY_SECRET)) {
+          throw new Error(
+            'Interactive UI actions require a verified iframe UI capability token and cannot be invoked by the model.'
+          );
+        }
+        return await executeMonitorAppAction(args, callDaemon);
       }
       const targetTabId = typeof args?.tabId === 'number' ? args.tabId : undefined;
       const sc = await buildMonitorStructuredState(callDaemon, 0, targetTabId, targetTabId !== undefined);

@@ -1,6 +1,7 @@
 export const INLINE_MONITOR_URI = 'ui://chrome-live/live-monitor.html';
 
-export function buildInlineMonitorHtml() {
+export function buildInlineMonitorHtml(uiSecret = '') {
+  const safeUiSecretJson = JSON.stringify(String(uiSecret || ''));
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -903,6 +904,8 @@ export function buildInlineMonitorHtml() {
         }
       });
 
+      const UI_SECRET = ${safeUiSecretJson};
+
       async function pollLoop() {
         if (document.hidden || pollInFlight) {
           scheduleNextPoll();
@@ -910,10 +913,10 @@ export function buildInlineMonitorHtml() {
         }
         pollInFlight = true;
         try {
-          const pollArgs = { action: 'poll', lastFrameTs };
+          const pollArgs = { action: 'poll', lastFrameTs, uiSecret: UI_SECRET };
           if (selectedTabId !== null) pollArgs.tabId = selectedTabId;
           const res = await sendRequest('tools/call', {
-            name: 'chrome_live_ui_action',
+            name: 'chrome_live_monitor',
             arguments: pollArgs
           });
           if (res && res.structuredContent) {
@@ -936,8 +939,8 @@ export function buildInlineMonitorHtml() {
         if (labelText) showStatus(labelText, 'info', false);
         try {
           const res = await sendRequest('tools/call', {
-            name: 'chrome_live_ui_action',
-            arguments: actionArgs
+            name: 'chrome_live_monitor',
+            arguments: { ...actionArgs, uiSecret: UI_SECRET }
           });
           if (res && res.isError) {
             const errTxt = (res.content && res.content[0] && res.content[0].text) || 'Action failed';
