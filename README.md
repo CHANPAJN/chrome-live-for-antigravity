@@ -9,14 +9,14 @@
 Instead of launching a blank, logged-out sandboxed browser that triggers anti-bot captchas or forces repeated logins, you can either **share a single signed-in tab on demand** (`Alt+Shift+L` / `Option+Shift+L` on macOS) or let your agent work quietly inside **collapsed background tab groups** while interacting through the built-in **Antigravity MCP App (SEP-1865)** inline in chat, docked in the side pane, or full-page from the sidebar.
 
 <p align="center">
-  <img src="./docs/real-dual-demo.gif" alt="100% real side-by-side capture: official Antigravity desktop with inline SEP-1865 MCP App live monitor driving real Chrome with HUD cursor, collapsed cyan background tab group, and local payment guardrail" width="880" />
+  <img src="./docs/real-dual-demo.gif" alt="Chrome Live for Antigravity 50fps workflow demo: inline SEP-1865 MCP App live monitor synchronized with Chrome HUD cursor, auto-collapsing cyan background tab group, and local payment guardrail" width="880" />
 </p>
-<p align="center"><sub>100% real desktop capture — zero mockups: official Antigravity (inline SEP-1865 <code>chrome_live_monitor</code> with <code>LIVE · 0 Token</code> stream &amp; <code>Control / Pick / Attach | Popout / Refresh / Release</code>) synchronized side-by-side with live Chrome (HUD pill, silent collapsed <code>Live · Active</code> background tab group, and local guardrail blocking <code>checkout.stripe.com</code>).</sub></p>
+<p align="center"><sub>Synchronized 50fps workflow showcase of the real Antigravity inline <code>chrome_live_monitor</code> (<code>LIVE · 0 Token</code> &amp; <code>Control / Pick / Attach | Popout / Refresh / Release</code>) and live Chrome (HUD cursor &amp; glass pill, auto-collapsing cyan <code>Live · Active</code> background tab group, and local guardrail blocking <code>checkout.stripe.com</code>).</sub></p>
 
 <details>
-<summary><strong>View CLI + Real Chrome split-screen capture (for Claude Code / Codex / OpenCode terminal users)</strong></summary>
+<summary><strong>View unedited 1:1 real Chrome window + live CLI capture</strong></summary>
 <p align="center">
-  <img src="./docs/real-demo.gif" alt="Real CLI driving live Chrome: foreground HUD cursor, collapsed cyan background tab group, clean text extraction, and local payment guardrail" width="880" />
+  <img src="./docs/real-demo.gif" alt="Unedited 1:1 real Chrome window driven by live CLI: foreground HUD cursor, collapsed cyan background tab group, clean text extraction, and local payment guardrail" width="880" />
 </p>
 </details>
 
