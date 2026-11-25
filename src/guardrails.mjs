@@ -64,19 +64,45 @@ export const DEFAULT_BLOCKED_DOMAINS = Object.freeze([
   'dash.cloudflare.com'
 ]);
 
-const CHECKOUT_PATH_PATTERNS = [
-  /\/checkout(?:\/|\?|$|#)/i,
-  /\/pay(?:ment(?:s)?)?(?:\/|\?|$|#)/i,
-  /\/cashier(?:\/|\?|$|#)/i,
-  /\/billing(?:\/|\?|$|#)/i,
-  /\/wallet\/transfer(?:\/|\?|$|#)/i
-];
+const CHECKOUT_SEGMENT_RX =
+  /(?:^|\/)(?:checkout|pay|payment|payments|cashier|billing|wallet\/transfer)(?:\/|\?|$|#|;|\.[a-z0-9]{1,8}(?:\/|\?|$|#|;))/i;
 
 export const AUDIT_SENSITIVE_PARAM_RX =
-  /(?:token|secret|passw|pwd|apikey|api[-_]?key|access[-_]?key|private[-_]?key|auth|code|state|sig|jwt|bearer|ticket|session|sid|csrf|xsrf|otp|credential)/i;
+  /(?:token|secret|passw|pwd|apikey|api[-_]?key|access[-_]?key|private[-_]?key|auth|code|state|sig|jwt|bearer|ticket|session|sid|csrf|xsrf|otp|credential|hmac|(?:^|[-_.])(?:key|pass|pin|hash)(?:$|[-_.]))/i;
 
 const HASH_SENSITIVE_PAIR_RX =
-  /([#?&])([^=&#]*(?:token|secret|passw|pwd|apikey|api[-_]?key|access[-_]?key|private[-_]?key|auth|code|state|sig|jwt|bearer|ticket|session|sid|csrf|xsrf|otp|credential)[^=&#]*)=([^&#]*)/gi;
+  /([#?&])([^=&#]*(?:token|secret|passw|pwd|apikey|api[-_]?key|access[-_]?key|private[-_]?key|auth|code|state|sig|jwt|bearer|ticket|session|sid|csrf|xsrf|otp|credential|hmac|(?:^|[-_.])(?:key|pass|pin|hash)(?:$|[-_.]))[^=&#]*)=([^&#]*)/gi;
+
+function canonicalizePathForGuardrail(rawSegment) {
+  if (!rawSegment) return { ok: true, path: '/' };
+  let decoded = String(rawSegment);
+  for (let i = 0; i < 3; i++) {
+    if (!decoded.includes('%')) break;
+    try {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    } catch {
+      return { ok: false, path: '' };
+    }
+  }
+  const normalizedSlashes = decoded.replace(/\\/g, '/');
+  const qIdx = normalizedSlashes.indexOf('?');
+  const pathPart = qIdx === -1 ? normalizedSlashes : normalizedSlashes.slice(0, qIdx);
+  const queryPart = qIdx === -1 ? '' : normalizedSlashes.slice(qIdx);
+
+  const stack = [];
+  for (const rawPiece of pathPart.split('/')) {
+    const cleanPiece = rawPiece.split(';')[0];
+    if (!cleanPiece || cleanPiece === '.') continue;
+    if (cleanPiece === '..') {
+      stack.pop();
+      continue;
+    }
+    stack.push(cleanPiece);
+  }
+  return { ok: true, path: `/${stack.join('/')}${queryPart}` };
+}
 
 export function redactUrlForAudit(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return rawUrl;
@@ -172,16 +198,23 @@ export function evaluateUrlSafety(rawUrl, customBlockedDomains = []) {
     }
   }
 
-  // Also inspect SPA hash routes (e.g. https://shop.example.com/#/checkout/pay)
-  const fullRoute = `${parsed.pathname}${parsed.search}${parsed.hash}`;
-  for (const rx of CHECKOUT_PATH_PATTERNS) {
-    if (rx.test(fullRoute)) {
-      return {
-        allowed: false,
-        code: 'PAYMENT_PATH',
-        reason: `URL route "${parsed.pathname}${parsed.hash}" matches protected payment/checkout guardrail`
-      };
-    }
+  const canonPath = canonicalizePathForGuardrail(parsed.pathname);
+  if (!canonPath.ok) {
+    return { allowed: false, code: 'MALFORMED_URL', reason: 'Malformed percent-encoding in URL pathname' };
+  }
+  const rawHashBody = parsed.hash ? parsed.hash.replace(/^#+/, '') : '';
+  const canonHash = rawHashBody ? canonicalizePathForGuardrail(rawHashBody) : { ok: true, path: '' };
+  if (!canonHash.ok) {
+    return { allowed: false, code: 'MALFORMED_URL', reason: 'Malformed percent-encoding in URL fragment' };
+  }
+
+  // Inspect canonicalized pathname and SPA hash route (defeating %63heckout, %2fcheckout, ;jsessionid, /cashier.htm)
+  if (CHECKOUT_SEGMENT_RX.test(canonPath.path) || (canonHash.path && CHECKOUT_SEGMENT_RX.test(canonHash.path))) {
+    return {
+      allowed: false,
+      code: 'PAYMENT_PATH',
+      reason: `URL route "${parsed.pathname}${parsed.hash}" matches protected payment/checkout guardrail`
+    };
   }
 
   return { allowed: true, code: 'OK', reason: '' };
@@ -190,7 +223,7 @@ export function evaluateUrlSafety(rawUrl, customBlockedDomains = []) {
 const SENSITIVE_FILE_DIR_RX =
   /(?:^|\/)(?:\.ssh|\.gnupg|\.aws|\.kube|\.azure|\.gcloud|\.docker|\.chrome-live-antigravity|gcloud)(?:\/|$)/i;
 const SENSITIVE_FILE_NAME_RX =
-  /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|auth\.token|\.local-runtime\.json|agent_vault\.enc|\.env(?:\..+)?|\.npmrc|\.pypirc|\.netrc|\.git-credentials|credentials(?:\.json)?|application_default_credentials\.json|Cookies(?:-journal)?|Login Data(?:\s+For\s+Account)?|Web Data|.*\.(?:pem|key|p12|pfx|kdbx|ovpn|jks|keystore))$/i;
+  /^(?:(?!.*\.pub$)id_(?:rsa|ed25519|ecdsa|dsa)(?:$|[._-].+)|authorized_keys|known_hosts|auth\.token|\.local-runtime\.json|agent_vault\.enc|\.env(?:\..+)?|\.npmrc|\.pypirc|\.netrc|\.git-credentials|kubeconfig|credentials(?:\.json)?|application_default_credentials\.json|Local\s+State|Cookies(?:-journal)?|cookies\.sqlite|key[34]\.db|cert9\.db|logins\.json|Login Data(?:\s+For\s+Account)?|Web Data|.*\.(?:pem|key|p12|pfx|kdbx|ovpn|jks|keystore)|.*\.tfstate(?:\.backup)?)$/i;
 
 function resolveCanonicalPath(targetPath) {
   try {

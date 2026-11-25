@@ -821,6 +821,7 @@
         this._cancelHoldUnlock();
         this._clearConfirmState();
         const nextPaused = this._state.mode !== 'paused';
+        this._state.userPausedLock = nextPaused;
         this._state.mode = nextPaused ? 'paused' : 'working';
         this._state.activity = nextPaused ? this._t().pausedByUser : this._t().resumed;
         this._state.flashText = '';
@@ -859,6 +860,7 @@
         if (selfDestructIfOrphan()) return;
         this._cancelHoldUnlock();
         this._clearConfirmState();
+        this._state.userPausedLock = true;
         this._state.mode = 'paused';
         this._state.visible = false;
         this._notifyBackground('release');
@@ -909,6 +911,7 @@
             holdingPointerId = null;
             this._cancelHoldUnlock();
             this._clearConfirmState();
+            this._state.userPausedLock = true;
             this._state.mode = 'paused';
             this._state.activity = this._t().pausedByUser;
             this._state.flashText = '';
@@ -1112,13 +1115,20 @@
       if (payload.lang === 'zh' || payload.lang === 'en') {
         this._state.lang = payload.lang;
       }
+      if (payload.clearUserPauseLock === true) {
+        this._state.userPausedLock = false;
+      }
       if (typeof payload.visible === 'boolean') this._state.visible = payload.visible;
       if (typeof payload.mode === 'string') {
-        this._state.mode = payload.mode;
+        if (payload.mode === 'paused') {
+          this._state.mode = 'paused';
+        } else if (!this._state.userPausedLock) {
+          this._state.mode = payload.mode;
+        }
         this._clearConfirmState();
-        this._state.userActionQueue.length = 0;
+        // Never wipe userActionQueue inside update(); only drainUserEvents() may consume queued user gestures!
       }
-      if (typeof payload.activity === 'string') {
+      if (typeof payload.activity === 'string' && (!this._state.userPausedLock || payload.mode === 'paused')) {
         this._state.activity = payload.activity;
         this._state.flashText = '';
       }

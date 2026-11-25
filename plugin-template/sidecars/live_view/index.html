@@ -337,7 +337,10 @@
         });
 
         releaseBtn.addEventListener('click', async () => {
-          const r = await sidecarFetch('/api/action?cmd=release_tab&all=1').catch(() => null);
+          if (activeTabId === null) return;
+          const r = await sidecarFetch(`/api/action?cmd=release_tab&tabId=${encodeURIComponent(activeTabId)}`).catch(
+            () => null
+          );
           const j = r ? await r.json().catch(() => null) : null;
           if (!j || j.ok === false) {
             statusTitle.textContent = j?.error || 'Release failed';

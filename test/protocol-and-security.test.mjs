@@ -738,7 +738,10 @@ test('Upload guardrails block credential keys, restrict default uploads to stagi
       { method: 'upload', params: { target: 'auto', files: [stagedIcon] } }
     );
     assert.equal(okResp.statusCode, 200);
-    assert.deepEqual(okResp.json.result.receivedFiles, [expectedRealIcon]);
+    assert.equal(okResp.json.result.receivedFiles.length, 1);
+    assert.equal(path.basename(okResp.json.result.receivedFiles[0]), path.basename(expectedRealIcon));
+    assert.match(okResp.json.result.receivedFiles[0], /\.upload-snapshots/);
+    assert.equal(fs.existsSync(okResp.json.result.receivedFiles[0]), false, 'Private snapshot must be purged after upload RPC');
     assert.equal(okResp.json.result.hasPasteFallback, true);
     assert.equal(okResp.json.result.fallbackMime, 'image/png');
 
@@ -892,8 +895,18 @@ test('MCP stdio server isolates model-visible monitor from app-only UI actions, 
     const monitorCall = await rpc(4, 'tools/call', { name: 'chrome_live_monitor', arguments: { tabId: 77 } });
     assert.ok(monitorCall.result.structuredContent.frameDataUrl.startsWith('data:image/jpeg;base64,'));
     assert.equal(monitorCall.result.structuredContent.frameTabId, 77);
-    const uiSecret = monitorCall.result.structuredContent.uiSecret;
-    assert.match(uiSecret, /^[0-9a-f]{64}$/, 'Expected 256-bit uiSecret inside structuredContent');
+    const uiSecret = monitorCall.result._meta?.uiSecret;
+    assert.match(uiSecret, /^[0-9a-f]{64}$/, 'Expected 256-bit uiSecret inside CallToolResult._meta');
+    assert.equal(
+      monitorCall.result.structuredContent.uiSecret,
+      undefined,
+      'Model-visible structuredContent MUST NOT expose uiSecret'
+    );
+    assert.equal(
+      JSON.stringify(monitorCall.result.structuredContent || {}).includes(uiSecret),
+      false,
+      'Serialized structuredContent MUST NOT include uiSecret'
+    );
     assert.equal(
       JSON.stringify(monitorCall.result.content || []).includes(uiSecret),
       false,
@@ -951,19 +964,37 @@ test('MCP stdio server isolates model-visible monitor from app-only UI actions, 
   }
 });
 
-test('Soak bug-hunt regressions: strict explicit tabId isolation, batch cmd alias, and discarded-tab bounded script helper', () => {
+test('Soak bug-hunt regressions: runtime resolveTargetEntry multi-tab isolation, detached tab rejection & bounded script helper', () => {
   const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
 
-  // 1. Explicit tabId must never silently fall back to another shared tab after detachment
-  assert.match(swSource, /Tab #\$\{numId\} is no longer controlled/);
-  assert.match(swSource, /\[GUARDRAIL\] Detached tab #\$\{numId\}/);
+  // Execute resolveTargetEntry in a real VM context to verify multi-tab & detached-tab behavior
+  const resolveMatch = swSource.match(/function resolveTargetEntry\(requestedTabId\)[\s\S]*?\n\}/);
+  assert.ok(resolveMatch, 'Expected resolveTargetEntry in service-worker.js');
+  const mockManaged = new Map();
+  const mockDetached = new Map();
+  const runResolve = vm.runInNewContext(`(${resolveMatch[0]})`, {
+    managedTabs: mockManaged,
+    recentDetachedTabs: mockDetached
+  });
 
-  // 2. Batch step parser accepts action, method, or cmd aliases
+  // 0 controlled tabs -> throws
+  assert.throws(() => runResolve(undefined), /No shared or controlled tab available/);
+
+  // Single controlled tab -> omitting tabId resolves cleanly
+  mockManaged.set(10, { tabId: 10, substate: 'shared' });
+  assert.equal(runResolve(undefined).tabId, 10);
+
+  // Multiple controlled tabs -> omitting tabId MUST throw rather than silently hijacking tab 10!
+  mockManaged.set(20, { tabId: 20, substate: 'worker' });
+  assert.throws(() => runResolve(undefined), /Multiple tabs are currently controlled/);
+  assert.equal(runResolve(20).tabId, 20);
+
+  // Explicit detached/guardrail-tripped tabId MUST throw and never fall back to remaining tabs
+  mockDetached.set(30, { reason: 'Protected checkout/payment route (/checkout)', isGuardrail: true });
+  assert.throws(() => runResolve(30), /\[GUARDRAIL\] Detached tab #30/);
+
   assert.match(swSource, /rawStep\.action \|\| rawStep\.method \|\| rawStep\.cmd/);
-
-  // 3. Discarded background tabs are reloaded and bounded by timeout
   assert.match(swSource, /async function execScriptBounded/);
-  assert.match(swSource, /cur\?\.discarded/);
 });
 
 test('Multi-tab concurrency & form-state regressions: per-tab frame isolation, ARIA states/alerts, and click disabled guard', async () => {
@@ -1852,7 +1883,8 @@ test('Blind-audit round-1 regressions: multi-tab release isolation, paused frame
         name: 'chrome_live_monitor',
         arguments: { tabId: 88 }
       });
-      const uiSecret = monInit.result.structuredContent.uiSecret;
+      const uiSecret = monInit.result._meta?.uiSecret;
+      assert.equal(monInit.result.structuredContent.uiSecret, undefined);
       assert.equal(monInit.result.structuredContent.frameTabId, 88);
 
       // Releasing tab 88 while tab 77 is still active MUST NOT trigger screenshot on tab 77 or leak tab 77's frame
@@ -1883,7 +1915,8 @@ test('Blind-audit round-1 regressions: multi-tab release isolation, paused frame
       });
       assert.equal(monPaused77.result.structuredContent.frameDataUrl ?? null, null, 'Paused tab poll must return null frame');
 
-      // Dynamic token rotation without daemon restart
+      // Dynamic token rotation without daemon restart MUST reject old HTTP tokens AND actively evict existing WS peers with 4001!
+      const ext2RotatedClosePromise = new Promise((resolve) => ext2.on('close', (code) => resolve(code)));
       const oldToken = activeToken;
       const rotatedToken = crypto.randomBytes(32).toString('hex');
       activeToken = rotatedToken;
@@ -1893,6 +1926,8 @@ test('Blind-audit round-1 regressions: multi-tab release isolation, paused frame
       assert.equal(staleReq.status, 401, 'Old token must be rejected immediately after rotation');
       const freshReq = await signedGet('/api/state', rotatedToken);
       assert.equal(freshReq.status, 200, 'Rotated token must succeed without restarting daemon');
+      const ext2EvictCode = await ext2RotatedClosePromise;
+      assert.equal(ext2EvictCode, 4001, 'Existing WebSocket session must be evicted with 4001 upon token rotation');
     } finally {
       try {
         ext1?.socket?.destroy();
@@ -1917,6 +1952,238 @@ test('Blind-audit round-1 regressions: multi-tab release isolation, paused frame
     else process.env.CHROME_LIVE_UPLOAD_DIR = prevUploadDir;
     if (prevEnvToken === undefined) delete process.env.CHROME_LIVE_TOKEN;
     else process.env.CHROME_LIVE_TOKEN = prevEnvToken;
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+});
+
+test('Blind-audit round-2 runtime regressions: percent-encoded/matrix/suffix payment paths, cryptographic pre-body header HMAC, pause race lock, CSS selector probing block, upload TOCTOU snapshot & BOM stdio framing', async () => {
+  const { spawn } = await import('node:child_process');
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+  const hudSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'hud.js'), 'utf8');
+
+  // 1. Dual-layer URL guardrail defeats %63heckout, %2fcheckout, #/%63heckout, /cashier.htm, /pay.php, ;jsessionid, and malformed %
+  const blockedUrls = [
+    'https://shop.example.com/%63heckout',
+    'https://shop.example.com/%2fcheckout',
+    'https://shop.example.com/#/%2fcheckout',
+    'https://shop.example.com/#/%63heckout',
+    'https://shop.example.com/cashier.htm',
+    'https://shop.example.com/checkout.html',
+    'https://shop.example.com/pay.php?order=1',
+    'https://shop.example.com/checkout;jsessionid=abc123',
+    'https://shop.example.com/%E0%A4%A'
+  ];
+  const allowedBenignUrls = [
+    'https://docs.example.com/payload',
+    'https://docs.example.com/display.html',
+    'https://docs.example.com/repayment-guide'
+  ];
+
+  // Extract extension's canonicalizeRouteForGuardrail + checkTabUrlAllowed and run in VM
+  const extGuardMatch = swSource.match(
+    /const CHECKOUT_SEGMENT_RX =[\s\S]*?function assertSafeModelSelector[\s\S]*?\n\}/
+  );
+  const extCheckTabMatch = swSource.match(/function checkTabUrlAllowed\(rawUrl\)[\s\S]*?\n\}/);
+  assert.ok(extGuardMatch && extCheckTabMatch, 'Expected extension URL & selector guardrail functions');
+  const extVm = vm.createContext({
+    URL,
+    decodeURIComponent,
+    BUILTIN_PROTECTED_DOMAINS: ['checkout.stripe.com', 'alipay.com'],
+    customBlockedDomains: ['internal-finance.corp.local'],
+    bridgeConfig: { port: 28196 }
+  });
+  vm.runInContext(`${extGuardMatch[0]}\n${extCheckTabMatch[0]}`, extVm);
+
+  for (const badUrl of blockedUrls) {
+    assert.equal(evaluateUrlSafety(badUrl).allowed, false, `Daemon guardrail should block ${badUrl}`);
+    assert.equal(extVm.checkTabUrlAllowed(badUrl).allowed, false, `Extension guardrail should block ${badUrl}`);
+  }
+  for (const okUrl of allowedBenignUrls) {
+    assert.equal(evaluateUrlSafety(okUrl).allowed, true, `Daemon guardrail should allow ${okUrl}`);
+    assert.equal(extVm.checkTabUrlAllowed(okUrl).allowed, true, `Extension guardrail should allow ${okUrl}`);
+  }
+
+  // 2. CSS attribute-value & substring selector probing MUST throw in assertSafeModelSelector
+  for (const evilSel of [
+    'input[name="csrf_token"][value^="a"]',
+    'input[type="password"][value*="S"]',
+    'meta[name="csrf-token"][content^="e"]',
+    'div[data-csrf="123"]',
+    'a[href$="secret"]'
+  ]) {
+    assert.throws(() => extVm.assertSafeModelSelector(evilSel), /\[GUARDRAIL\]/);
+  }
+  // Safe exact selectors pass cleanly
+  extVm.assertSafeModelSelector('#submit-btn');
+  extVm.assertSafeModelSelector('input[name="q"]');
+  extVm.assertSafeModelSelector('[data-testid="search-input"]');
+
+  // 3. Expanded URL & Playbook redaction (?key=AIza..., ?pin=..., #opaqueHash, customBlockedDomains)
+  const geminiKeyUrl = 'https://api.example.com/v1/models?key=AIzaSySecretKey12345&pin=8899&page=1#9f8e7d6c5b4a32109f8e7d6c5b4a3210';
+  const redactedGemini = redactUrlForAudit(geminiKeyUrl);
+  assert.equal(redactedGemini.includes('AIzaSySecretKey12345'), false);
+  assert.equal(redactedGemini.includes('8899'), false);
+  assert.equal(redactedGemini.includes('9f8e7d6c5b4a3210'), false);
+
+  const sanitizedPlaybookRoute = sanitizeRouteUrl(geminiKeyUrl);
+  assert.equal(sanitizedPlaybookRoute.includes('AIzaSySecretKey12345'), false);
+  assert.equal(sanitizedPlaybookRoute.includes('9f8e7d6c5b4a3210'), false);
+  assert.equal(
+    sanitizeRouteUrl('https://internal-finance.corp.local/reports', ['internal-finance.corp.local']),
+    null,
+    'Playbook sanitizeRouteUrl must honor customBlockedDomains'
+  );
+
+  // 4. Undocumented plaintext `chrome-live token` CLI subcommand MUST NOT exist
+  const cliPath = path.join(REPO_ROOT, 'bin', 'chrome-live.mjs');
+  const tokenCmdRes = spawnSync(process.execPath, [cliPath, 'token'], { encoding: 'utf8' });
+  assert.notEqual(tokenCmdRes.status, 0, '`chrome-live token` subcommand must be rejected');
+
+  // 5. Pause race immunity: syncHudNow & HUD update() MUST NOT overwrite user pause or wipe userActionQueue
+  const syncHudNowMatch = swSource.match(/async function syncHudNow\(tabId, payload\)[\s\S]*?\n\}/);
+  assert.ok(syncHudNowMatch, 'Expected syncHudNow in service-worker.js');
+  let scriptInjectedDuringPause = false;
+  const pausedTabsMap = new Map([[42, { tabId: 42, paused: true, detached: false, uiMode: 'paused' }]]);
+  const runSyncHudNow = vm.runInNewContext(`(${syncHudNowMatch[0]})`, {
+    managedTabs: pausedTabsMap,
+    currentLang: 'zh',
+    runHudScriptSafe: async () => {
+      scriptInjectedDuringPause = true;
+      return [{ result: { updated: true } }];
+    }
+  });
+  await runSyncHudNow(42, { visible: true, mode: 'working', activity: 'Late in-flight command' });
+  assert.equal(pausedTabsMap.get(42).uiMode, 'paused', 'Late working syncHudNow must never overwrite paused entry');
+  assert.equal(scriptInjectedDuringPause, false, 'Late working syncHudNow must short-circuit without injecting working mode');
+  assert.equal(
+    hudSource.includes('userActionQueue.length = 0'),
+    false,
+    'hud.js update() must never clear queued user pause/release events'
+  );
+
+  // 6. Pre-body cryptographic Header HMAC rejects forged-signature 12MB POST BEFORE reading body + Upload snapshot TOCTOU + BOM MCP framing
+  const prevHome = process.env.CHROME_LIVE_HOME;
+  const prevEnvTok = process.env.CHROME_LIVE_TOKEN;
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-r3-home-'));
+  let daemon = null;
+  let extWs = null;
+  let mcpProc = null;
+  try {
+    delete process.env.CHROME_LIVE_TOKEN;
+    process.env.CHROME_LIVE_HOME = tempHome;
+    const tok = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(path.join(tempHome, 'auth.token'), `${tok}\n`, 'utf8');
+    daemon = createDaemonServer({ host: '127.0.0.1', port: 0 });
+    const port = await daemon.listen();
+
+    // Send POST headers with forged 64-zero signatures and huge Content-Length, WITHOUT sending body bytes:
+    // Daemon MUST immediately return 401 before waiting for body!
+    const forgedRespStatus = await new Promise((resolve, reject) => {
+      const sock = net.createConnection({ host: '127.0.0.1', port }, () => {
+        const rawReq = [
+          'POST /api/command HTTP/1.1',
+          `Host: 127.0.0.1:${port}`,
+          'Content-Type: application/json',
+          'Content-Length: 10485760',
+          `X-Chrome-Live-Ts: ${Date.now()}`,
+          `X-Chrome-Live-Nonce: ${crypto.randomBytes(16).toString('hex')}`,
+          `X-Chrome-Live-Hdr-Sig: ${'0'.repeat(64)}`,
+          `X-Chrome-Live-Sig: ${'0'.repeat(64)}`,
+          '\r\n'
+        ].join('\r\n');
+        sock.write(rawReq); // Deliberately send ZERO body bytes!
+      });
+      let respText = '';
+      sock.on('data', (c) => {
+        respText += c.toString('utf8');
+        if (respText.includes('\r\n\r\n')) {
+          sock.destroy();
+          const m = respText.match(/^HTTP\/1\.1\s+(\d+)/);
+          resolve(m ? Number(m[1]) : 0);
+        }
+      });
+      sock.setTimeout(1500, () => {
+        sock.destroy();
+        reject(new Error('Daemon waited on POST body instead of rejecting forged header HMAC immediately!'));
+      });
+      sock.on('error', reject);
+    });
+    assert.equal(forgedRespStatus, 401, 'Forged header HMAC must be rejected with 401 before buffering POST body');
+
+    // Verify batch upload freezes immutable private snapshot immune to mid-batch TOCTOU replacement & cleans up afterwards
+    const stagingDir = getDefaultUploadStagingDir();
+    fs.mkdirSync(stagingDir, { recursive: true });
+    const stagedPath = path.join(stagingDir, 'invoice-safe.txt');
+    fs.writeFileSync(stagedPath, 'SAFE_ORIGINAL_CONTENT', 'utf8');
+
+    extWs = await connectTestWsClient(port, '/ws/extension', tok);
+    let frozenBytesSeenByChrome = '';
+    let snapshotPathSeen = '';
+    extWs.on('message', (raw) => {
+      const msg = JSON.parse(raw.toString('utf8'));
+      if (msg.type === 'rpc_request' && msg.method === 'batch') {
+        // Simulate attacker mutating/deleting the original staging file during step 1 BEFORE Chrome executes step 2 upload!
+        fs.writeFileSync(stagedPath, 'SWAPPED_SENSITIVE_SECRET_AFTER_CHECK', 'utf8');
+        const uploadStep = msg.params.steps.find((s) => s.action === 'upload');
+        snapshotPathSeen = uploadStep.files[0];
+        frozenBytesSeenByChrome = fs.readFileSync(snapshotPathSeen, 'utf8');
+        extWs.sendMaskedJson({ type: 'rpc_response', id: msg.id, ok: true, result: { stepResults: [] } });
+      }
+    });
+
+    const batchRes = await httpJson(port, 'POST', '/api/command', { token: tok }, {
+      method: 'batch',
+      params: {
+        steps: [
+          { action: 'wait', ms: 50 },
+          { action: 'upload', files: [stagedPath] }
+        ]
+      }
+    });
+    assert.equal(batchRes.statusCode, 200);
+    assert.notEqual(path.resolve(snapshotPathSeen), path.resolve(stagedPath), 'Extension must receive isolated private snapshot path');
+    assert.equal(frozenBytesSeenByChrome, 'SAFE_ORIGINAL_CONTENT', 'Upload snapshot must preserve verified fd bytes against TOCTOU swap');
+    assert.equal(fs.existsSync(snapshotPathSeen), false, 'Private upload snapshot must be cleaned up immediately after RPC');
+
+    // Verify UTF-8 BOM prefixed line-delimited MCP stream does NOT deadlock into header mode
+    mcpProc = spawn(process.execPath, [cliPath, 'mcp'], {
+      env: { ...process.env, CHROME_LIVE_PORT: String(port), CHROME_LIVE_HOME: tempHome },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    const bomReplyPromise = new Promise((resolve, reject) => {
+      let buf = '';
+      const t = setTimeout(() => reject(new Error('UTF-8 BOM prefixed MCP line deadlocked')), 2000);
+      mcpProc.stdout.on('data', (c) => {
+        buf += c.toString('utf8');
+        if (buf.includes('\n')) {
+          clearTimeout(t);
+          resolve(JSON.parse(buf.trim().split('\n')[0]));
+        }
+      });
+    });
+    const bomPrefix = Buffer.from([0xef, 0xbb, 0xbf]);
+    const initLine = Buffer.from(`${JSON.stringify({ jsonrpc: '2.0', id: 707, method: 'initialize', params: {} })}\n`, 'utf8');
+    mcpProc.stdin.write(Buffer.concat([bomPrefix, initLine]));
+    const bomReply = await bomReplyPromise;
+    assert.equal(bomReply.id, 707);
+    assert.ok(bomReply.result?.serverInfo);
+  } finally {
+    try {
+      extWs?.socket?.destroy();
+    } catch {}
+    if (mcpProc) {
+      try {
+        mcpProc.stdin?.destroy();
+        mcpProc.stdout?.destroy();
+        mcpProc.stderr?.destroy();
+      } catch {}
+      mcpProc.kill();
+    }
+    if (daemon) await daemon.close();
+    if (prevHome === undefined) delete process.env.CHROME_LIVE_HOME;
+    else process.env.CHROME_LIVE_HOME = prevHome;
+    if (prevEnvTok === undefined) delete process.env.CHROME_LIVE_TOKEN;
+    else process.env.CHROME_LIVE_TOKEN = prevEnvTok;
     fs.rmSync(tempHome, { recursive: true, force: true });
   }
 });

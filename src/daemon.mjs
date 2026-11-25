@@ -7,7 +7,10 @@ import { evaluateUploadFileSafety, evaluateUrlSafety, redactUrlForAudit, redactU
 import {
   computeChallengeHmac,
   computeHttpResponseHmac,
-  createReplayProtectedVerifier
+  createReplayProtectedVerifier,
+  sha256Hex,
+  verifySignedHttpResponse,
+  buildSignedHttpHeaders
 } from './hmac-auth.mjs';
 import {
   clearPlaybooks,
@@ -24,6 +27,7 @@ import {
   DEFAULT_HOST,
   DEFAULT_PORT,
   ensureAuthToken,
+  ensureSecureDirSync,
   getStateDir,
   timingSafeEqualToken
 } from './token-store.mjs';
@@ -72,6 +76,7 @@ function parseValidExtensionOrigin(originHeader) {
 
 const URL_FIELD_KEYS = new Set(['url', 'pageUrl', 'finalUrl', 'href', 'targetUrl']);
 const URL_ARRAY_KEYS = new Set(['urls', 'images']);
+const TEXT_URL_SCRUB_KEYS = new Set(['error', 'excerpt', 'text', 'summary']);
 
 function redactPayloadUrls(node, depth = 0) {
   if (!node || typeof node !== 'object' || depth > 10) return node;
@@ -82,8 +87,10 @@ function redactPayloadUrls(node, depth = 0) {
   for (const [k, v] of Object.entries(node)) {
     if (URL_FIELD_KEYS.has(k) && typeof v === 'string') {
       out[k] = redactUrlForAudit(v);
-    } else if (k === 'error' && typeof v === 'string') {
+    } else if (TEXT_URL_SCRUB_KEYS.has(k) && typeof v === 'string') {
       out[k] = redactUrlsInText(v);
+    } else if (k === 'alerts' && Array.isArray(v)) {
+      out[k] = v.map((msg) => (typeof msg === 'string' ? redactUrlsInText(msg) : msg));
     } else if (URL_ARRAY_KEYS.has(k) && Array.isArray(v)) {
       out[k] = v.map((u) => (typeof u === 'string' ? redactUrlForAudit(u) : u));
     } else if (k === 'routes' && v && typeof v === 'object' && !Array.isArray(v)) {
@@ -141,7 +148,7 @@ export function createDaemonServer(options = {}) {
         : ensureAuthToken();
 
   let extensionPeer = null;
-  const pairedExtensionOrigins = new Set();
+  let activeExtensionOrigin = null;
   const liveViewPeers = new Set();
   const upgradeSockets = new Set();
   const pendingRpc = new Map();
@@ -149,11 +156,23 @@ export function createDaemonServer(options = {}) {
 
   function resolveAllowedExtensionOrigin(originHeader) {
     const parsedOrigin = parseValidExtensionOrigin(originHeader);
-    if (!parsedOrigin) return null;
-    if (pairedExtensionOrigins.size > 0 && !pairedExtensionOrigins.has(parsedOrigin)) {
-      return null;
-    }
+    if (!parsedOrigin || !activeExtensionOrigin) return null;
+    if (parsedOrigin !== activeExtensionOrigin) return null;
     return String(originHeader).trim();
+  }
+
+  function evictStaleTokenPeers() {
+    const currentDigest = sha256Hex(resolveAuthToken());
+    if (extensionPeer && !extensionPeer.closed && extensionPeer._tokenDigest !== currentDigest) {
+      activeExtensionOrigin = null;
+      extensionPeer.close(4001, 'Auth token rotated');
+    }
+    for (const peer of Array.from(liveViewPeers)) {
+      if (!peer.closed && peer._tokenDigest !== currentDigest) {
+        liveViewPeers.delete(peer);
+        peer.close(4001, 'Auth token rotated');
+      }
+    }
   }
 
   const MAX_TAB_FRAMES = 6;
@@ -272,15 +291,28 @@ export function createDaemonServer(options = {}) {
     };
   }
 
+  const LIVE_PEER_SOFT_BACKPRESSURE = 2 * 1024 * 1024;
+  const LIVE_PEER_HARD_BACKPRESSURE = 8 * 1024 * 1024;
+
   function broadcastToLivePeers(payload) {
     if (liveViewPeers.size === 0) return;
     const text = JSON.stringify(payload);
-    for (const peer of liveViewPeers) {
+    for (const peer of Array.from(liveViewPeers)) {
       if (peer.closed) {
         liveViewPeers.delete(peer);
-      } else {
-        peer.sendText(text);
+        continue;
       }
+      const queued = peer.socket?.writableLength ?? 0;
+      if (queued > LIVE_PEER_HARD_BACKPRESSURE) {
+        liveViewPeers.delete(peer);
+        peer.close(1008, 'Live stream consumer backpressure exceeded');
+        continue;
+      }
+      if (queued > LIVE_PEER_SOFT_BACKPRESSURE && payload && payload.type === 'frame') {
+        // Drop intermediate video frame for slow viewer rather than growing heap unboundedly
+        continue;
+      }
+      peer.sendText(text);
     }
   }
 
@@ -335,7 +367,7 @@ export function createDaemonServer(options = {}) {
     return map[ext] || 'application/octet-stream';
   }
 
-  function prepareUploadParams(stepParams) {
+  function prepareUploadParams(stepParams, cleanupDirs = []) {
     const rawList = Array.isArray(stepParams.files)
       ? stepParams.files
       : typeof stepParams.file === 'string' && stepParams.file.trim()
@@ -345,11 +377,18 @@ export function createDaemonServer(options = {}) {
       throw new Error('upload requires at least one local file path');
     }
 
+    const snapshotsRoot = ensureSecureDirSync(path.join(getStateDir(), '.upload-snapshots'));
+    const batchSnapDir = ensureSecureDirSync(path.join(snapshotsRoot, crypto.randomUUID()));
+    cleanupDirs.push(batchSnapDir);
+
     const resolvedFiles = [];
     let totalBytes = 0;
     const filePayloads = [];
+    const MAX_UPLOAD_SNAPSHOT_BYTES = 64 * 1024 * 1024;
+    const openFlags = fs.constants.O_RDONLY | (typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0);
 
-    for (const item of rawList) {
+    for (let idx = 0; idx < rawList.length; idx++) {
+      const item = rawList[idx];
       const check = evaluateUploadFileSafety(String(item || ''));
       if (!check.allowed) {
         recordAudit('upload', { file: String(item || ''), code: check.code }, 'blocked');
@@ -357,9 +396,9 @@ export function createDaemonServer(options = {}) {
       }
       let fd;
       try {
-        fd = fs.openSync(check.resolvedPath, 'r');
+        fd = fs.openSync(check.resolvedPath, openFlags);
       } catch {
-        throw new Error(`Local file does not exist: ${check.resolvedPath}`);
+        throw new Error(`Local file does not exist or symlink was rejected: ${check.resolvedPath}`);
       }
       try {
         const st = fs.fstatSync(fd);
@@ -370,15 +409,32 @@ export function createDaemonServer(options = {}) {
           recordAudit('upload', { file: String(item || ''), code: 'HARDLINK_BLOCKED' }, 'blocked');
           throw new Error('[GUARDRAIL:HARDLINK_BLOCKED] Uploading hard-linked files (nlink > 1) is blocked by local guardrails');
         }
-        resolvedFiles.push(check.resolvedPath);
-        totalBytes += st.size;
-        if (st.size > 0 && totalBytes <= 3 * 1024 * 1024) {
-          const buf = Buffer.allocUnsafe(st.size);
-          const bytesRead = fs.readSync(fd, buf, 0, st.size, 0);
+        if (st.size > MAX_UPLOAD_SNAPSHOT_BYTES) {
+          throw new Error(`Upload file exceeds ${MAX_UPLOAD_SNAPSHOT_BYTES} byte limit`);
+        }
+
+        // Freeze an immutable private copy directly from the verified fd so subsequent symlink swaps
+        // (e.g. during multi-step batch waits before Chrome calls DOM.setFileInputFiles) cannot cause TOCTOU escape!
+        const itemSlotDir = ensureSecureDirSync(path.join(batchSnapDir, String(idx)));
+        const safeBaseName = path.basename(check.resolvedPath).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_') || 'upload.bin';
+        const privateCopyPath = path.join(itemSlotDir, safeBaseName);
+        const buf = st.size > 0 ? Buffer.allocUnsafe(st.size) : Buffer.alloc(0);
+        let offset = 0;
+        while (offset < st.size) {
+          const n = fs.readSync(fd, buf, offset, st.size - offset, offset);
+          if (n <= 0) break;
+          offset += n;
+        }
+        const exactBuf = offset === buf.length ? buf : buf.subarray(0, offset);
+        fs.writeFileSync(privateCopyPath, exactBuf, { mode: 0o600 });
+
+        resolvedFiles.push(privateCopyPath);
+        totalBytes += exactBuf.length;
+        if (exactBuf.length > 0 && totalBytes <= 3 * 1024 * 1024) {
           filePayloads.push({
-            name: path.basename(check.resolvedPath),
+            name: safeBaseName,
             mimeType: guessMimeType(check.resolvedPath),
-            base64: buf.subarray(0, bytesRead).toString('base64')
+            base64: exactBuf.toString('base64')
           });
         }
       } finally {
@@ -397,6 +453,7 @@ export function createDaemonServer(options = {}) {
 
   function dispatchExtensionRpc(method, params = {}, timeoutMs = 25000) {
     return new Promise((resolve, reject) => {
+      evictStaleTokenPeers();
       if (!extensionPeer || extensionPeer.closed) {
         reject(
           new Error(
@@ -415,9 +472,19 @@ export function createDaemonServer(options = {}) {
         }
       }
 
+      const uploadCleanupDirs = [];
+      const purgeUploadSnapshots = () => {
+        for (const d of uploadCleanupDirs) {
+          try {
+            fs.rmSync(d, { recursive: true, force: true });
+          } catch {}
+        }
+        uploadCleanupDirs.length = 0;
+      };
+
       try {
         if (method === 'upload') {
-          prepareUploadParams(params);
+          prepareUploadParams(params, uploadCleanupDirs);
         } else if (method === 'extract' && Array.isArray(params.urls)) {
           for (const rawUrl of params.urls) {
             const urlStr = String(rawUrl || '');
@@ -435,6 +502,7 @@ export function createDaemonServer(options = {}) {
             if (typeof step.url === 'string') {
               const safety = evaluateUrlSafety(step.url, state.customBlockedDomains);
               if (!safety.allowed) {
+                purgeUploadSnapshots();
                 recordAudit('batch', { url: step.url, code: safety.code }, 'blocked');
                 reject(new Error(`[GUARDRAIL:${safety.code}] ${safety.reason}`));
                 return;
@@ -445,6 +513,7 @@ export function createDaemonServer(options = {}) {
                 const urlStr = String(rawUrl || '');
                 const safety = evaluateUrlSafety(urlStr, state.customBlockedDomains);
                 if (!safety.allowed) {
+                  purgeUploadSnapshots();
                   recordAudit('batch', { url: urlStr, code: safety.code }, 'blocked');
                   reject(new Error(`[GUARDRAIL:${safety.code}] ${safety.reason}`));
                   return;
@@ -452,22 +521,31 @@ export function createDaemonServer(options = {}) {
               }
             }
             if (stepAction === 'upload') {
-              prepareUploadParams(step);
+              prepareUploadParams(step, uploadCleanupDirs);
             }
           }
         }
       } catch (prepErr) {
+        purgeUploadSnapshots();
         reject(prepErr);
         return;
       }
 
       const id = crypto.randomUUID();
+      const wrapResolve = (val) => {
+        purgeUploadSnapshots();
+        resolve(val);
+      };
+      const wrapReject = (err) => {
+        purgeUploadSnapshots();
+        reject(err);
+      };
       const timer = setTimeout(() => {
         pendingRpc.delete(id);
-        reject(new Error(`Extension RPC "${method}" timed out after ${timeoutMs}ms`));
+        wrapReject(new Error(`Extension RPC "${method}" timed out after ${timeoutMs}ms`));
       }, timeoutMs);
 
-      pendingRpc.set(id, { resolve, reject, timer, method });
+      pendingRpc.set(id, { resolve: wrapResolve, reject: wrapReject, timer, method });
       const sent = extensionPeer.sendJson({
         type: 'rpc_request',
         id,
@@ -477,7 +555,7 @@ export function createDaemonServer(options = {}) {
       if (!sent) {
         clearTimeout(timer);
         pendingRpc.delete(id);
-        reject(new Error('Failed to write RPC frame to Chrome extension WebSocket'));
+        wrapReject(new Error('Failed to write RPC frame to Chrome extension WebSocket'));
       }
     });
   }
@@ -507,7 +585,7 @@ export function createDaemonServer(options = {}) {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': extOrigin,
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, X-Chrome-Live-Ts, X-Chrome-Live-Nonce, X-Chrome-Live-Sig',
+        'Access-Control-Allow-Headers': 'Content-Type, X-Chrome-Live-Ts, X-Chrome-Live-Nonce, X-Chrome-Live-Hdr-Sig, X-Chrome-Live-Sig',
         'Access-Control-Expose-Headers': 'X-Chrome-Live-Server-Sig',
         'Access-Control-Max-Age': '600'
       });
@@ -530,24 +608,32 @@ export function createDaemonServer(options = {}) {
       return;
     }
 
+    evictStaleTokenPeers();
+
     if (parsedUrl.searchParams.has('token')) {
       sendJson(req, res, 401, {
         ok: false,
         error: 'UNAUTHORIZED',
         message: 'Query-string token authentication is prohibited'
       });
+      req.destroy();
       return;
     }
 
-    // Pre-validate HMAC headers, skew window, and replay cache BEFORE buffering any POST body (prevents unauthenticated 12MB memory DoS)
-    const prechecked = verifyHttpHmac.precheckHeaders(req);
+    const pathWithQuery = `${pathname}${parsedUrl.search}`;
+    // Cryptographically verify header HMAC BEFORE buffering a single byte of POST body (blocks unauthenticated 12MBxN memory DoS)
+    const prechecked = verifyHttpHmac.precheckHeaders(req, pathWithQuery);
     if (!prechecked.ok) {
       sendJson(req, res, 401, {
         ok: false,
         error: 'UNAUTHORIZED',
         message: prechecked.reason
       });
-      req.resume();
+      res.once('finish', () => {
+        try {
+          req.destroy();
+        } catch {}
+      });
       return;
     }
 
@@ -561,7 +647,6 @@ export function createDaemonServer(options = {}) {
       return;
     }
 
-    const pathWithQuery = `${pathname}${parsedUrl.search}`;
     const authCheck = verifyHttpHmac.verifyBody(req, pathWithQuery, rawBody, prechecked);
     if (!authCheck.ok) {
       sendJson(req, res, 401, {
@@ -573,7 +658,7 @@ export function createDaemonServer(options = {}) {
     }
     const verifiedHttpExtOrigin = parseValidExtensionOrigin(req.headers.origin);
     if (verifiedHttpExtOrigin) {
-      pairedExtensionOrigins.add(verifiedHttpExtOrigin);
+      activeExtensionOrigin = verifiedHttpExtOrigin;
     }
     req._hmacAuth = authCheck;
 
@@ -613,7 +698,7 @@ export function createDaemonServer(options = {}) {
           return;
         }
         if (action === 'save') {
-          const saved = saveManualPlaybook(body);
+          const saved = saveManualPlaybook({ ...body, customBlockedDomains: state.customBlockedDomains });
           recordAudit('playbook_save', { domain: saved.domain });
           sendJson(req, res, 200, { ok: true, ...saved });
           return;
@@ -675,7 +760,8 @@ export function createDaemonServer(options = {}) {
             learnInteractionSelector({
               url: result.pageUrl,
               label: result.learnedLabel,
-              selector: result.learnedSelector
+              selector: result.learnedSelector,
+              customBlockedDomains: state.customBlockedDomains
             });
           }
           if (method === 'batch' && Array.isArray(result.stepResults)) {
@@ -685,7 +771,8 @@ export function createDaemonServer(options = {}) {
                 learnInteractionSelector({
                   url: r.pageUrl,
                   label: r.learnedLabel,
-                  selector: r.learnedSelector
+                  selector: r.learnedSelector,
+                  customBlockedDomains: state.customBlockedDomains
                 });
               }
             }
@@ -695,9 +782,10 @@ export function createDaemonServer(options = {}) {
             learnFromPageVisit({
               url: snapTarget.url,
               title: snapTarget.title,
-              elements: snapTarget.elements
+              elements: snapTarget.elements,
+              customBlockedDomains: state.customBlockedDomains
             });
-            const pb = lookupDomainPlaybook(snapTarget.url);
+            const pb = lookupDomainPlaybook(snapTarget.url, state.customBlockedDomains);
             if (pb) {
               result.playbook = pb;
               if (method === 'batch' && result.finalSnapshot) {
@@ -733,6 +821,10 @@ export function createDaemonServer(options = {}) {
       });
     }
   });
+
+  server.headersTimeout = 8000;
+  server.requestTimeout = 15000;
+  server.keepAliveTimeout = 5000;
 
   server.on('upgrade', (req, socket, head) => {
     upgradeSockets.add(socket);
@@ -776,12 +868,13 @@ export function createDaemonServer(options = {}) {
     if (!peer) return;
     peer.on('error', () => {});
 
-    const attachAuthenticatedPeer = (authPayload = null) => {
+    const attachAuthenticatedPeer = (authPayload = null, verifiedToken = '') => {
+      peer._tokenDigest = sha256Hex(verifiedToken);
       peer.maxPayloadBytes = 16 * 1024 * 1024;
       if (pathname === '/ws/extension') {
         const verifiedOrigin = parseValidExtensionOrigin(req.headers.origin);
         if (verifiedOrigin) {
-          pairedExtensionOrigins.add(verifiedOrigin);
+          activeExtensionOrigin = verifiedOrigin;
         }
         // Extension has persisted the pairing token into chrome.storage.local; shred any leftover bootstrap file
         consumeAndShredLocalRuntimeBootstrap();
@@ -890,11 +983,16 @@ export function createDaemonServer(options = {}) {
             clearTimeout(authTimer);
             authTimer = null;
           }
-          attachAuthenticatedPeer(msg);
+          attachAuthenticatedPeer(msg, curToken);
           return;
         }
         if (authTimer) clearTimeout(authTimer);
         peer.close(4001, 'Unauthorized');
+        return;
+      }
+      if (peer._tokenDigest !== sha256Hex(resolveAuthToken())) {
+        activeExtensionOrigin = null;
+        peer.close(4001, 'Auth token rotated');
         return;
       }
       if (pathname === '/ws/extension') {
@@ -935,6 +1033,13 @@ export function createDaemonServer(options = {}) {
     }
 
     if (msg.type === 'screencast_frame' && typeof msg.data === 'string' && msg.data.length > 0) {
+      if (typeof msg.tabId === 'number') {
+        const matchingTab = Array.isArray(state.tabs) ? state.tabs.find((t) => t && t.tabId === msg.tabId) : null;
+        // Drop late in-flight frames arriving after a tab was paused or released
+        if (matchingTab?.paused || (Array.isArray(state.tabs) && state.tabs.length > 0 && !matchingTab)) {
+          return;
+        }
+      }
       const mimeType = msg.mimeType === 'image/png' ? 'image/png' : 'image/jpeg';
       const buffer = Buffer.from(msg.data, 'base64');
       const cleanFrameUrl = redactUrlForAudit(String(msg.url || ''));
@@ -972,6 +1077,7 @@ export function createDaemonServer(options = {}) {
   }
 
   const heartbeatTimer = setInterval(() => {
+    evictStaleTokenPeers();
     if (extensionPeer && !extensionPeer.closed) {
       extensionPeer.ping();
     }
@@ -1037,8 +1143,8 @@ if (isDirectEntry) {
   instance
     .listen()
     .then((boundPort) => {
-      fs.mkdirSync(getStateDir(), { recursive: true, mode: 0o700 });
-      fs.writeFileSync(pidFile, `${process.pid}\n`, 'utf8');
+      ensureSecureDirSync(getStateDir());
+      fs.writeFileSync(pidFile, `${process.pid}\n`, { encoding: 'utf8', mode: 0o600 });
       process.stdout.write(
         `[chrome-live] Listening on http://${DEFAULT_HOST}:${boundPort} (PID ${process.pid})\n`
       );
@@ -1053,8 +1159,34 @@ if (isDirectEntry) {
     })
     .catch((err) => {
       if (err && err.code === 'EADDRINUSE') {
-        process.stdout.write(`[chrome-live] Port ${DEFAULT_PORT} is already active.\n`);
-        process.exit(0);
+        const tok = ensureAuthToken();
+        const { ts, nonce, headers } = buildSignedHttpHeaders(tok, 'GET', '/api/health');
+        const probe = http.request(
+          { host: DEFAULT_HOST, port: DEFAULT_PORT, path: '/api/health', method: 'GET', headers, timeout: 1500 },
+          (res) => {
+            res.resume();
+            if (verifySignedHttpResponse(tok, res.statusCode || 500, res.headers, ts, nonce)) {
+              process.stdout.write(`[chrome-live] Verified daemon already active on port ${DEFAULT_PORT}.\n`);
+              process.exit(0);
+            } else {
+              process.stderr.write(
+                `[chrome-live] Port ${DEFAULT_PORT} is occupied by an unverified local process! Refusing to treat as active.\n`
+              );
+              process.exit(1);
+            }
+          }
+        );
+        probe.on('timeout', () => {
+          probe.destroy();
+          process.stderr.write(`[chrome-live] Port ${DEFAULT_PORT} is in use and unresponsive.\n`);
+          process.exit(1);
+        });
+        probe.on('error', (probeErr) => {
+          process.stderr.write(`[chrome-live] Port ${DEFAULT_PORT} conflict: ${probeErr.message}\n`);
+          process.exit(1);
+        });
+        probe.end();
+        return;
       }
       process.stderr.write(`[chrome-live] Failed to start daemon: ${err.message}\n`);
       process.exit(1);

@@ -86,7 +86,52 @@ const BUILTIN_PROTECTED_DOMAINS = [
   'dash.cloudflare.com'
 ];
 
-const CHECKOUT_PATH_RX = /\/(?:checkout|pay|payment|payments|cashier|billing|wallet\/transfer)(?:\/|\?|$|#)/i;
+const CHECKOUT_SEGMENT_RX =
+  /(?:^|\/)(?:checkout|pay|payment|payments|cashier|billing|wallet\/transfer)(?:\/|\?|$|#|;|\.[a-z0-9]{1,8}(?:\/|\?|$|#|;))/i;
+
+function canonicalizeRouteForGuardrail(rawSegment) {
+  if (!rawSegment) return { ok: true, path: '/' };
+  let decoded = String(rawSegment);
+  for (let i = 0; i < 3; i++) {
+    if (!decoded.includes('%')) break;
+    try {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    } catch {
+      return { ok: false, path: '' };
+    }
+  }
+  const normalized = decoded.replace(/\\/g, '/');
+  const qIdx = normalized.indexOf('?');
+  const pathPart = qIdx === -1 ? normalized : normalized.slice(0, qIdx);
+  const queryPart = qIdx === -1 ? '' : normalized.slice(qIdx);
+  const stack = [];
+  for (const seg of pathPart.split('/')) {
+    const cleanSeg = seg.split(';')[0];
+    if (!cleanSeg || cleanSeg === '.') continue;
+    if (cleanSeg === '..') {
+      stack.pop();
+      continue;
+    }
+    stack.push(cleanSeg);
+  }
+  return { ok: true, path: `/${stack.join('/')}${queryPart}` };
+}
+
+function assertSafeModelSelector(rawSelector) {
+  if (typeof rawSelector !== 'string') return;
+  const s = rawSelector.trim();
+  if (!s) return;
+  if (
+    /\[\s*(?:value|content|data-token|data-secret|data-csrf|csrf)\b/i.test(s) ||
+    /\[\s*[^\]=*^$~|]+\s*[*^$]=/.test(s)
+  ) {
+    throw new Error(
+      '[GUARDRAIL] CSS attribute-value or substring probing selectors ([value...], [content...], [^=], [$=], [*=]) are blocked'
+    );
+  }
+}
 
 let bridgeConfig = {
   host: '127.0.0.1',
@@ -154,16 +199,22 @@ async function sha256HexWeb(text) {
 async function signedDaemonFetch(routePath, method = 'GET', bodyObj = null) {
   const m = String(method || 'GET').toUpperCase();
   const bodyStr = bodyObj !== null && bodyObj !== undefined ? JSON.stringify(bodyObj) : '';
+  const bodyByteLen = bodyStr ? new TextEncoder().encode(bodyStr).byteLength : 0;
   const ts = String(Date.now());
   const nonce = generateRandomHex(16);
   const bodyHash = await sha256HexWeb(bodyStr);
+  const hdrSig = await hmacSha256Hex(
+    bridgeConfig.token,
+    JSON.stringify(['chrome-live:http-hdr:v2', m, routePath, ts, nonce, bodyByteLen])
+  );
   const sig = await hmacSha256Hex(
     bridgeConfig.token,
-    `chrome-live:http-req:v1:${m}:${routePath}:${ts}:${nonce}:${bodyHash}`
+    JSON.stringify(['chrome-live:http-req:v2', m, routePath, ts, nonce, bodyHash])
   );
   const headers = {
     'X-Chrome-Live-Ts': ts,
     'X-Chrome-Live-Nonce': nonce,
+    'X-Chrome-Live-Hdr-Sig': hdrSig,
     'X-Chrome-Live-Sig': sig
   };
   if (bodyStr) {
@@ -178,7 +229,7 @@ async function signedDaemonFetch(routePath, method = 'GET', bodyObj = null) {
   const serverSig = resp.headers.get('x-chrome-live-server-sig') || '';
   const expectedServerSig = await hmacSha256Hex(
     bridgeConfig.token,
-    `chrome-live:http-res:v1:${resp.status}:${ts}:${nonce}`
+    JSON.stringify(['chrome-live:http-res:v2', resp.status, ts, nonce])
   );
   if (!constantTimeHexEqual(serverSig, expectedServerSig)) {
     throw new Error('Unverified local service response signature');
@@ -196,9 +247,9 @@ let groupSerializeChain = Promise.resolve();
 let activeExtractJobs = 0;
 
 const LOCAL_AUDIT_SENSITIVE_PARAM_RX =
-  /(?:token|secret|passw|pwd|apikey|api[-_]?key|access[-_]?key|private[-_]?key|auth|code|state|sig|jwt|bearer|ticket|session|sid|csrf|xsrf|otp|credential)/i;
+  /(?:token|secret|passw|pwd|apikey|api[-_]?key|access[-_]?key|private[-_]?key|auth|code|state|sig|jwt|bearer|ticket|session|sid|csrf|xsrf|otp|credential|hmac|(?:^|[-_.])(?:key|pass|pin|hash)(?:$|[-_.]))/i;
 const LOCAL_HASH_SENSITIVE_PAIR_RX =
-  /([#?&])([^=&#]*(?:token|secret|passw|pwd|apikey|api[-_]?key|access[-_]?key|private[-_]?key|auth|code|state|sig|jwt|bearer|ticket|session|sid|csrf|xsrf|otp|credential)[^=&#]*)=([^&#]*)/gi;
+  /([#?&])([^=&#]*(?:token|secret|passw|pwd|apikey|api[-_]?key|access[-_]?key|private[-_]?key|auth|code|state|sig|jwt|bearer|ticket|session|sid|csrf|xsrf|otp|credential|hmac|(?:^|[-_.])(?:key|pass|pin|hash)(?:$|[-_.]))[^=&#]*)=([^&#]*)/gi;
 
 function redactAuditUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return rawUrl;
@@ -269,9 +320,17 @@ function checkTabUrlAllowed(rawUrl) {
       return { allowed: false, reason: `Protected financial/security domain (${clean})` };
     }
   }
-  const fullRoute = `${parsed.pathname}${parsed.search}${parsed.hash}`;
-  if (CHECKOUT_PATH_RX.test(fullRoute)) {
-    return { allowed: false, reason: `Protected checkout/payment route (${parsed.pathname})` };
+  const canonPath = canonicalizeRouteForGuardrail(parsed.pathname);
+  if (!canonPath.ok) {
+    return { allowed: false, reason: 'Malformed percent-encoding in URL pathname' };
+  }
+  const rawHash = parsed.hash ? parsed.hash.replace(/^#+/, '') : '';
+  const canonHash = rawHash ? canonicalizeRouteForGuardrail(rawHash) : { ok: true, path: '' };
+  if (!canonHash.ok) {
+    return { allowed: false, reason: 'Malformed percent-encoding in URL fragment' };
+  }
+  if (CHECKOUT_SEGMENT_RX.test(canonPath.path) || (canonHash.path && CHECKOUT_SEGMENT_RX.test(canonHash.path))) {
+    return { allowed: false, reason: `Protected checkout/payment route (${parsed.pathname}${parsed.hash})` };
   }
   return { allowed: true, reason: '' };
 }
@@ -482,7 +541,7 @@ async function connectWebSocket(forceManual = false) {
         if (msg && msg.type === 'auth_challenge' && typeof msg.serverNonce === 'string' && typeof msg.serverProof === 'string') {
           const expectedServerProof = await hmacSha256Hex(
             bridgeConfig.token,
-            `chrome-live:server:${clientNonce}:${msg.serverNonce}`
+            JSON.stringify(['chrome-live:ws-auth:v2', 'server', clientNonce, msg.serverNonce])
           );
           if (!constantTimeHexEqual(msg.serverProof, expectedServerProof)) {
             pushLocalAudit('auth_rejected', { reason: 'Daemon serverProof mismatch' }, 'blocked');
@@ -491,7 +550,7 @@ async function connectWebSocket(forceManual = false) {
           }
           const clientProof = await hmacSha256Hex(
             bridgeConfig.token,
-            `chrome-live:client:${clientNonce}:${msg.serverNonce}`
+            JSON.stringify(['chrome-live:ws-auth:v2', 'client', clientNonce, msg.serverNonce])
           );
           wsAuthed = true;
           sock.send(
@@ -571,6 +630,16 @@ async function runHudScriptSafe(tabId, opts, timeoutMs = 1200) {
 
 async function syncHudNow(tabId, payload) {
   const entry = managedTabs.get(tabId);
+  // Never allow an in-flight working update to overwrite a user-initiated pause or detach
+  if (
+    entry &&
+    (entry.paused || entry.detached) &&
+    payload &&
+    payload.mode === 'working' &&
+    payload.clearUserPauseLock !== true
+  ) {
+    return;
+  }
   if (entry && typeof payload.mode === 'string') {
     entry.uiMode = payload.mode;
   }
@@ -707,6 +776,7 @@ async function pollHudUserEvents(tabId, entry) {
       } else if (ev === 'resume') {
         entry.paused = false;
         entry.uiMode = 'working';
+        await syncHud(tabId, { visible: true, mode: 'working', clearUserPauseLock: true });
         await syncLiveTabGroups();
         notifyPanelAndDaemon();
       } else if (ev === 'release') {
@@ -714,6 +784,12 @@ async function pollHudUserEvents(tabId, entry) {
       }
     }
   } catch {}
+}
+
+async function verifyEntryStillControllable(entry) {
+  assertStillActiveAndUnpaused(entry);
+  await pollHudUserEvents(entry.tabId, entry);
+  assertStillActiveAndUnpaused(entry);
 }
 
 function resetCdpIdleTimer(entry) {
@@ -779,6 +855,8 @@ async function stopCdpForTab(tabId, entryOverride = null) {
 
 async function captureQuickFrame(tabId, entry, timeoutMs = 1200) {
   if (!ws || ws.readyState !== WebSocket.OPEN || !wsAuthed || !isEntryLiveForCdp(tabId, entry)) return null;
+  await pollHudUserEvents(tabId, entry);
+  if (!isEntryLiveForCdp(tabId, entry)) return null;
   try {
     await Promise.race([
       ensureCdpForTab(tabId, entry),
@@ -1108,7 +1186,8 @@ async function mergeRelayTabBack(entry, { resumedByUserInBrowser = false } = {})
   await syncHud(entry.tabId, {
     visible: true,
     mode: entry.uiMode,
-    activity: entry.activity
+    activity: entry.activity,
+    clearUserPauseLock: Boolean(resumedByUserInBrowser)
   });
   await syncLiveTabGroups();
   if (resumedByUserInBrowser) {
@@ -1145,20 +1224,18 @@ function resolveTargetEntry(requestedTabId) {
       `Tab #${numId} is no longer controlled (${detached?.reason || 'not attached'}).`
     );
   }
-  // Prefer user-shared tab first, otherwise most recent worker tab
-  for (const e of managedTabs.values()) {
-    if (e.substate === 'shared') return e;
-  }
-  let last = null;
-  for (const e of managedTabs.values()) {
-    last = e;
-  }
-  if (!last) {
+  if (managedTabs.size === 0) {
     throw new Error(
       'No shared or controlled tab available. Share a tab with Alt+Shift+L or run "chrome-live open <url>".'
     );
   }
-  return last;
+  if (managedTabs.size > 1) {
+    const activeIds = Array.from(managedTabs.keys()).join(', ');
+    throw new Error(
+      `Multiple tabs are currently controlled (${activeIds}); specify an explicit tabId to prevent cross-tab actions.`
+    );
+  }
+  return managedTabs.values().next().value;
 }
 
 async function execScriptBounded(tabId, scriptOptions, timeoutMs = 6500) {
@@ -1218,18 +1295,59 @@ async function assertTabReadyForAction(entry) {
     throw new Error(`[GUARDRAIL] Detached tab because it navigated to ${safety.reason}`);
   }
 
-  // Also inspect visible embedded <iframe> sources so modal payment/checkout embeds auto-detach immediately
+  // 1. Inspect ALL live browser sub-frames via webNavigation (catches cross-origin 302 redirects & form-targeted frames!)
+  if (chrome.webNavigation?.getAllFrames) {
+    const navFrames = await chrome.webNavigation.getAllFrames({ tabId: entry.tabId }).catch(() => null);
+    if (Array.isArray(navFrames)) {
+      for (const nf of navFrames) {
+        if (!nf || !nf.url || nf.url === 'about:blank' || nf.errorOccurred) continue;
+        const nfSafety = checkTabUrlAllowed(nf.url);
+        if (!nfSafety.allowed) {
+          const reason = `Embedded payment/protected sub-frame: ${nfSafety.reason}`;
+          await detachManagedTab(entry.tabId, reason, true);
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(
+              JSON.stringify({
+                type: 'guardrail_trip',
+                tabId: entry.tabId,
+                url: redactAuditUrl(nf.url),
+                reason
+              })
+            );
+          }
+          throw new Error(`[GUARDRAIL] Detached tab due to ${reason}`);
+        }
+      }
+    }
+  }
+
+  // 2. Also inspect visible embedded <iframe>/<frame> (including open Shadow DOM & <form target> actions)
   const iframeRes = await runHudScriptSafe(entry.tabId, {
     func: () => {
       const urls = [];
-      for (const frame of document.querySelectorAll('iframe[src]')) {
-        const src = frame.src || frame.getAttribute('src') || '';
-        if (!/^https?:/i.test(src)) continue;
-        const st = window.getComputedStyle(frame);
-        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
-        const rc = frame.getBoundingClientRect();
-        if (rc.width >= 80 && rc.height >= 80) urls.push(src);
-      }
+      const collectFrames = (root, depth = 0) => {
+        if (!root || depth > 6) return;
+        for (const frame of root.querySelectorAll('iframe, frame')) {
+          const st = window.getComputedStyle(frame);
+          if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
+          const rc = frame.getBoundingClientRect();
+          if (rc.width < 40 || rc.height < 40) continue;
+          const src = frame.src || frame.getAttribute('src') || '';
+          if (/^https?:/i.test(src)) urls.push(src);
+          const fName = frame.getAttribute('name');
+          if (fName) {
+            for (const form of document.querySelectorAll('form[target]')) {
+              if (form.getAttribute('target') === fName && /^https?:/i.test(form.action || '')) {
+                urls.push(form.action);
+              }
+            }
+          }
+        }
+        for (const el of root.querySelectorAll('*')) {
+          if (el.shadowRoot) collectFrames(el.shadowRoot, depth + 1);
+        }
+      };
+      collectFrames(document);
       return urls;
     }
   });
@@ -1254,6 +1372,9 @@ async function assertTabReadyForAction(entry) {
       }
     }
   }
+
+  // Re-verify pause/detach after async frame inspection so mid-check user pauses are never overwritten!
+  await verifyEntryStillControllable(entry);
 }
 
 async function waitForTabComplete(tabId, timeoutMs = 15000) {
@@ -1439,7 +1560,8 @@ async function executeBridgeRpc(method, params) {
       const val = String(params.text ?? '');
       const shouldSubmit = Boolean(params.submit);
       const ceIndex = typeof params.ceIndex === 'number' ? params.ceIndex : -1;
-      await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
+      await verifyEntryStillControllable(entry);
+      const keyRes = await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
         func: (str, sub, ceIdx) => {
           let el =
             ceIdx >= 0
@@ -1454,7 +1576,29 @@ async function executeBridgeRpc(method, params) {
               'input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, [contenteditable]:not([contenteditable="false"])'
             );
           }
-          if (!el) return;
+          if (!el) return { ok: false, error: 'No active input field' };
+          const st = window.getComputedStyle(el);
+          const tSec = String(st.webkitTextSecurity || st.getPropertyValue('-webkit-text-security') || '').toLowerCase();
+          const autoAttr = String(el.getAttribute?.('autocomplete') || '').toLowerCase();
+          const metaStr = [
+            el.getAttribute?.('name'),
+            el.id,
+            el.getAttribute?.('placeholder'),
+            el.getAttribute?.('aria-label')
+          ]
+            .filter(Boolean)
+            .join(' ');
+          if (
+            (el instanceof HTMLInputElement && String(el.type).toLowerCase() === 'password') ||
+            (tSec && tSec !== 'none') ||
+            /(?:password|one-time-code|cc-number|cc-csc|cc-exp)/i.test(autoAttr) ||
+            /\b(?:password|passwd|otp|cvv|cvc)\b|密码|支付密码|动态码|短信验证码/i.test(metaStr)
+          ) {
+            return {
+              ok: false,
+              error: '[GUARDRAIL] Remote typing into password or OTP fields is disabled; use Popout / Pause in Chrome'
+            };
+          }
           el.focus?.();
           if (el.isContentEditable) {
             const sel = window.getSelection?.();
@@ -1482,10 +1626,16 @@ async function executeBridgeRpc(method, params) {
             el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
             el.form?.requestSubmit?.();
           }
+          return { ok: true };
         },
         args: [val, shouldSubmit, ceIndex]
       });
+      const kOut = keyRes?.[0]?.result;
+      if (kOut && kOut.ok === false) {
+        throw new Error(kOut.error || 'Remote text input rejected');
+      }
       await new Promise((r) => setTimeout(r, 220));
+      await verifyEntryStillControllable(entry);
       await captureQuickFrame(entry.tabId, entry);
       notifyPanelAndDaemon();
       return { tabId: entry.tabId, typed: val.length };
@@ -1552,28 +1702,26 @@ async function executeBridgeRpc(method, params) {
             tagLower === 'select' ||
             el.isContentEditable ||
             /^(?:textbox|searchbox|combobox|spinbutton)$/.test(roleLower);
-          // Never read user-typed .value, nested <textarea>/contenteditable drafts, or hidden text
-          const extractCleanText = (rootNode) => {
-            if (!rootNode || typeof rootNode.querySelector !== 'function') return rootNode?.textContent || '';
-            if (
-              !rootNode.querySelector(
-                'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [hidden], [aria-hidden="true"], style, script, noscript, template'
-              )
-            ) {
-              return rootNode.textContent || '';
+          // Never read user-typed .value, nested <textarea>/contenteditable/editor drafts, or hidden text across Shadow DOM
+          const REGION_SKIP_SEL =
+            'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
+          const isInsideSkipped = (node) => {
+            let cur = node instanceof Element ? node : node?.parentElement;
+            while (cur) {
+              if (cur.isContentEditable || cur.matches?.(REGION_SKIP_SEL) || cur.closest?.(REGION_SKIP_SEL)) return true;
+              const rn = cur.getRootNode?.();
+              cur = rn && rn instanceof ShadowRoot ? rn.host : null;
             }
+            return false;
+          };
+          const extractCleanText = (rootNode) => {
+            if (!rootNode) return '';
             const outParts = [];
             const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
             let tn;
             while ((tn = tw.nextNode())) {
               const p = tn.parentElement;
-              if (
-                p &&
-                !p.isContentEditable &&
-                !p.closest(
-                  'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]'
-                )
-              ) {
+              if (p && !isInsideSkipped(p)) {
                 outParts.push(tn.nodeValue || '');
               }
             }
@@ -1825,7 +1973,16 @@ async function executeBridgeRpc(method, params) {
                   'OPTION'
                 ]);
                 const SKIP_CLOSEST =
-                  'style, script, noscript, template, textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [hidden], [aria-hidden="true"], [data-chrome-live-hud]';
+                  'style, script, noscript, template, textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], [data-chrome-live-hud]';
+                const isInsideSkipped = (node) => {
+                  let cur = node instanceof Element ? node : node?.parentElement;
+                  while (cur) {
+                    if (cur.isContentEditable || cur.matches?.(SKIP_CLOSEST) || cur.closest?.(SKIP_CLOSEST)) return true;
+                    const rn = cur.getRootNode?.();
+                    cur = rn && rn instanceof ShadowRoot ? rn.host : null;
+                  }
+                  return false;
+                };
                 const visCache = new WeakMap();
                 const isElemVisible = (el) => {
                   if (visCache.has(el)) return visCache.get(el);
@@ -1851,7 +2008,7 @@ async function executeBridgeRpc(method, params) {
                   while ((node = walker.nextNode())) {
                     const p = node.parentElement;
                     if (!p) continue;
-                    if (p.isContentEditable || SKIP_TAGS.has(p.tagName) || p.closest(SKIP_CLOSEST) || !isElemVisible(p)) {
+                    if (SKIP_TAGS.has(p.tagName) || isInsideSkipped(p) || !isElemVisible(p)) {
                       continue;
                     }
                     const chunk = node.nodeValue || '';
@@ -1911,6 +2068,7 @@ async function executeBridgeRpc(method, params) {
     const maxItems = Math.min(200, Math.max(10, Number(params.maxItems) || 90));
     entry.activity = tr().readingDom;
     await syncHud(entry.tabId, { visible: true, mode: 'working', activity: entry.activity });
+    await verifyEntryStillControllable(entry);
 
     const execRes = await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
       func: (limit) => {
@@ -1985,28 +2143,26 @@ async function executeBridgeRpc(method, params) {
             tagLower === 'select' ||
             node.isContentEditable ||
             /^(?:textbox|searchbox|combobox|spinbutton)$/.test(roleAttr);
-          // Never expose user-entered password/OTP/input values or nested draft text as element labels
-          const extractCleanText = (rootNode) => {
-            if (!rootNode || typeof rootNode.querySelector !== 'function') return rootNode?.textContent || '';
-            if (
-              !rootNode.querySelector(
-                'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [hidden], [aria-hidden="true"], style, script, noscript, template'
-              )
-            ) {
-              return rootNode.textContent || '';
+          // Never expose user-entered password/OTP/input values or nested editor draft text as element labels
+          const SNAP_SKIP_SEL =
+            'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
+          const isSnapSkipped = (n) => {
+            let cur = n instanceof Element ? n : n?.parentElement;
+            while (cur) {
+              if (cur.isContentEditable || cur.matches?.(SNAP_SKIP_SEL) || cur.closest?.(SNAP_SKIP_SEL)) return true;
+              const rn = cur.getRootNode?.();
+              cur = rn && rn instanceof ShadowRoot ? rn.host : null;
             }
+            return false;
+          };
+          const extractCleanText = (rootNode) => {
+            if (!rootNode) return '';
             const outParts = [];
             const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
             let tn;
             while ((tn = tw.nextNode())) {
               const p = tn.parentElement;
-              if (
-                p &&
-                !p.isContentEditable &&
-                !p.closest(
-                  'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]'
-                )
-              ) {
+              if (p && !isSnapSkipped(p)) {
                 outParts.push(tn.nodeValue || '');
               }
             }
@@ -2097,18 +2253,23 @@ async function executeBridgeRpc(method, params) {
           if (aStyle.display === 'none' || aStyle.visibility === 'hidden' || aStyle.opacity === '0') continue;
           const aRect = aNode.getBoundingClientRect();
           if (aRect.width < 4 || aRect.height < 4) continue;
+          const ALERT_SKIP_SEL =
+            'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
+          const isAlertSkipped = (n) => {
+            let cur = n instanceof Element ? n : n?.parentElement;
+            while (cur) {
+              if (cur.isContentEditable || cur.matches?.(ALERT_SKIP_SEL) || cur.closest?.(ALERT_SKIP_SEL)) return true;
+              const rn = cur.getRootNode?.();
+              cur = rn && rn instanceof ShadowRoot ? rn.host : null;
+            }
+            return false;
+          };
           const cleanAlertParts = [];
           const aWalker = document.createTreeWalker(aNode, NodeFilter.SHOW_TEXT);
           let aTn;
           while ((aTn = aWalker.nextNode())) {
             const ap = aTn.parentElement;
-            if (
-              ap &&
-              !ap.isContentEditable &&
-              !ap.closest(
-                'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]'
-              )
-            ) {
+            if (ap && !isAlertSkipped(ap)) {
               cleanAlertParts.push(aTn.nodeValue || '');
             }
           }
@@ -2129,7 +2290,16 @@ async function executeBridgeRpc(method, params) {
           'OPTION'
         ]);
         const SKIP_CLOSEST =
-          'style, script, noscript, template, textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [hidden], [aria-hidden="true"], [data-chrome-live-hud]';
+          'style, script, noscript, template, textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], [data-chrome-live-hud]';
+        const isInsideSkipped = (n) => {
+          let cur = n instanceof Element ? n : n?.parentElement;
+          while (cur) {
+            if (cur.isContentEditable || cur.matches?.(SKIP_CLOSEST) || cur.closest?.(SKIP_CLOSEST)) return true;
+            const rn = cur.getRootNode?.();
+            cur = rn && rn instanceof ShadowRoot ? rn.host : null;
+          }
+          return false;
+        };
         const visCache = new WeakMap();
         const isElemVisible = (el) => {
           if (visCache.has(el)) return visCache.get(el);
@@ -2155,7 +2325,7 @@ async function executeBridgeRpc(method, params) {
           while ((tNode = walker.nextNode())) {
             const p = tNode.parentElement;
             if (!p) continue;
-            if (p.isContentEditable || SKIP_TAGS.has(p.tagName) || p.closest(SKIP_CLOSEST) || !isElemVisible(p)) {
+            if (SKIP_TAGS.has(p.tagName) || isInsideSkipped(p) || !isElemVisible(p)) {
               continue;
             }
             const v = tNode.nodeValue || '';
@@ -2178,6 +2348,7 @@ async function executeBridgeRpc(method, params) {
       args: [maxItems]
     });
 
+    await verifyEntryStillControllable(entry);
     await captureQuickFrame(entry.tabId, entry);
     notifyPanelAndDaemon();
     return { tabId: entry.tabId, ...(execRes?.[0]?.result || {}) };
@@ -2185,8 +2356,12 @@ async function executeBridgeRpc(method, params) {
 
   if (method === 'click') {
     const target = params.target;
+    if (typeof target === 'string') {
+      assertSafeModelSelector(target);
+    }
     entry.activity = tr().clicking(typeof target === 'number' ? `[${target}]` : String(target).slice(0, 24));
     await syncHud(entry.tabId, { visible: true, mode: 'working', activity: entry.activity });
+    await verifyEntryStillControllable(entry);
 
     const execRes = await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
       func: async (tgt) => {
@@ -2221,40 +2396,55 @@ async function executeBridgeRpc(method, params) {
           return acc;
         }
 
-        function extractCleanContainerText(rootNode) {
-          if (!rootNode || typeof rootNode.querySelector !== 'function') return rootNode?.textContent || '';
-          if (
-            !rootNode.querySelector(
-              'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [hidden], [aria-hidden="true"], style, script, noscript, template'
-            )
-          ) {
-            return rootNode.textContent || '';
+        const CLICK_SKIP_SEL =
+          'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
+        const isClickSkipped = (n) => {
+          let cur = n instanceof Element ? n : n?.parentElement;
+          while (cur) {
+            if (cur.isContentEditable || cur.matches?.(CLICK_SKIP_SEL) || cur.closest?.(CLICK_SKIP_SEL)) return true;
+            const rn = cur.getRootNode?.();
+            cur = rn && rn instanceof ShadowRoot ? rn.host : null;
           }
+          return false;
+        };
+
+        function extractCleanContainerText(rootNode) {
+          if (!rootNode) return '';
           const outParts = [];
           const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
           let tn;
           while ((tn = tw.nextNode())) {
             const p = tn.parentElement;
-            if (
-              p &&
-              !p.isContentEditable &&
-              !p.closest(
-                'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]'
-              )
-            ) {
+            if (p && !isClickSkipped(p)) {
               outParts.push(tn.nodeValue || '');
             }
           }
           return outParts.join(' ');
         }
 
+        function isInteractableElement(cand) {
+          if (!cand || !(cand instanceof Element)) return false;
+          const tg = cand.tagName.toLowerCase();
+          if (tg === 'meta' || tg === 'script' || tg === 'style' || tg === 'link' || tg === 'template' || tg === 'head') {
+            return false;
+          }
+          if (tg === 'input' && String(cand.type || '').toLowerCase() === 'hidden') return false;
+          if (cand.closest?.('[data-chrome-live-hud]')) return false;
+          const st = window.getComputedStyle(cand);
+          if (st.display === 'none' || st.visibility === 'hidden') return false;
+          const rc = cand.getBoundingClientRect();
+          return rc.width >= 2 && rc.height >= 2;
+        }
+
         let el = null;
         if (typeof tgt === 'number') {
-          el = queryDeep(document, `[data-clive-idx="${tgt}"]`);
+          const hit = queryDeep(document, `[data-clive-idx="${tgt}"]`);
+          if (isInteractableElement(hit)) el = hit;
         } else {
           const raw = String(tgt || '').trim();
           if (raw && /[#.\[\]>:+~=]/.test(raw)) {
-            el = queryDeep(document, raw);
+            const hit = queryDeep(document, raw);
+            if (isInteractableElement(hit)) el = hit;
           }
           if (!el && raw) {
             const needle = raw.toLowerCase();
@@ -2322,32 +2512,7 @@ async function executeBridgeRpc(method, params) {
           elTagLower === 'select' ||
           el.isContentEditable ||
           /^(?:textbox|searchbox|combobox|spinbutton)$/.test(elRoleAttr);
-        const extractSafeNodeText = (rootNode) => {
-          if (!rootNode || typeof rootNode.querySelector !== 'function') return rootNode?.textContent || '';
-          if (
-            !rootNode.querySelector(
-              'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [hidden], [aria-hidden="true"], style, script, noscript, template'
-            )
-          ) {
-            return rootNode.textContent || '';
-          }
-          const outParts = [];
-          const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
-          let tn;
-          while ((tn = tw.nextNode())) {
-            const p = tn.parentElement;
-            if (
-              p &&
-              !p.isContentEditable &&
-              !p.closest(
-                'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]'
-              )
-            ) {
-              outParts.push(tn.nodeValue || '');
-            }
-          }
-          return outParts.join(' ');
-        };
+        const extractSafeNodeText = (rootNode) => extractCleanContainerText(rootNode);
         // Never leak user-entered password/OTP/input values or nested drafts in disabled errors or click receipts
         const safeElemLabel = (maxLen) =>
           (
@@ -2568,6 +2733,7 @@ async function executeBridgeRpc(method, params) {
         .catch(() => {});
     }
     await new Promise((r) => setTimeout(r, 220));
+    await verifyEntryStillControllable(entry);
     await captureQuickFrame(entry.tabId, entry);
     notifyPanelAndDaemon();
     return {
@@ -2581,8 +2747,12 @@ async function executeBridgeRpc(method, params) {
 
   if (method === 'type') {
     const { target, text, submit } = params;
+    if (typeof target === 'string') {
+      assertSafeModelSelector(target);
+    }
     entry.activity = tr().typing;
     await syncHud(entry.tabId, { visible: true, mode: 'working', activity: entry.activity });
+    await verifyEntryStillControllable(entry);
 
     const execRes = await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
       func: async (tgt, val, shouldSubmit) => {
@@ -2616,13 +2786,29 @@ async function executeBridgeRpc(method, params) {
           return acc;
         }
 
+        function isValidTypeTarget(cand) {
+          if (!cand || !(cand instanceof Element)) return false;
+          const tg = cand.tagName.toLowerCase();
+          if (tg === 'meta' || tg === 'script' || tg === 'style' || tg === 'link' || tg === 'template' || tg === 'head') {
+            return false;
+          }
+          if (tg === 'input' && String(cand.type || '').toLowerCase() === 'hidden') return false;
+          if (cand.closest?.('[data-chrome-live-hud]')) return false;
+          const st = window.getComputedStyle(cand);
+          if (st.display === 'none' || st.visibility === 'hidden') return false;
+          const rc = cand.getBoundingClientRect();
+          return rc.width >= 2 && rc.height >= 2;
+        }
+
         let el = null;
         if (typeof tgt === 'number') {
-          el = queryDeep(document, `[data-clive-idx="${tgt}"]`);
+          const hit = queryDeep(document, `[data-clive-idx="${tgt}"]`);
+          if (isValidTypeTarget(hit)) el = hit;
         } else if (typeof tgt === 'string') {
           const raw = tgt.trim();
           if (raw) {
-            el = queryDeep(document, raw);
+            const hit = queryDeep(document, raw);
+            if (isValidTypeTarget(hit)) el = hit;
           }
           if (!el && raw) {
             const needle = raw.toLowerCase();
@@ -2672,6 +2858,29 @@ async function executeBridgeRpc(method, params) {
         }
 
         if (!el) return { ok: false, error: `Input element not found: ${tgt}` };
+        const elStyle = window.getComputedStyle(el);
+        const elTextSec = String(elStyle.webkitTextSecurity || elStyle.getPropertyValue('-webkit-text-security') || '').toLowerCase();
+        const elAuto = String(el.getAttribute?.('autocomplete') || '').toLowerCase();
+        const elMetaHints = [
+          el.getAttribute?.('name'),
+          el.id,
+          el.getAttribute?.('placeholder'),
+          el.getAttribute?.('aria-label')
+        ]
+          .filter(Boolean)
+          .join(' ');
+        if (
+          (el instanceof HTMLInputElement && String(el.type || '').toLowerCase() === 'password') ||
+          (elTextSec && elTextSec !== 'none') ||
+          /(?:password|one-time-code|cc-number|cc-csc|cc-exp)/i.test(elAuto) ||
+          /\b(?:password|passwd|otp|cvv|cvc)\b|密码|支付密码|动态口令|短信验证码/i.test(elMetaHints)
+        ) {
+          return {
+            ok: false,
+            error:
+              '[GUARDRAIL] Automated typing into password, OTP, or payment security fields is blocked; use Pause / Popout to enter credentials manually in Chrome'
+          };
+        }
         el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
         const rect = el.getBoundingClientRect();
         const jx = ((Math.random() + Math.random()) / 2 - 0.5) * Math.min(rect.width * 0.3, 24);
@@ -2860,10 +3069,13 @@ async function executeBridgeRpc(method, params) {
 
     const out = execRes?.[0]?.result;
     if (!out || !out.ok) throw new Error(out?.error || 'Type failed');
+    await verifyEntryStillControllable(entry);
     if (out.inCodeMirror) {
       await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
           world: 'MAIN',
           func: (v) => {
+            const ctrl = window.__chromeLiveHudController__;
+            if (ctrl && (!ctrl._state?.visible || ctrl._state?.mode === 'paused')) return;
             const cm = document.querySelector('.CodeMirror')?.CodeMirror;
             if (cm && typeof cm.setValue === 'function') {
               cm.setValue(v);
@@ -2875,6 +3087,7 @@ async function executeBridgeRpc(method, params) {
         .catch(() => {});
     }
     await new Promise((r) => setTimeout(r, 220));
+    await verifyEntryStillControllable(entry);
     await captureQuickFrame(entry.tabId, entry);
     notifyPanelAndDaemon();
     return {
@@ -2890,8 +3103,11 @@ async function executeBridgeRpc(method, params) {
   if (method === 'upload') {
     const files = Array.isArray(params.files) ? params.files : [];
     if (files.length === 0) throw new Error('upload requires at least one file path');
+    if (typeof params.target === 'string') {
+      assertSafeModelSelector(params.target);
+    }
     const EXT_SENSITIVE_BASE_RX =
-      /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|auth\.token|\.local-runtime\.json|agent_vault\.enc|\.env(?:\..+)?|\.npmrc|\.pypirc|\.netrc|\.git-credentials|credentials(?:\.json)?|application_default_credentials\.json|Cookies(?:-journal)?|Login Data(?:\s+For\s+Account)?|Web Data|.*\.(?:pem|key|p12|pfx|kdbx|ovpn|jks|keystore))$/i;
+      /^(?:(?!.*\.pub$)id_(?:rsa|ed25519|ecdsa|dsa)(?:$|[._-].+)|authorized_keys|known_hosts|auth\.token|\.local-runtime\.json|agent_vault\.enc|\.env(?:\..+)?|\.npmrc|\.pypirc|\.netrc|\.git-credentials|kubeconfig|credentials(?:\.json)?|application_default_credentials\.json|Local\s+State|Cookies(?:-journal)?|cookies\.sqlite|key[34]\.db|cert9\.db|logins\.json|Login Data(?:\s+For\s+Account)?|Web Data|.*\.(?:pem|key|p12|pfx|kdbx|ovpn|jks|keystore)|.*\.tfstate(?:\.backup)?)$/i;
     for (const rawFile of files) {
       const fStr = String(rawFile || '').trim();
       const withoutDrive = fStr.replace(/^[A-Za-z]:/, '');
@@ -3096,6 +3312,7 @@ async function executeBridgeRpc(method, params) {
         .catch(() => {});
 
       await new Promise((r) => setTimeout(r, 240));
+      await verifyEntryStillControllable(entry);
       await captureQuickFrame(entry.tabId, entry);
       notifyPanelAndDaemon();
       return {
@@ -3108,6 +3325,7 @@ async function executeBridgeRpc(method, params) {
 
     // Fallback for rich-text editors without <input type="file"> (synthetic paste + drop DataTransfer)
     if (Array.isArray(params.pasteFallback) && params.pasteFallback.length > 0) {
+      await verifyEntryStillControllable(entry);
       const fallbackRes = await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
         func: async (tgt, payloads) => {
           let editor = null;
@@ -3173,6 +3391,7 @@ async function executeBridgeRpc(method, params) {
         throw new Error(fb?.error || 'No <input type="file"> or paste-capable editor found on page');
       }
       await new Promise((r) => setTimeout(r, 240));
+      await verifyEntryStillControllable(entry);
       await captureQuickFrame(entry.tabId, entry);
       notifyPanelAndDaemon();
       return {
@@ -3238,11 +3457,11 @@ async function executeBridgeRpc(method, params) {
     const url = String(params.url || '').trim();
     const safety = checkTabUrlAllowed(url);
     if (!safety.allowed) throw new Error(`[GUARDRAIL] ${safety.reason}`);
+    await verifyEntryStillControllable(entry);
     entry.activity = tr().navigating;
     await chrome.tabs.update(entry.tabId, { url });
     await waitForTabComplete(entry.tabId, 15000);
-    await pollHudUserEvents(entry.tabId, entry);
-    assertStillActiveAndUnpaused(entry);
+    await verifyEntryStillControllable(entry);
     const updated = await chrome.tabs.get(entry.tabId);
     entry.title = updated.title || '';
     entry.url = updated.url || url;
@@ -3253,6 +3472,7 @@ async function executeBridgeRpc(method, params) {
     }
     entry.activity = tr().loaded(entry.title.slice(0, 28));
     await syncHud(entry.tabId, { visible: true, mode: 'working', activity: entry.activity });
+    await verifyEntryStillControllable(entry);
     await captureQuickFrame(entry.tabId, entry);
     notifyPanelAndDaemon();
     return { tabId: entry.tabId, title: entry.title, url: entry.url };
@@ -3292,56 +3512,70 @@ async function executeBridgeRpc(method, params) {
   if (method === 'wait') {
     const waitMs = Math.min(15000, Math.max(0, Number(params.ms) || 0));
     const selector = typeof params.selector === 'string' ? params.selector.trim() : '';
+    if (selector) {
+      assertSafeModelSelector(selector);
+    }
     const timeoutMs = Math.min(15000, Math.max(300, Number(params.timeoutMs) || 8000));
     entry.activity = tr().waiting;
     await syncHud(entry.tabId, { visible: true, mode: 'working', activity: entry.activity });
+    await verifyEntryStillControllable(entry);
 
     if (selector) {
-      const execRes = await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
-        func: async (sel, maxWait) => {
-          function queryDeep(root, s, depth = 0) {
-            if (!root || depth > 6) return null;
-            try {
-              const hit = root.querySelector(s);
-              if (hit) return hit;
-            } catch {
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < timeoutMs) {
+        await verifyEntryStillControllable(entry);
+        const execRes = await chrome.scripting.executeScript({
+          target: { tabId: entry.tabId },
+          injectImmediately: true,
+          func: (sel) => {
+            function queryDeep(root, s, depth = 0) {
+              if (!root || depth > 6) return null;
+              try {
+                const hit = root.querySelector(s);
+                if (hit) return hit;
+              } catch {
+                return null;
+              }
+              for (const h of root.querySelectorAll('*')) {
+                if (h.hasAttribute && h.hasAttribute('data-chrome-live-hud')) continue;
+                if (h.shadowRoot) {
+                  const sub = queryDeep(h.shadowRoot, s, depth + 1);
+                  if (sub) return sub;
+                }
+              }
               return null;
             }
-            for (const h of root.querySelectorAll('*')) {
-              if (h.hasAttribute && h.hasAttribute('data-chrome-live-hud')) continue;
-              if (h.shadowRoot) {
-                const sub = queryDeep(h.shadowRoot, s, depth + 1);
-                if (sub) return sub;
-              }
-            }
-            return null;
-          }
-          const deadline = performance.now() + maxWait;
-          while (performance.now() < deadline) {
             const found = queryDeep(document, sel);
-            if (found) {
-              const rect = found.getBoundingClientRect();
-              if (rect.width > 0 && rect.height > 0) {
-                return { matched: true, selector: sel };
-              }
+            if (!found || !(found instanceof Element)) return false;
+            const tg = found.tagName.toLowerCase();
+            if (tg === 'meta' || tg === 'script' || tg === 'style' || tg === 'link' || tg === 'template' || tg === 'head') {
+              return false;
             }
-            await new Promise((r) => setTimeout(r, 120));
-          }
-          return { matched: false, selector: sel };
-        },
-        args: [selector, timeoutMs]
-      });
-      const res = execRes?.[0]?.result || { matched: false };
-      if (!res.matched) {
-        throw new Error(`Timed out waiting for selector: ${selector}`);
+            if (tg === 'input' && String(found.type || '').toLowerCase() === 'hidden') return false;
+            const st = window.getComputedStyle(found);
+            if (st.display === 'none' || st.visibility === 'hidden') return false;
+            const rect = found.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+          },
+          args: [selector]
+        });
+        if (execRes?.[0]?.result === true) {
+          await verifyEntryStillControllable(entry);
+          return { tabId: entry.tabId, matched: true, selector };
+        }
+        await new Promise((r) => setTimeout(r, 200));
       }
-      return { tabId: entry.tabId, ...res };
+      throw new Error(`Timed out waiting for selector: ${selector}`);
     }
 
     await waitForTabComplete(entry.tabId, timeoutMs);
-    if (waitMs > 0) {
-      await new Promise((r) => setTimeout(r, waitMs));
+    const waitStart = Date.now();
+    while (Date.now() - waitStart < waitMs) {
+      await verifyEntryStillControllable(entry);
+      const stepSleep = Math.min(250, waitMs - (Date.now() - waitStart));
+      if (stepSleep > 0) await new Promise((r) => setTimeout(r, stepSleep));
     }
+    await verifyEntryStillControllable(entry);
     return { tabId: entry.tabId, waitedMs: waitMs };
   }
 
@@ -3388,6 +3622,31 @@ chrome.debugger.onDetach.addListener((source, reason) => {
     }
   }
 });
+
+if (chrome.webNavigation?.onCommitted) {
+  chrome.webNavigation.onCommitted.addListener(async (details) => {
+    if (!details || typeof details.tabId !== 'number' || !managedTabs.has(details.tabId)) return;
+    if (!details.url || details.url === 'about:blank') return;
+    const safety = checkTabUrlAllowed(details.url);
+    if (!safety.allowed) {
+      const reason =
+        details.frameId === 0
+          ? safety.reason
+          : `Embedded payment/protected sub-frame: ${safety.reason}`;
+      await detachManagedTab(details.tabId, reason, true).catch(() => {});
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(
+          JSON.stringify({
+            type: 'guardrail_trip',
+            tabId: details.tabId,
+            url: redactAuditUrl(details.url),
+            reason
+          })
+        );
+      }
+    }
+  });
+}
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   // Always notify the open side panel when an active tab navigates from chrome://newtab/ to a web URL
@@ -3796,7 +4055,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await syncHud(entry.tabId, {
           visible: true,
           mode: entry.uiMode,
-          activity: entry.activity
+          activity: entry.activity,
+          clearUserPauseLock: !entry.paused
         });
         await syncLiveTabGroups();
         notifyPanelAndDaemon();

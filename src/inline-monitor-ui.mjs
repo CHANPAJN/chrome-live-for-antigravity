@@ -637,8 +637,10 @@ export function buildInlineMonitorHtml() {
         attachBtn.style.display = canAttach ? 'inline-block' : 'none';
       }
 
+      let parentTargetOrigin = '*';
+
       function postJson(payload) {
-        window.parent.postMessage(payload, '*');
+        window.parent.postMessage(payload, parentTargetOrigin);
       }
 
       function sendRequest(method, params) {
@@ -810,6 +812,7 @@ export function buildInlineMonitorHtml() {
           if (isPaused && interactionMode !== 'watch') setMode('watch');
           attachBtn.disabled = false;
           relayBtn.disabled = false;
+          snapBtn.disabled = isPaused;
           releaseBtn.disabled = false;
           if (primary.inRelayPopout) {
             relayBtn.dataset.relay = 'merge';
@@ -839,6 +842,7 @@ export function buildInlineMonitorHtml() {
           relayBtn.disabled = true;
           relayBtn.dataset.relay = 'popout';
           setBtnLabel(relayBtn, L.relayOut);
+          snapBtn.disabled = true;
           releaseBtn.disabled = true;
           if (interactionMode !== 'watch') setMode('watch');
           if (prevInRelay) showStatus('');
@@ -886,6 +890,9 @@ export function buildInlineMonitorHtml() {
 
       window.addEventListener('message', (ev) => {
         if (ev.source !== window.parent) return;
+        if (typeof ev.origin === 'string' && ev.origin && ev.origin !== 'null') {
+          parentTargetOrigin = ev.origin;
+        }
         const msg = ev.data;
         if (!msg || typeof msg !== 'object' || msg.jsonrpc !== '2.0') return;
 
@@ -914,11 +921,12 @@ export function buildInlineMonitorHtml() {
         }
 
         if (msg.method === 'ui/notifications/tool-result') {
+          const metaSecret = msg.params && msg.params._meta && msg.params._meta.uiSecret;
+          if (typeof metaSecret === 'string' && metaSecret) {
+            uiSecret = metaSecret;
+          }
           const sc = msg.params && (msg.params.structuredContent || msg.params);
           if (sc) {
-            if (typeof sc.uiSecret === 'string' && sc.uiSecret) {
-              uiSecret = sc.uiSecret;
-            }
             renderSnapshot(sc);
             scheduleNextPoll();
           }
@@ -1059,8 +1067,9 @@ export function buildInlineMonitorHtml() {
       });
 
       snapBtn.addEventListener('click', async () => {
+        if (!currentTab || currentTab.paused) return;
         const res = await callAppAction(
-          { action: 'screenshot', tabId: currentTab ? currentTab.tabId : undefined },
+          { action: 'screenshot', tabId: currentTab.tabId },
           IS_ZH ? '正在抓取最新画面...' : 'Refreshing live frame...'
         );
         if (res) showStatus(IS_ZH ? '画面已刷新' : 'Frame updated', 'ok', false);

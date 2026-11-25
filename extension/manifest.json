@@ -34,7 +34,8 @@
     "storage",
     "alarms",
     "sidePanel",
-    "contextMenus"
+    "contextMenus",
+    "webNavigation"
   ],
   "host_permissions": [
     "<all_urls>",

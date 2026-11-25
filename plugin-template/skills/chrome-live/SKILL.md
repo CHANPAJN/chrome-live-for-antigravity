@@ -9,7 +9,7 @@ Operate the user's local Google Chrome through `chrome-live` (`127.0.0.1:__CHROM
 
 - **Shared Signed-In Tabs (`substate == "shared"`):** When the user shares an authenticated tab (`Alt+Shift+L`), run `health` first to inspect `tabs`, pass `--tab <tabId>` on subsequent actions, and **never close the user's shared tab**.
 - **Background Tab Groups (`open`):** Open external pages quietly inside the collapsed `Live · Active` tab group without stealing foreground window focus, and always run `done "<summary>"` at the end of the task so temporary worker tabs and CDP debuggers are cleaned up.
-- **Concurrent Extraction (`extract`):** Fetch clean article text and high-resolution image URLs from multiple pages at once in a self-cleaning minimized worker window.
+- **Concurrent Extraction (`extract`):** Fetch clean article text and high-resolution image URLs from multiple pages at once in self-cleaning background worker tabs (reusing a collapsed group in the current normal window, or a minimized worker window if none exists).
 
 ## Live Preview (MANDATORY First Step on Visual Workflows)
 

@@ -271,12 +271,6 @@ async function main() {
     return;
   }
 
-  if (cmd === 'token') {
-    const token = ensureAuthToken();
-    process.stdout.write(`${token}\n`);
-    return;
-  }
-
   if (cmd === 'setup' || cmd === 'install') {
     const token = ensureAuthToken();
     const runtimePath = writeExtensionLocalRuntimeConfig(token);

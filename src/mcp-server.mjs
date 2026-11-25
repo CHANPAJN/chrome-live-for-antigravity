@@ -195,7 +195,7 @@ const MCP_TOOLS = [
   {
     name: 'chrome_live_extract',
     description:
-      'Concurrently extract clean article/DOM text and high-resolution image URLs from one or more URLs in a minimized worker window, closing only its own worker tabs upon completion.',
+      'Concurrently extract clean article/DOM text and high-resolution image URLs from one or more URLs in background worker tabs (reusing a collapsed background group in your normal window, or a minimized worker window if none exists), closing only its own worker tabs upon completion.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -438,35 +438,78 @@ export function startMcpStdioServer({ callDaemon }) {
 
   const MAX_MCP_MESSAGE_BYTES = 16 * 1024 * 1024;
   const MAX_MCP_HEADER_BYTES = 8192;
+  let lockedFramingMode = null; // null until first valid message locks 'line' or 'header'
 
   process.stdin.on('data', (chunk) => {
     rawBuffer = rawBuffer.length === 0 ? chunk : Buffer.concat([rawBuffer, chunk]);
 
     while (rawBuffer.length > 0) {
-      // Strip leading CR/LF/whitespace between frames without misclassifying fragmented headers
+      // Strip leading UTF-8 BOM (0xEF 0xBB 0xBF) and CR/LF/whitespace between frames
       let leadIdx = 0;
-      while (
-        leadIdx < rawBuffer.length &&
-        (rawBuffer[leadIdx] === 0x20 ||
-          rawBuffer[leadIdx] === 0x09 ||
-          rawBuffer[leadIdx] === 0x0d ||
-          rawBuffer[leadIdx] === 0x0a)
-      ) {
-        leadIdx++;
+      while (leadIdx < rawBuffer.length) {
+        if (
+          leadIdx + 2 < rawBuffer.length &&
+          rawBuffer[leadIdx] === 0xef &&
+          rawBuffer[leadIdx + 1] === 0xbb &&
+          rawBuffer[leadIdx + 2] === 0xbf
+        ) {
+          leadIdx += 3;
+          continue;
+        }
+        const b = rawBuffer[leadIdx];
+        if (b === 0x20 || b === 0x09 || b === 0x0d || b === 0x0a) {
+          leadIdx++;
+          continue;
+        }
+        break;
       }
       if (leadIdx > 0) {
         rawBuffer = rawBuffer.subarray(leadIdx);
         if (rawBuffer.length === 0) return;
       }
+      // Wait if buffer currently holds only a partial 1- or 2-byte UTF-8 BOM prefix
+      if (
+        (rawBuffer.length === 1 && rawBuffer[0] === 0xef) ||
+        (rawBuffer.length === 2 && rawBuffer[0] === 0xef && rawBuffer[1] === 0xbb)
+      ) {
+        return;
+      }
 
-      const firstByte = rawBuffer[0];
-      // JSON-RPC line framing always starts with '{' (0x7b) or '[' (0x5b); anything else is HTTP-style header framing
-      if (firstByte !== 0x7b && firstByte !== 0x5b) {
-        framingMode = 'header';
+      if (lockedFramingMode === null) {
+        const firstByte = rawBuffer[0];
+        if (firstByte === 0x7b || firstByte === 0x5b) {
+          lockedFramingMode = 'line';
+          framingMode = 'line';
+        } else {
+          const probeAscii = rawBuffer.subarray(0, Math.min(rawBuffer.length, 32)).toString('ascii');
+          if (/^(?:content-length|content-type)\s*:/i.test(probeAscii)) {
+            lockedFramingMode = 'header';
+            framingMode = 'header';
+          } else if (
+            rawBuffer.length < 16 &&
+            ('content-length:'.startsWith(probeAscii.toLowerCase()) ||
+              'content-type:'.startsWith(probeAscii.toLowerCase()))
+          ) {
+            return;
+          } else {
+            // Malformed leading garbage in unlocked stream: skip up to next LF without locking into 'header' deadlock
+            const nextLf = rawBuffer.indexOf(0x0a);
+            if (nextLf === -1) {
+              if (rawBuffer.length > MAX_MCP_HEADER_BYTES) rawBuffer = Buffer.alloc(0);
+              return;
+            }
+            rawBuffer = rawBuffer.subarray(nextLf + 1);
+            continue;
+          }
+        }
+      }
+
+      if (lockedFramingMode === 'header') {
         const sepIdx = rawBuffer.indexOf('\r\n\r\n');
         if (sepIdx === -1) {
           if (rawBuffer.length > MAX_MCP_HEADER_BYTES) {
             rawBuffer = Buffer.alloc(0);
+            process.stdin.destroy();
           }
           return;
         }
@@ -479,6 +522,7 @@ export function startMcpStdioServer({ callDaemon }) {
         const contentLen = Number.parseInt(m[1], 10);
         if (!Number.isFinite(contentLen) || contentLen < 0 || contentLen > MAX_MCP_MESSAGE_BYTES) {
           rawBuffer = Buffer.alloc(0);
+          process.stdin.destroy();
           return;
         }
         const totalNeeded = sepIdx + 4 + contentLen;
@@ -496,10 +540,9 @@ export function startMcpStdioServer({ callDaemon }) {
           }
           return;
         }
-        const line = rawBuffer.subarray(0, nlIdx).toString('utf8').trim();
+        const line = rawBuffer.subarray(0, nlIdx).toString('utf8').replace(/^\uFEFF/, '').trim();
         rawBuffer = rawBuffer.subarray(nlIdx + 1);
         if (!line) continue;
-        framingMode = 'line';
         try {
           handleRpc(JSON.parse(line));
         } catch {}
@@ -622,7 +665,8 @@ async function executeMonitorAppAction(args, callDaemon) {
   return {
     __mcpRawResult: {
       content: [{ type: 'text', text: act || 'ok' }],
-      structuredContent: sc
+      structuredContent: sc,
+      _meta: { uiSecret: UI_CAPABILITY_SECRET }
     }
   };
 }
@@ -655,7 +699,8 @@ async function invokeTool(toolName, args, callDaemon) {
               text: `${label} (connected=${Boolean(sc?.extensionConnected)}, activeTabs=${tabCount}).`
             }
           ],
-          structuredContent: sc && typeof sc === 'object' ? { ...sc, uiSecret: UI_CAPABILITY_SECRET } : { uiSecret: UI_CAPABILITY_SECRET }
+          structuredContent: sc && typeof sc === 'object' ? sc : {},
+          _meta: { uiSecret: UI_CAPABILITY_SECRET }
         }
       };
     }

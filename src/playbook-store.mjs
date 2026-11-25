@@ -165,9 +165,9 @@ export function normalizeDomain(urlOrDomain) {
   }
 }
 
-export function sanitizeRouteUrl(rawUrl) {
+export function sanitizeRouteUrl(rawUrl, customBlockedDomains = []) {
   if (!rawUrl || typeof rawUrl !== 'string') return null;
-  const safety = evaluateUrlSafety(rawUrl);
+  const safety = evaluateUrlSafety(rawUrl, customBlockedDomains);
   if (!safety.allowed) return null;
 
   let u;
@@ -179,12 +179,19 @@ export function sanitizeRouteUrl(rawUrl) {
 
   u.username = '';
   u.password = '';
-  if (u.hash && (u.hash.length > 48 || AUDIT_SENSITIVE_PARAM_RX.test(u.hash) || /utm_/i.test(u.hash))) {
-    u.hash = '';
+  if (u.hash) {
+    // Only retain pure SPA route paths like #/orders/list; strip all opaque anchors/tokens/params (e.g. #9f8e7d...)
+    const pureSpaRoute =
+      /^#\/[A-Za-z0-9/_-]{1,64}$/.test(u.hash) &&
+      !/^#\/?(?:eyJ|[0-9a-f]{24,})/i.test(u.hash) &&
+      !AUDIT_SENSITIVE_PARAM_RX.test(u.hash);
+    if (!pureSpaRoute) {
+      u.hash = '';
+    }
   }
 
   for (const key of Array.from(u.searchParams.keys())) {
-    if (STRIP_QUERY_PATTERNS.some((rx) => rx.test(key))) {
+    if (STRIP_QUERY_PATTERNS.some((rx) => rx.test(key)) || AUDIT_SENSITIVE_PARAM_RX.test(key)) {
       u.searchParams.delete(key);
     }
   }
@@ -251,11 +258,13 @@ export function setPlaybookEnabled(enabled) {
   return getPlaybookSummary();
 }
 
-export function lookupDomainPlaybook(urlOrDomain) {
+export function lookupDomainPlaybook(urlOrDomain, customBlockedDomains = []) {
   const store = loadStore();
   if (!store.enabled) return null;
   const domain = normalizeDomain(urlOrDomain);
   if (!domain) return null;
+  if (!evaluateUrlSafety(`https://${domain}/`, customBlockedDomains).allowed) return null;
+  if (!Object.hasOwn(store.sites, domain)) return null;
 
   const entry = store.sites[domain];
   if (!entry) return null;
@@ -272,11 +281,11 @@ export function lookupDomainPlaybook(urlOrDomain) {
   };
 }
 
-export function learnFromPageVisit({ url, title, elements = [] } = {}) {
+export function learnFromPageVisit({ url, title, elements = [], customBlockedDomains = [] } = {}) {
   const store = loadStore();
   if (!store.enabled) return false;
 
-  const cleanUrl = sanitizeRouteUrl(url);
+  const cleanUrl = sanitizeRouteUrl(url, customBlockedDomains);
   if (!cleanUrl || !shouldAutoLearnUrl(cleanUrl)) return false;
 
   const domain = normalizeDomain(cleanUrl);
@@ -323,11 +332,11 @@ export function learnFromPageVisit({ url, title, elements = [] } = {}) {
   return changed;
 }
 
-export function learnInteractionSelector({ url, label, selector } = {}) {
+export function learnInteractionSelector({ url, label, selector, customBlockedDomains = [] } = {}) {
   const store = loadStore();
   if (!store.enabled) return false;
   if (!url || !label || !selector) return false;
-  if (!evaluateUrlSafety(url).allowed) return false;
+  if (!evaluateUrlSafety(url, customBlockedDomains).allowed) return false;
 
   const domain = normalizeDomain(url);
   if (!domain || SKIP_AUTO_HOSTS.has(domain)) return false;
@@ -352,7 +361,7 @@ export function learnInteractionSelector({ url, label, selector } = {}) {
   return true;
 }
 
-export function saveManualPlaybook({ domain: rawDomain, route, tip, tipIndex, selector } = {}) {
+export function saveManualPlaybook({ domain: rawDomain, route, tip, tipIndex, selector, customBlockedDomains = [] } = {}) {
   const store = loadStore();
   if (!store.enabled) {
     throw new Error('Site Playbooks are disabled; enable them before saving entries');
@@ -361,7 +370,7 @@ export function saveManualPlaybook({ domain: rawDomain, route, tip, tipIndex, se
   if (!domain) {
     throw new Error('Invalid domain for playbook entry');
   }
-  const safety = evaluateUrlSafety(`https://${domain}/`);
+  const safety = evaluateUrlSafety(`https://${domain}/`, customBlockedDomains);
   if (!safety.allowed) {
     throw new Error(`Cannot store playbook for protected domain: ${domain}`);
   }
@@ -375,7 +384,7 @@ export function saveManualPlaybook({ domain: rawDomain, route, tip, tipIndex, se
     } else if (!/^https?:\/\//i.test(candidateUrl)) {
       candidateUrl = `https://${candidateUrl}`;
     }
-    const cleanUrl = sanitizeRouteUrl(candidateUrl);
+    const cleanUrl = sanitizeRouteUrl(candidateUrl, customBlockedDomains);
     if (!cleanUrl) throw new Error('Route URL is invalid or blocked by guardrails');
     const routeHost = normalizeDomain(cleanUrl);
     if (!routeHost || (routeHost !== domain && !routeHost.endsWith(`.${domain}`))) {

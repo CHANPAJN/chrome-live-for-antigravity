@@ -115,6 +115,9 @@ export class NativeWsPeer extends EventEmitter {
   close(code = 1000, reason = '', emitCode = code, emitReason = reason) {
     if (this.closed) return;
     this.closed = true;
+    this._buffer = Buffer.alloc(0);
+    this._fragments = [];
+    this._fragmentBytes = 0;
     try {
       // RFC 6455 Section 5.5: Control frames MUST have payload <= 125 bytes (2-byte code + <=123 valid UTF-8 bytes)
       const reasonBuf = truncateUtf8Bytes(reason, 123);
@@ -216,9 +219,28 @@ export class NativeWsPeer extends EventEmitter {
         this.close(1002, 'Invalid 1-byte close payload');
         return;
       }
-      const peerCode = payload.length >= 2 ? payload.readUInt16BE(0) : 1005;
-      const peerReason = payload.length > 2 ? payload.subarray(2).toString('utf8') : '';
-      const replyCode = peerCode >= 1000 && peerCode <= 4999 && peerCode !== 1005 && peerCode !== 1006 ? peerCode : 1000;
+      let peerCode = 1005;
+      let peerReason = '';
+      if (payload.length >= 2) {
+        peerCode = payload.readUInt16BE(0);
+        const validWireCloseCode =
+          (peerCode >= 1000 && peerCode <= 1003) ||
+          (peerCode >= 1007 && peerCode <= 1011) ||
+          (peerCode >= 3000 && peerCode <= 4999);
+        if (!validWireCloseCode) {
+          this.close(1002, 'Invalid RFC 6455 close code');
+          return;
+        }
+        if (payload.length > 2) {
+          try {
+            peerReason = new TextDecoder('utf-8', { fatal: true }).decode(payload.subarray(2));
+          } catch {
+            this.close(1007, 'Invalid UTF-8 in close reason');
+            return;
+          }
+        }
+      }
+      const replyCode = peerCode === 1005 ? 1000 : peerCode;
       this.close(replyCode, 'Peer closed', peerCode, peerReason);
       return;
     }
@@ -292,8 +314,19 @@ export function upgradeHttpToWebSocket(
   head,
   { requireMask = true, maxPayloadBytes = 16 * 1024 * 1024 } = {}
 ) {
-  const key = req.headers['sec-websocket-key'];
-  if (!key || typeof key !== 'string') {
+  const method = String(req.method || '').toUpperCase();
+  const upgradeHdr = String(req.headers.upgrade || '').toLowerCase();
+  const wsVersion = String(req.headers['sec-websocket-version'] || '').trim();
+  const key = typeof req.headers['sec-websocket-key'] === 'string' ? req.headers['sec-websocket-key'].trim() : '';
+  let validKey = false;
+  if (/^[A-Za-z0-9+/]{22}==$/.test(key)) {
+    try {
+      validKey = Buffer.from(key, 'base64').length === 16;
+    } catch {
+      validKey = false;
+    }
+  }
+  if (method !== 'GET' || !upgradeHdr.includes('websocket') || wsVersion !== '13' || !validKey) {
     socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
     socket.destroy();
     return null;

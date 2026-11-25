@@ -26,6 +26,55 @@ function readLocalToken() {
   }
 }
 
+function signDaemonHttp(token, method, routePath, payload) {
+  const ts = String(Date.now());
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const methodUpper = String(method || 'GET').toUpperCase();
+  const byteLen = payload ? payload.length : 0;
+  const bodyHash = crypto
+    .createHash('sha256')
+    .update(payload || Buffer.alloc(0))
+    .digest('hex');
+  const hdrCanonical = JSON.stringify([
+    'chrome-live:http-hdr:v2',
+    methodUpper,
+    routePath,
+    ts,
+    nonce,
+    byteLen
+  ]);
+  const reqCanonical = JSON.stringify([
+    'chrome-live:http-req:v2',
+    methodUpper,
+    routePath,
+    ts,
+    nonce,
+    bodyHash
+  ]);
+  const hdrSig = crypto.createHmac('sha256', token).update(hdrCanonical, 'utf8').digest('hex');
+  const sig = crypto.createHmac('sha256', token).update(reqCanonical, 'utf8').digest('hex');
+  return {
+    ts,
+    nonce,
+    headers: {
+      'X-Chrome-Live-Ts': ts,
+      'X-Chrome-Live-Nonce': nonce,
+      'X-Chrome-Live-Hdr-Sig': hdrSig,
+      'X-Chrome-Live-Sig': sig
+    }
+  };
+}
+
+function verifyDaemonHttp(token, statusCode, resHeaders, ts, nonce) {
+  const serverSig = String(resHeaders?.['x-chrome-live-server-sig'] || '');
+  if (!serverSig || !token) return false;
+  const canonical = JSON.stringify(['chrome-live:http-res:v2', Number(statusCode) || 0, String(ts), String(nonce)]);
+  const expected = crypto.createHmac('sha256', token).update(canonical, 'utf8').digest('hex');
+  const a = Buffer.from(serverSig, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 function maybeBootstrapDaemon() {
   const now = Date.now();
   if (now - lastSpawnAt < SPAWN_COOLDOWN_MS) return;
@@ -34,12 +83,7 @@ function maybeBootstrapDaemon() {
     return;
   }
 
-  const probe = http.request(
-    { host: DAEMON_HOST, port: DAEMON_PORT, path: '/api/ping', method: 'GET', timeout: 800 },
-    (res) => res.resume()
-  );
-  probe.on('timeout', () => probe.destroy());
-  probe.on('error', () => {
+  const spawnDaemon = () => {
     try {
       const child = spawn(process.execPath, [DAEMON_SCRIPT], {
         cwd: path.dirname(DAEMON_SCRIPT),
@@ -49,40 +93,27 @@ function maybeBootstrapDaemon() {
       });
       child.unref();
     } catch {}
-  });
-  probe.end();
-}
-
-function signDaemonHttp(token, method, routePath, payload) {
-  const ts = String(Date.now());
-  const nonce = crypto.randomBytes(16).toString('hex');
-  const bodyHash = crypto
-    .createHash('sha256')
-    .update(payload || Buffer.alloc(0))
-    .digest('hex');
-  const reqCanonical = `chrome-live:http-req:v1:${String(method || 'GET').toUpperCase()}:${routePath}:${ts}:${nonce}:${bodyHash}`;
-  const sig = crypto.createHmac('sha256', token).update(reqCanonical, 'utf8').digest('hex');
-  return {
-    ts,
-    nonce,
-    headers: {
-      'X-Chrome-Live-Ts': ts,
-      'X-Chrome-Live-Nonce': nonce,
-      'X-Chrome-Live-Sig': sig
-    }
   };
-}
 
-function verifyDaemonHttp(token, statusCode, resHeaders, ts, nonce) {
-  const serverSig = String(resHeaders?.['x-chrome-live-server-sig'] || '');
-  if (!serverSig || !token) return false;
-  const expected = crypto
-    .createHmac('sha256', token)
-    .update(`chrome-live:http-res:v1:${Number(statusCode) || 0}:${ts}:${nonce}`, 'utf8')
-    .digest('hex');
-  const a = Buffer.from(serverSig, 'utf8');
-  const b = Buffer.from(expected, 'utf8');
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+  const token = readLocalToken();
+  if (!token) {
+    spawnDaemon();
+    return;
+  }
+  const { ts, nonce, headers } = signDaemonHttp(token, 'GET', '/api/health', null);
+  const probe = http.request(
+    { host: DAEMON_HOST, port: DAEMON_PORT, path: '/api/health', method: 'GET', headers, timeout: 800 },
+    (res) => {
+      res.resume();
+      if (!verifyDaemonHttp(token, res.statusCode || 500, res.headers, ts, nonce)) {
+        // Port is occupied by an unverified process; do not treat as a healthy daemon
+        return;
+      }
+    }
+  );
+  probe.on('timeout', () => probe.destroy());
+  probe.on('error', () => spawnDaemon());
+  probe.end();
 }
 
 function callDaemon(method, routePath, bodyObj = null, timeoutMs = 6000) {
