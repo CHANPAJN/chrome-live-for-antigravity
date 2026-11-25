@@ -86,7 +86,7 @@ const BUILTIN_PROTECTED_DOMAINS = [
   'dash.cloudflare.com'
 ];
 
-const CHECKOUT_PATH_RX = /\/(?:checkout|payment|payments|cashier|billing\/pay|wallet\/transfer)(?:\/|\?|$|#)/i;
+const CHECKOUT_PATH_RX = /\/(?:checkout|pay|payment|payments|cashier|billing|wallet\/transfer)(?:\/|\?|$|#)/i;
 
 let bridgeConfig = {
   host: '127.0.0.1',
@@ -108,8 +108,36 @@ let extractWindowPromise = null;
 let groupSerializeChain = Promise.resolve();
 let activeExtractJobs = 0;
 
+const LOCAL_AUDIT_SENSITIVE_PARAM_RX =
+  /^(?:token|access_token|id_token|refresh_token|auth.*|code|state|sig|signature|key|api_key|secret|password|session.*)$/i;
+
+function redactAuditUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return rawUrl;
+  try {
+    const parsed = new URL(rawUrl.trim());
+    if (!parsed.search) return parsed.toString();
+    let changed = false;
+    for (const [k] of parsed.searchParams.entries()) {
+      if (LOCAL_AUDIT_SENSITIVE_PARAM_RX.test(k)) {
+        parsed.searchParams.set(k, 'REDACTED');
+        changed = true;
+      }
+    }
+    return changed ? parsed.toString() : rawUrl;
+  } catch {
+    return rawUrl;
+  }
+}
+
 function pushLocalAudit(action, detail = {}, status = 'ok') {
-  localAudit.unshift({ ts: Date.now(), action, detail, status });
+  const safeDetail =
+    detail && typeof detail === 'object'
+      ? {
+          ...detail,
+          ...(typeof detail.url === 'string' ? { url: redactAuditUrl(detail.url) } : {})
+        }
+      : detail;
+  localAudit.unshift({ ts: Date.now(), action, detail: safeDetail, status });
   if (localAudit.length > 40) localAudit.length = 40;
 }
 
@@ -321,16 +349,18 @@ async function connectWebSocket() {
     return;
   }
 
-  const wsUrl = `ws://${bridgeConfig.host}:${bridgeConfig.port}/ws/extension?token=${encodeURIComponent(bridgeConfig.token)}`;
+  const wsUrl = `ws://${bridgeConfig.host}:${bridgeConfig.port}/ws/extension`;
   try {
     const sock = new WebSocket(wsUrl);
     ws = sock;
 
     sock.addEventListener('open', () => {
       if (ws !== sock) return;
+      // First-frame token auth avoids placing the pairing token in WebSocket URL query strings
       sock.send(
         JSON.stringify({
-          type: 'hello',
+          type: 'auth',
+          token: bridgeConfig.token,
           version: EXT_VERSION,
           tabs: serializeTabs(),
           customBlockedDomains
@@ -1047,24 +1077,7 @@ async function executeBridgeRpc(method, params) {
 
   if (method === 'remote_interact') {
     const entry = resolveTargetEntry(params.tabId);
-    const liveTab = await chrome.tabs.get(entry.tabId);
-    entry.title = liveTab.title || '';
-    entry.url = liveTab.url || '';
-    const safety = checkTabUrlAllowed(entry.url);
-    if (!safety.allowed) {
-      await detachManagedTab(entry.tabId, safety.reason, true);
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify({
-            type: 'guardrail_trip',
-            tabId: entry.tabId,
-            url: entry.url,
-            reason: safety.reason
-          })
-        );
-      }
-      throw new Error(`[GUARDRAIL] Detached tab because it navigated to ${safety.reason}`);
-    }
+    await assertTabReadyForAction(entry);
     const kind = String(params.kind || 'click');
 
     if (kind === 'click') {

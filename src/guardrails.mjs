@@ -52,12 +52,33 @@ export const DEFAULT_BLOCKED_DOMAINS = Object.freeze([
 ]);
 
 const CHECKOUT_PATH_PATTERNS = [
-  /\/checkout(?:\/|$)/i,
-  /\/payment(?:s)?(?:\/|$)/i,
-  /\/cashier(?:\/|$)/i,
-  /\/billing\/pay(?:\/|$)/i,
-  /\/wallet\/transfer(?:\/|$)/i
+  /\/checkout(?:\/|\?|$|#)/i,
+  /\/pay(?:ment(?:s)?)?(?:\/|\?|$|#)/i,
+  /\/cashier(?:\/|\?|$|#)/i,
+  /\/billing(?:\/|\?|$|#)/i,
+  /\/wallet\/transfer(?:\/|\?|$|#)/i
 ];
+
+const AUDIT_SENSITIVE_PARAM_RX =
+  /^(?:token|access_token|id_token|refresh_token|auth.*|code|state|sig|signature|key|api_key|secret|password|session.*)$/i;
+
+export function redactUrlForAudit(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return rawUrl;
+  try {
+    const parsed = new URL(rawUrl.trim());
+    if (!parsed.search) return parsed.toString();
+    let mutated = false;
+    for (const [k] of parsed.searchParams.entries()) {
+      if (AUDIT_SENSITIVE_PARAM_RX.test(k)) {
+        parsed.searchParams.set(k, 'REDACTED');
+        mutated = true;
+      }
+    }
+    return mutated ? parsed.toString() : rawUrl;
+  } catch {
+    return rawUrl;
+  }
+}
 
 export function evaluateUrlSafety(rawUrl, customBlockedDomains = []) {
   if (!rawUrl || typeof rawUrl !== 'string') {

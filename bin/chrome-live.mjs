@@ -142,7 +142,13 @@ function writeExtensionLocalRuntimeConfig(token) {
     port: DEFAULT_PORT,
     token
   };
-  fs.writeFileSync(runtimeFile, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+  fs.writeFileSync(runtimeFile, `${JSON.stringify(data, null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600
+  });
+  try {
+    fs.chmodSync(runtimeFile, 0o600);
+  } catch {}
   return runtimeFile;
 }
 

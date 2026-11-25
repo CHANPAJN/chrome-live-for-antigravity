@@ -331,6 +331,9 @@ export function learnInteractionSelector({ url, label, selector } = {}) {
 
 export function saveManualPlaybook({ domain: rawDomain, route, tip, tipIndex, selector } = {}) {
   const store = loadStore();
+  if (!store.enabled) {
+    throw new Error('Site Playbooks are disabled; enable them before saving entries');
+  }
   const domain = normalizeDomain(rawDomain);
   if (!domain) {
     throw new Error('Invalid domain for playbook entry');

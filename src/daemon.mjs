@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { URL, fileURLToPath } from 'node:url';
-import { evaluateUploadFileSafety, evaluateUrlSafety } from './guardrails.mjs';
+import { evaluateUploadFileSafety, evaluateUrlSafety, redactUrlForAudit } from './guardrails.mjs';
 import {
   clearPlaybooks,
   deletePlaybookItem,
@@ -142,12 +142,19 @@ export function createDaemonServer(options = {}) {
   }
 
   function recordAudit(action, detail = {}, status = 'ok') {
+    const safeDetail =
+      detail && typeof detail === 'object'
+        ? {
+            ...detail,
+            ...(typeof detail.url === 'string' ? { url: redactUrlForAudit(detail.url) } : {})
+          }
+        : detail;
     const entry = {
       id: crypto.randomUUID(),
       ts: Date.now(),
       action,
       status,
-      detail
+      detail: safeDetail
     };
     auditLog.unshift(entry);
     if (auditLog.length > MAX_AUDIT_ENTRIES) {
@@ -198,15 +205,18 @@ export function createDaemonServer(options = {}) {
     }
   }
 
-  function checkAuthorized(req, parsedUrl) {
-    const headerToken =
+  function extractHeaderToken(req) {
+    return String(
       req.headers['x-chrome-live-token'] ||
-      (req.headers.authorization?.startsWith('Bearer ')
-        ? req.headers.authorization.slice(7)
-        : '');
-    const queryToken = parsedUrl.searchParams.get('token') || '';
-    const candidate = String(headerToken || queryToken || '');
-    return timingSafeEqualToken(candidate, authToken);
+        (req.headers.authorization?.startsWith('Bearer ')
+          ? req.headers.authorization.slice(7)
+          : '') ||
+        ''
+    );
+  }
+
+  function checkAuthorized(req) {
+    return timingSafeEqualToken(extractHeaderToken(req), authToken);
   }
 
   function sendJson(req, res, statusCode, bodyObj) {
@@ -313,6 +323,16 @@ export function createDaemonServer(options = {}) {
       try {
         if (method === 'upload') {
           prepareUploadParams(params);
+        } else if (method === 'extract' && Array.isArray(params.urls)) {
+          for (const rawUrl of params.urls) {
+            const urlStr = String(rawUrl || '');
+            const safety = evaluateUrlSafety(urlStr, state.customBlockedDomains);
+            if (!safety.allowed) {
+              recordAudit('extract', { url: urlStr, code: safety.code }, 'blocked');
+              reject(new Error(`[GUARDRAIL:${safety.code}] ${safety.reason}`));
+              return;
+            }
+          }
         } else if (method === 'batch' && Array.isArray(params.steps)) {
           for (const step of params.steps) {
             if (!step || typeof step !== 'object') continue;
@@ -579,57 +599,66 @@ export function createDaemonServer(options = {}) {
     }
 
     const parsedUrl = new URL(req.url || '/', `http://127.0.0.1:${boundPort}`);
-    if (!checkAuthorized(req, parsedUrl)) {
+    if (parsedUrl.searchParams.has('token')) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;
     }
 
     const pathname = parsedUrl.pathname;
-    if (pathname === '/ws/extension') {
-      const peer = upgradeHttpToWebSocket(req, socket, head);
-      if (!peer) return;
-
-      if (extensionPeer && !extensionPeer.closed) {
-        extensionPeer.close(1000, 'Replaced by newer extension connection');
-      }
-      extensionPeer = peer;
-      state.extensionConnected = true;
-      state.connectedAt = Date.now();
-      state.updatedAt = Date.now();
-      recordAudit('extension_connected', {});
-      broadcastToLivePeers({ type: 'state', snapshot: buildPublicSnapshot() });
-
-      peer.on('error', () => {});
-      peer.on('message', (rawText) => {
-        let msg;
-        try {
-          msg = JSON.parse(rawText);
-        } catch {
-          return;
-        }
-        handleExtensionMessage(msg);
-      });
-
-      peer.on('close', () => {
-        if (extensionPeer === peer) {
-          extensionPeer = null;
-          state.extensionConnected = false;
-          state.updatedAt = Date.now();
-          for (const [id, entry] of pendingRpc.entries()) {
-            clearTimeout(entry.timer);
-            entry.reject(new Error('Extension WebSocket disconnected during RPC'));
-            pendingRpc.delete(id);
-          }
-          broadcastToLivePeers({ type: 'state', snapshot: buildPublicSnapshot() });
-        }
-      });
+    if (pathname !== '/ws/extension' && pathname !== '/ws/live') {
+      socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+      socket.destroy();
       return;
     }
 
-    if (pathname === '/ws/live') {
-      const peer = upgradeHttpToWebSocket(req, socket, head);
-      if (!peer) return;
+    const headerToken = extractHeaderToken(req);
+    let preAuthed = false;
+    if (headerToken) {
+      if (!timingSafeEqualToken(headerToken, authToken)) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      preAuthed = true;
+    }
+
+    const peer = upgradeHttpToWebSocket(req, socket, head, { requireMask: true });
+    if (!peer) return;
+    peer.on('error', () => {});
+
+    const attachAuthenticatedPeer = (authPayload = null) => {
+      if (pathname === '/ws/extension') {
+        if (extensionPeer && !extensionPeer.closed) {
+          extensionPeer.close(1000, 'Replaced by newer extension connection');
+        }
+        extensionPeer = peer;
+        state.extensionConnected = true;
+        state.connectedAt = Date.now();
+        state.updatedAt = Date.now();
+        recordAudit('extension_connected', {});
+        if (authPayload) {
+          handleExtensionMessage({ ...authPayload, type: 'hello' });
+        } else {
+          broadcastToLivePeers({ type: 'state', snapshot: buildPublicSnapshot() });
+        }
+
+        peer.on('close', () => {
+          if (extensionPeer === peer) {
+            extensionPeer = null;
+            state.extensionConnected = false;
+            state.updatedAt = Date.now();
+            for (const [id, entry] of pendingRpc.entries()) {
+              clearTimeout(entry.timer);
+              entry.reject(new Error('Extension WebSocket disconnected during RPC'));
+              pendingRpc.delete(id);
+            }
+            broadcastToLivePeers({ type: 'state', snapshot: buildPublicSnapshot() });
+          }
+        });
+        return;
+      }
+
       liveViewPeers.add(peer);
       peer.sendJson({ type: 'state', snapshot: buildPublicSnapshot() });
       if (state.latestFrame && state.latestFrame.buffer) {
@@ -644,15 +673,54 @@ export function createDaemonServer(options = {}) {
           capturedAt: state.latestFrame.capturedAt
         });
       }
-      peer.on('error', () => {});
       peer.on('close', () => {
         liveViewPeers.delete(peer);
       });
-      return;
+    };
+
+    let authenticated = preAuthed;
+    let authTimer = null;
+    if (authenticated) {
+      attachAuthenticatedPeer(null);
+    } else {
+      authTimer = setTimeout(() => {
+        if (!authenticated && !peer.closed) {
+          peer.close(4001, 'Authentication timeout');
+        }
+      }, 3000);
+      authTimer.unref();
+      peer.on('close', () => {
+        if (authTimer) clearTimeout(authTimer);
+      });
     }
 
-    socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
-    socket.destroy();
+    peer.on('message', (rawText) => {
+      let msg;
+      try {
+        msg = JSON.parse(rawText);
+      } catch {
+        if (!authenticated) peer.close(4001, 'Invalid auth payload');
+        return;
+      }
+      if (!authenticated) {
+        const candidate = msg && msg.type === 'auth' ? String(msg.token || '') : '';
+        if (!timingSafeEqualToken(candidate, authToken)) {
+          if (authTimer) clearTimeout(authTimer);
+          peer.close(4001, 'Unauthorized');
+          return;
+        }
+        authenticated = true;
+        if (authTimer) {
+          clearTimeout(authTimer);
+          authTimer = null;
+        }
+        attachAuthenticatedPeer(msg);
+        return;
+      }
+      if (pathname === '/ws/extension') {
+        handleExtensionMessage(msg);
+      }
+    });
   });
 
   function handleExtensionMessage(msg) {

@@ -792,7 +792,8 @@ export function buildInlineMonitorHtml() {
         if (primary) {
           titleEl.textContent = primary.title || 'Chrome Live';
           subEl.textContent = primary.activity || primary.url || L.active;
-          remoteBtn.disabled = false;
+          remoteBtn.disabled = isPaused;
+          if (isPaused && interactionMode === 'remote') setMode('watch');
           regionBtn.disabled = false;
           attachBtn.disabled = false;
           relayBtn.disabled = false;

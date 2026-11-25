@@ -31,21 +31,24 @@ function collectSourceFiles(dir, out = []) {
   return out;
 }
 
-function connectTestWsClient(port, routePath, token) {
+function connectTestWsClient(port, routePath, token, { authMode = 'first-frame' } = {}) {
   return new Promise((resolve, reject) => {
     const secKey = crypto.randomBytes(16).toString('base64');
     const expectedAccept = computeWebSocketAccept(secKey);
     const socket = net.createConnection({ host: '127.0.0.1', port }, () => {
-      const reqLines = [
-        `GET ${routePath}?token=${encodeURIComponent(token)} HTTP/1.1`,
+      const headers = [
+        `GET ${routePath} HTTP/1.1`,
         `Host: 127.0.0.1:${port}`,
         'Upgrade: websocket',
         'Connection: Upgrade',
         `Sec-WebSocket-Key: ${secKey}`,
-        'Sec-WebSocket-Version: 13',
-        '\r\n'
-      ].join('\r\n');
-      socket.write(reqLines);
+        'Sec-WebSocket-Version: 13'
+      ];
+      if (authMode === 'header' && token) {
+        headers.push(`X-Chrome-Live-Token: ${token}`);
+      }
+      headers.push('\r\n');
+      socket.write(headers.join('\r\n'));
     });
 
     let headerBuf = Buffer.alloc(0);
@@ -68,6 +71,9 @@ function connectTestWsClient(port, routePath, token) {
         socket.write(encodeWsFrame(0x01, Buffer.from(JSON.stringify(obj), 'utf8'), true));
       };
       if (rest.length > 0) peer._onData(rest);
+      if (authMode === 'first-frame' && token) {
+        peer.sendMaskedJson({ type: 'auth', token, version: '1.0.0', tabs: [] });
+      }
       resolve(peer);
     }
 
@@ -805,4 +811,113 @@ test('Multi-tab concurrency & form-state regressions: per-tab frame isolation, A
   assert.match(cliSource, /if \(cmd === 'release'\)/);
   assert.match(cliSource, /function formatSnapshotElementLine/);
   assert.match(cliSource, /function formatAlertsBlock/);
+});
+
+test('Security audit hardening: paused remote_interact guard, extract daemon guardrail, first-frame WS auth, RFC 6455 masking, audit redaction & /pay /billing routes', async () => {
+  // 1. Standalone /pay and /billing routes are blocked without false positives on /payload or /billing-docs
+  assert.equal(evaluateUrlSafety('https://shop.example.com/pay').allowed, false);
+  assert.equal(evaluateUrlSafety('https://shop.example.com/pay?order=1').allowed, false);
+  assert.equal(evaluateUrlSafety('https://cloud.example.com/billing').allowed, false);
+  assert.equal(evaluateUrlSafety('https://cloud.example.com/#/billing/invoices').allowed, false);
+  assert.equal(evaluateUrlSafety('https://docs.example.com/payload').allowed, true);
+  assert.equal(evaluateUrlSafety('https://docs.example.com/billing-docs').allowed, true);
+
+  // 2. Live daemon integration checks
+  const prevHome = process.env.CHROME_LIVE_HOME;
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-sec-audit-'));
+  process.env.CHROME_LIVE_HOME = tempHome;
+  const testToken = crypto.randomBytes(32).toString('hex');
+  const daemon = createDaemonServer({ host: '127.0.0.1', port: 0, token: testToken });
+  const port = await daemon.listen();
+
+  try {
+    // 2a. Query-string ?token= must be rejected on both HTTP and WS
+    const httpQueryAuth = await httpJson(port, 'GET', `/api/health?token=${encodeURIComponent(testToken)}`);
+    assert.equal(httpQueryAuth.statusCode, 401);
+    await assert.rejects(
+      () => connectTestWsClient(port, `/ws/extension?token=${encodeURIComponent(testToken)}`, testToken, { authMode: 'none' }),
+      /401/
+    );
+
+    // 2b. WS first-frame auth rejects wrong token without hijacking extensionPeer
+    const badAuthWs = await connectTestWsClient(port, '/ws/extension', '', { authMode: 'none' });
+    const badClosed = new Promise((resolve) => badAuthWs.on('close', resolve));
+    badAuthWs.sendMaskedJson({ type: 'auth', token: 'wrong-token' });
+    await badClosed;
+    assert.equal(badAuthWs.closed, true);
+
+    // 2c. RFC 6455: Unmasked client WS frame must be rejected by server with protocol error close
+    const unmaskedWs = await connectTestWsClient(port, '/ws/extension', testToken, { authMode: 'header' });
+    const unmaskedClosed = new Promise((resolve) => unmaskedWs.on('close', resolve));
+    unmaskedWs.socket.write(encodeWsFrame(0x01, Buffer.from('{"type":"hello"}', 'utf8'), false));
+    await unmaskedClosed;
+    assert.equal(unmaskedWs.closed, true);
+
+    // 2d. Valid first-frame auth connects extensionPeer cleanly
+    const extWs = await connectTestWsClient(port, '/ws/extension', testToken, { authMode: 'first-frame' });
+    await new Promise((r) => setTimeout(r, 40));
+
+    extWs.on('message', (txt) => {
+      const msg = JSON.parse(txt);
+      if (msg.type === 'rpc_request') {
+        extWs.sendMaskedJson({ type: 'rpc_response', id: msg.id, ok: true, result: { ok: true } });
+      }
+    });
+
+    // 2e. Daemon-level guardrail blocks protected URLs inside extract's urls array before reaching extension
+    const blockedExtract = await httpJson(
+      port,
+      'POST',
+      '/api/command',
+      { 'X-Chrome-Live-Token': testToken },
+      {
+        method: 'extract',
+        params: { urls: ['https://example.com/article', 'https://checkout.stripe.com/c/pay/123'] }
+      }
+    );
+    assert.equal(blockedExtract.statusCode, 500);
+    assert.match(blockedExtract.json.error, /GUARDRAIL:SENSITIVE_DOMAIN/);
+
+    // 2f. Daemon audit log redacts sensitive query params in stored URLs
+    const okOpen = await httpJson(
+      port,
+      'POST',
+      '/api/command',
+      { 'X-Chrome-Live-Token': testToken },
+      { method: 'open', params: { url: 'https://example.com/cb?page=2&token=supersecret&code=oauth123' } }
+    );
+    assert.equal(okOpen.statusCode, 200);
+    const health = await httpJson(port, 'GET', '/api/health', { 'X-Chrome-Live-Token': testToken });
+    const openAudit = health.json.recentAudit.find((a) => a.action === 'open');
+    assert.ok(openAudit && typeof openAudit.detail.url === 'string');
+    assert.ok(!openAudit.detail.url.includes('supersecret'), 'Audit log must redact token param');
+    assert.ok(!openAudit.detail.url.includes('oauth123'), 'Audit log must redact code param');
+    assert.ok(openAudit.detail.url.includes('page=2'), 'Audit log preserves benign query params');
+
+    // 2g. Playbook manual save is refused while playbooks are disabled
+    const saveWhileOff = await httpJson(
+      port,
+      'POST',
+      '/api/playbook',
+      { 'X-Chrome-Live-Token': testToken },
+      { action: 'save', domain: 'example.com', tip: 'Should not persist while disabled' }
+    );
+    assert.equal(saveWhileOff.statusCode, 500);
+    assert.match(saveWhileOff.json.error, /disabled/i);
+
+    extWs.socket.destroy();
+  } finally {
+    await daemon.close();
+    if (prevHome === undefined) delete process.env.CHROME_LIVE_HOME;
+    else process.env.CHROME_LIVE_HOME = prevHome;
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+
+  // 3. Extension remote_interact enforces assertTabReadyForAction (paused + HUD sync + guardrail)
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+  assert.match(
+    swSource,
+    /if \(method === 'remote_interact'\) \{\s*const entry = resolveTargetEntry\(params\.tabId\);\s*await assertTabReadyForAction\(entry\);/
+  );
+  assert.ok(!swSource.includes('/ws/extension?token='), 'Extension WS must not pass token in query string');
 });

@@ -54,10 +54,11 @@ export function encodeWsFrame(opcode, payloadBuffer, mask = false) {
 }
 
 export class NativeWsPeer extends EventEmitter {
-  constructor(socket, { maxPayloadBytes = 16 * 1024 * 1024 } = {}) {
+  constructor(socket, { maxPayloadBytes = 16 * 1024 * 1024, requireMask = false } = {}) {
     super();
     this.socket = socket;
     this.maxPayloadBytes = maxPayloadBytes;
+    this.requireMask = Boolean(requireMask);
     this.closed = false;
     this._buffer = Buffer.alloc(0);
     this._fragments = [];
@@ -136,6 +137,10 @@ export class NativeWsPeer extends EventEmitter {
       const fin = (first & 0x80) !== 0;
       const opcode = first & 0x0f;
       const masked = (second & 0x80) !== 0;
+      if (this.requireMask && !masked) {
+        this.close(1002, 'Client frames must be masked per RFC 6455');
+        return;
+      }
       let payloadLen = second & 0x7f;
       let offset = 2;
 
@@ -259,7 +264,7 @@ export class NativeWsPeer extends EventEmitter {
   }
 }
 
-export function upgradeHttpToWebSocket(req, socket, head) {
+export function upgradeHttpToWebSocket(req, socket, head, { requireMask = true } = {}) {
   const key = req.headers['sec-websocket-key'];
   if (!key || typeof key !== 'string') {
     socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
@@ -276,7 +281,7 @@ export function upgradeHttpToWebSocket(req, socket, head) {
   ].join('\r\n');
 
   socket.write(responseHeaders);
-  const peer = new NativeWsPeer(socket);
+  const peer = new NativeWsPeer(socket, { requireMask });
   if (head && head.length > 0) {
     peer._onData(head);
   }
