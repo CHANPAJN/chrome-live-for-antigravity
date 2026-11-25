@@ -143,6 +143,22 @@ node ./bin/chrome-live.mjs done "任务完成"                  # 断开调试�
 - **支付与敏感路径拦截**：内置国内外主流支付、网银、云账单、`chrome://`、`edge://` 及 `/checkout`、`/payment`、`/pay`、`/cashier`、`/billing` 路由拦截；受控页面若跳转到受保护域名会自动断开调试并交还用户。
 - **无客户端修改 & 干净卸载**：不修改 Antigravity 客户端任何文件；关闭式 Shadow DOM、跨源支付 `<iframe>` 与系统文件对话框均受浏览器沙箱隔离不可访问。卸载只需运行 `node ./bin/chrome-live.mjs stop`，在扩展页移除扩展并删除 `~/.chrome-live-antigravity`。
 
+## 隐藏顶部「已开始调试此浏览器」提示条幅
+
+只要扩展挂载了 Chrome 原生 `chrome.debugger` API，Chrome 默认会在窗口顶部显示灰白条幅 `“Chrome Live (for Antigravity)”已开始调试此浏览器 [取消]`（点「取消」会立即断开当前 AI 操控）。
+
+- **默认自动消失**：平时不用手动点取消，任务结束（`done`）或空闲满 18 秒后扩展会自动卸载调试器，条幅随之消失。
+- **彻底隐藏条幅（推荐）**：完全退出 Chrome 后，给浏览器加上官方启动参数 `--silent-debugger-extension-api` 即可不再弹出：
+  - **Windows**：右键桌面上或任务栏里的 Chrome 快捷方式 → **属性** → 在「目标」末尾引号**外面**加一个空格和 `--silent-debugger-extension-api`，确定后重启 Chrome：
+    ```text
+    "C:\Program Files\Google\Chrome\Application\chrome.exe" --silent-debugger-extension-api
+    ```
+  - **macOS**：先彻底退出 Chrome（`Cmd + Q`），在终端运行：
+    ```bash
+    open -b com.google.Chrome --args --silent-debugger-extension-api
+    ```
+  - **Linux**：命令行运行 `google-chrome --silent-debugger-extension-api`，或在 `~/.local/share/applications/` 对应的 `.desktop` 文件的 `Exec=` 末尾追加该参数。
+
 ## 测试
 
 ```bash

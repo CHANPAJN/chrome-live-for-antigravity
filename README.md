@@ -143,6 +143,22 @@ node ./bin/chrome-live.mjs done "Task complete"            # Detach debugger & c
 - **Financial & internal-page guardrails**: Blocks payment gateways, banking portals, cloud billing consoles, `chrome://`/`edge://`, and `/checkout`, `/payment`, `/pay`, `/cashier`, `/billing` paths locally. If a controlled tab redirects to a protected domain, the debugger detaches immediately.
 - **No host binary patching & clean uninstall**: Never touches Antigravity binaries; closed Shadow DOM, cross-origin payment `<iframe>` elements, and native OS file dialogs stay isolated by the browser sandbox. To uninstall, run `node ./bin/chrome-live.mjs stop`, remove the extension in Chrome, and delete `~/.chrome-live-antigravity`.
 
+## Hiding the "started debugging this browser" Banner
+
+Whenever an extension attaches Chrome's native `chrome.debugger` API, Chrome displays a top infobar saying `"Chrome Live (for Antigravity)" started debugging this browser [Cancel]` (clicking **Cancel** immediately detaches AI control).
+
+- **Auto-dismiss by default**: You do not need to click Cancel—the extension detaches automatically on `done` or after 18 seconds of idle time, and the bar disappears on its own.
+- **Suppress permanently (optional)**: Fully quit Chrome and launch it with Chromium's built-in `--silent-debugger-extension-api` flag:
+  - **Windows**: Right-click your Chrome shortcut (Desktop or Taskbar) → **Properties** → append a space and `--silent-debugger-extension-api` **outside** the closing quote in **Target**, then restart Chrome:
+    ```text
+    "C:\Program Files\Google\Chrome\Application\chrome.exe" --silent-debugger-extension-api
+    ```
+  - **macOS**: Quit Chrome completely (`Cmd + Q`) and launch via Terminal:
+    ```bash
+    open -b com.google.Chrome --args --silent-debugger-extension-api
+    ```
+  - **Linux**: Run `google-chrome --silent-debugger-extension-api`, or append the flag to the `Exec=` line in your `.desktop` launcher under `~/.local/share/applications/`.
+
 ## Tests
 
 ```bash
