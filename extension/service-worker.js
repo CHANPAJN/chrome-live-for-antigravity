@@ -196,16 +196,31 @@ let activeExtractJobs = 0;
 
 const LOCAL_AUDIT_SENSITIVE_PARAM_RX =
   /^(?:token|access_token|id_token|refresh_token|auth.*|code|state|sig|signature|key|api_key|secret|password|session.*)$/i;
+const LOCAL_HASH_SENSITIVE_PAIR_RX =
+  /([#?&])(token|access_token|id_token|refresh_token|auth[a-z0-9_.-]*|code|state|sig|signature|key|api_key|secret|password|session[a-z0-9_.-]*)=([^&#]*)/gi;
 
 function redactAuditUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return rawUrl;
   try {
     const parsed = new URL(rawUrl.trim());
-    if (!parsed.search) return parsed.toString();
     let changed = false;
-    for (const [k] of parsed.searchParams.entries()) {
-      if (LOCAL_AUDIT_SENSITIVE_PARAM_RX.test(k)) {
-        parsed.searchParams.set(k, 'REDACTED');
+    if (parsed.username || parsed.password) {
+      parsed.username = '';
+      parsed.password = '';
+      changed = true;
+    }
+    if (parsed.search) {
+      for (const [k] of parsed.searchParams.entries()) {
+        if (LOCAL_AUDIT_SENSITIVE_PARAM_RX.test(k)) {
+          parsed.searchParams.set(k, 'REDACTED');
+          changed = true;
+        }
+      }
+    }
+    if (parsed.hash) {
+      const cleanedHash = parsed.hash.replace(LOCAL_HASH_SENSITIVE_PAIR_RX, '$1$2=REDACTED');
+      if (cleanedHash !== parsed.hash) {
+        parsed.hash = cleanedHash;
         changed = true;
       }
     }
@@ -1135,14 +1150,18 @@ async function execScriptBounded(tabId, scriptOptions, timeoutMs = 6500) {
   }
 }
 
-async function assertTabReadyForAction(entry) {
-  await pollHudUserEvents(entry.tabId, entry);
-  if (!managedTabs.has(entry.tabId)) {
-    throw new Error('Tab was released by user');
+function assertStillActiveAndUnpaused(entry) {
+  if (!entry || !managedTabs.has(entry.tabId)) {
+    throw new Error('Aborted: tab was released by user');
   }
   if (entry.paused) {
-    throw new Error('Tab automation is currently paused by user in the HUD');
+    throw new Error('Aborted: tab automation is currently paused by user');
   }
+}
+
+async function assertTabReadyForAction(entry) {
+  await pollHudUserEvents(entry.tabId, entry);
+  assertStillActiveAndUnpaused(entry);
   const liveTab = await chrome.tabs.get(entry.tabId);
   if (liveTab.discarded) {
     await chrome.tabs.reload(entry.tabId).catch(() => {});
@@ -1164,6 +1183,43 @@ async function assertTabReadyForAction(entry) {
       );
     }
     throw new Error(`[GUARDRAIL] Detached tab because it navigated to ${safety.reason}`);
+  }
+
+  // Also inspect visible embedded <iframe> sources so modal payment/checkout embeds auto-detach immediately
+  const iframeRes = await runHudScriptSafe(entry.tabId, {
+    func: () => {
+      const urls = [];
+      for (const frame of document.querySelectorAll('iframe[src]')) {
+        const src = frame.src || frame.getAttribute('src') || '';
+        if (!/^https?:/i.test(src)) continue;
+        const st = window.getComputedStyle(frame);
+        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
+        const rc = frame.getBoundingClientRect();
+        if (rc.width >= 80 && rc.height >= 80) urls.push(src);
+      }
+      return urls;
+    }
+  });
+  const embeddedUrls = iframeRes?.[0]?.result;
+  if (Array.isArray(embeddedUrls)) {
+    for (const fUrl of embeddedUrls) {
+      const fSafety = checkTabUrlAllowed(fUrl);
+      if (!fSafety.allowed) {
+        const reason = `Embedded payment/protected iframe: ${fSafety.reason}`;
+        await detachManagedTab(entry.tabId, reason, true);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(
+            JSON.stringify({
+              type: 'guardrail_trip',
+              tabId: entry.tabId,
+              url: redactAuditUrl(fUrl),
+              reason
+            })
+          );
+        }
+        throw new Error(`[GUARDRAIL] Detached tab due to ${reason}`);
+      }
+    }
   }
 }
 
@@ -1189,13 +1245,6 @@ async function waitForTabComplete(tabId, timeoutMs = 15000) {
 async function executeBridgeRpc(method, params) {
   pushLocalAudit(method, { tabId: params.tabId, url: params.url, label: params.label });
 
-  if (method === 'reload_extension') {
-    setTimeout(() => {
-      chrome.runtime.reload();
-    }, 80);
-    return { reloading: true };
-  }
-
   if (method === 'share_active') {
     throw new Error(
       'Sharing an existing signed-in tab requires explicit user confirmation in Chrome (press Alt+Shift+L or click "Share Current Tab" in the extension panel).'
@@ -1204,6 +1253,7 @@ async function executeBridgeRpc(method, params) {
 
   if (method === 'focus_tab') {
     const entry = resolveTargetEntry(params.tabId);
+    await assertTabReadyForAction(entry);
     const tab = await chrome.tabs.update(entry.tabId, { active: true });
     if (tab && typeof tab.windowId === 'number') {
       await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
@@ -1250,6 +1300,25 @@ async function executeBridgeRpc(method, params) {
         args: [rx, ry]
       });
       const vp = vpRes?.[0]?.result || { px: 640, py: 400, hidden: false };
+      const restoreRemoteShield = async () => {
+        await chrome.scripting
+          .executeScript({
+            target: { tabId: entry.tabId },
+            injectImmediately: true,
+            func: () => {
+              const ctrl = window.__chromeLiveHudController__;
+              if (ctrl?.shieldEl) ctrl.shieldEl.style.pointerEvents = '';
+            }
+          })
+          .catch(() => {});
+      };
+
+      await pollHudUserEvents(entry.tabId, entry);
+      if (!managedTabs.has(entry.tabId) || entry.paused) {
+        await restoreRemoteShield();
+        assertStillActiveAndUnpaused(entry);
+      }
+
       let hitViaCdp = false;
       if (!vp.hidden) {
         try {
@@ -1259,6 +1328,7 @@ async function executeBridgeRpc(method, params) {
             x: vp.px,
             y: vp.py
           });
+          assertStillActiveAndUnpaused(entry);
           await chrome.debugger.sendCommand({ tabId: entry.tabId }, 'Input.dispatchMouseEvent', {
             type: 'mousePressed',
             x: vp.px,
@@ -1268,6 +1338,7 @@ async function executeBridgeRpc(method, params) {
             clickCount: 1
           });
           await new Promise((r) => setTimeout(r, 52));
+          assertStillActiveAndUnpaused(entry);
           await chrome.debugger.sendCommand({ tabId: entry.tabId }, 'Input.dispatchMouseEvent', {
             type: 'mouseReleased',
             x: vp.px,
@@ -1277,10 +1348,26 @@ async function executeBridgeRpc(method, params) {
             clickCount: 1
           });
           hitViaCdp = true;
-        } catch {}
+        } catch {
+          await pollHudUserEvents(entry.tabId, entry);
+          if (!managedTabs.has(entry.tabId) || entry.paused) {
+            await restoreRemoteShield();
+            assertStillActiveAndUnpaused(entry);
+          }
+        }
       }
+
+      await pollHudUserEvents(entry.tabId, entry);
+      if (!managedTabs.has(entry.tabId) || entry.paused) {
+        await restoreRemoteShield();
+        assertStillActiveAndUnpaused(entry);
+      }
+
       await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
           func: (px, py, usedCdp) => {
+            const ctrl = window.__chromeLiveHudController__;
+            if (ctrl?.shieldEl) ctrl.shieldEl.style.pointerEvents = '';
+            if (ctrl?._state?.mode === 'paused') return;
             if (!usedCdp) {
               const targetEl = document.elementFromPoint(px, py);
               if (targetEl) {
@@ -1288,8 +1375,6 @@ async function executeBridgeRpc(method, params) {
                 targetEl.click?.();
               }
             }
-            const ctrl = window.__chromeLiveHudController__;
-            if (ctrl?.shieldEl) ctrl.shieldEl.style.pointerEvents = '';
           },
           args: [vp.px, vp.py, hitViaCdp]
         })
@@ -1423,9 +1508,34 @@ async function executeBridgeRpc(method, params) {
             tagLower === 'textarea' ||
             tagLower === 'select' ||
             el.isContentEditable;
-          // Never read user-typed .value or editable textContent from input/password/OTP fields
+          // Never read user-typed .value, nested <textarea>/contenteditable drafts, or hidden text
+          const extractCleanText = (rootNode) => {
+            if (!rootNode || typeof rootNode.querySelector !== 'function') return rootNode?.textContent || '';
+            if (
+              !rootNode.querySelector(
+                'textarea, select, input, [contenteditable="true"], [hidden], [aria-hidden="true"], style, script, noscript, template'
+              )
+            ) {
+              return rootNode.textContent || '';
+            }
+            const outParts = [];
+            const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
+            let tn;
+            while ((tn = tw.nextNode())) {
+              const p = tn.parentElement;
+              if (
+                p &&
+                !p.closest(
+                  'textarea, select, input, [contenteditable="true"], [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]'
+                )
+              ) {
+                outParts.push(tn.nodeValue || '');
+              }
+            }
+            return outParts.join(' ');
+          };
           const safeValueLabel = isButtonInput ? el.value || '' : '';
-          const safeTextLabel = isUserValueField ? '' : el.textContent || '';
+          const safeTextLabel = isUserValueField ? '' : extractCleanText(el);
           const rawLabel = (
             el.getAttribute('aria-label') ||
             el.getAttribute('placeholder') ||
@@ -1823,11 +1933,36 @@ async function executeBridgeRpc(method, params) {
             tagLower === 'textarea' ||
             tagLower === 'select' ||
             node.isContentEditable;
-          // Never expose user-entered password/OTP/input values as element labels
+          // Never expose user-entered password/OTP/input values or nested draft text as element labels
+          const extractCleanText = (rootNode) => {
+            if (!rootNode || typeof rootNode.querySelector !== 'function') return rootNode?.textContent || '';
+            if (
+              !rootNode.querySelector(
+                'textarea, select, input, [contenteditable="true"], [hidden], [aria-hidden="true"], style, script, noscript, template'
+              )
+            ) {
+              return rootNode.textContent || '';
+            }
+            const outParts = [];
+            const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
+            let tn;
+            while ((tn = tw.nextNode())) {
+              const p = tn.parentElement;
+              if (
+                p &&
+                !p.closest(
+                  'textarea, select, input, [contenteditable="true"], [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]'
+                )
+              ) {
+                outParts.push(tn.nodeValue || '');
+              }
+            }
+            return outParts.join(' ');
+          };
           const rawLabel =
             node.getAttribute('aria-label') ||
             node.getAttribute('placeholder') ||
-            (isUserValueField ? '' : node.textContent) ||
+            (isUserValueField ? '' : extractCleanText(node)) ||
             (isButtonInput ? node.value : '') ||
             node.getAttribute('title') ||
             (isSensitiveField ? '(password)' : '') ||
@@ -1910,7 +2045,21 @@ async function executeBridgeRpc(method, params) {
           if (aStyle.display === 'none' || aStyle.visibility === 'hidden' || aStyle.opacity === '0') continue;
           const aRect = aNode.getBoundingClientRect();
           if (aRect.width < 4 || aRect.height < 4) continue;
-          const txt = String(aNode.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 140);
+          const cleanAlertParts = [];
+          const aWalker = document.createTreeWalker(aNode, NodeFilter.SHOW_TEXT);
+          let aTn;
+          while ((aTn = aWalker.nextNode())) {
+            const ap = aTn.parentElement;
+            if (
+              ap &&
+              !ap.closest(
+                'textarea, select, input, [contenteditable="true"], [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]'
+              )
+            ) {
+              cleanAlertParts.push(aTn.nodeValue || '');
+            }
+          }
+          const txt = cleanAlertParts.join(' ').replace(/\s+/g, ' ').trim().slice(0, 140);
           if (txt && txt.length >= 2) alertSet.add(txt);
         }
         const alerts = Array.from(alertSet);
@@ -2016,6 +2165,32 @@ async function executeBridgeRpc(method, params) {
           return acc;
         }
 
+        function extractCleanContainerText(rootNode) {
+          if (!rootNode || typeof rootNode.querySelector !== 'function') return rootNode?.textContent || '';
+          if (
+            !rootNode.querySelector(
+              'textarea, select, input, [contenteditable="true"], [hidden], [aria-hidden="true"], style, script, noscript, template'
+            )
+          ) {
+            return rootNode.textContent || '';
+          }
+          const outParts = [];
+          const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
+          let tn;
+          while ((tn = tw.nextNode())) {
+            const p = tn.parentElement;
+            if (
+              p &&
+              !p.closest(
+                'textarea, select, input, [contenteditable="true"], [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]'
+              )
+            ) {
+              outParts.push(tn.nodeValue || '');
+            }
+          }
+          return outParts.join(' ');
+        }
+
         let el = null;
         if (typeof tgt === 'number') {
           el = queryDeep(document, `[data-clive-idx="${tgt}"]`);
@@ -2041,7 +2216,7 @@ async function executeBridgeRpc(method, params) {
               const iBtn = iTag === 'input' && /^(?:button|submit|reset)$/i.test(String(item.type || ''));
               const iUserVal = (iTag === 'input' && !iBtn) || iTag === 'textarea' || iTag === 'select' || item.isContentEditable;
               const txt = (
-                (iUserVal ? '' : item.textContent) ||
+                (iUserVal ? '' : extractCleanContainerText(item)) ||
                 (iBtn ? item.value : '') ||
                 item.getAttribute('aria-label') ||
                 item.getAttribute('title') ||
@@ -2075,12 +2250,37 @@ async function executeBridgeRpc(method, params) {
           elTagLower === 'textarea' ||
           elTagLower === 'select' ||
           el.isContentEditable;
-        // Never leak user-entered password/OTP/input values in disabled errors or click receipts
+        const extractSafeNodeText = (rootNode) => {
+          if (!rootNode || typeof rootNode.querySelector !== 'function') return rootNode?.textContent || '';
+          if (
+            !rootNode.querySelector(
+              'textarea, select, input, [contenteditable="true"], [hidden], [aria-hidden="true"], style, script, noscript, template'
+            )
+          ) {
+            return rootNode.textContent || '';
+          }
+          const outParts = [];
+          const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
+          let tn;
+          while ((tn = tw.nextNode())) {
+            const p = tn.parentElement;
+            if (
+              p &&
+              !p.closest(
+                'textarea, select, input, [contenteditable="true"], [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]'
+              )
+            ) {
+              outParts.push(tn.nodeValue || '');
+            }
+          }
+          return outParts.join(' ');
+        };
+        // Never leak user-entered password/OTP/input values or nested drafts in disabled errors or click receipts
         const safeElemLabel = (maxLen) =>
           (
             el.getAttribute('aria-label') ||
             el.getAttribute('placeholder') ||
-            (elIsUserValueField ? '' : el.textContent) ||
+            (elIsUserValueField ? '' : extractSafeNodeText(el)) ||
             (elIsButtonInput ? el.value : '') ||
             el.getAttribute('title') ||
             (elIsSensitive ? '(password)' : '') ||
@@ -2180,6 +2380,28 @@ async function executeBridgeRpc(method, params) {
 
     // Dispatch real hardware-level isTrusted:true mouse arc + human dwell press via CDP when visible
     if (out.needHardwareClick) {
+      const cleanupPendingClickInPage = async () => {
+        await chrome.scripting
+          .executeScript({
+            target: { tabId: entry.tabId },
+            injectImmediately: true,
+            func: () => {
+              const ctrl = window.__chromeLiveHudController__;
+              if (ctrl?.shieldEl) ctrl.shieldEl.style.pointerEvents = '';
+              const pending = window.__clivePendingClickEl;
+              delete window.__clivePendingClickEl;
+              if (pending) delete pending.__cliveTrustedReceived;
+            }
+          })
+          .catch(() => {});
+      };
+
+      await pollHudUserEvents(entry.tabId, entry);
+      if (!managedTabs.has(entry.tabId) || entry.paused) {
+        await cleanupPendingClickInPage();
+        assertStillActiveAndUnpaused(entry);
+      }
+
       let cdpDispatched = false;
       try {
         // Temporarily lift shield pointer-events so CDP hit-test lands on the real page element
@@ -2197,6 +2419,7 @@ async function executeBridgeRpc(method, params) {
           [arcX, arcY],
           [out.x, out.y]
         ]) {
+          assertStillActiveAndUnpaused(entry);
           await chrome.debugger.sendCommand({ tabId: entry.tabId }, 'Input.dispatchMouseEvent', {
             type: 'mouseMoved',
             x: mx,
@@ -2204,6 +2427,7 @@ async function executeBridgeRpc(method, params) {
           });
           await new Promise((r) => setTimeout(r, 14 + Math.floor(Math.random() * 16)));
         }
+        assertStillActiveAndUnpaused(entry);
         await chrome.debugger.sendCommand({ tabId: entry.tabId }, 'Input.dispatchMouseEvent', {
           type: 'mousePressed',
           x: out.x,
@@ -2214,6 +2438,7 @@ async function executeBridgeRpc(method, params) {
         });
         // Human finger press-to-release dwell: 45ms ~ 98ms
         await new Promise((r) => setTimeout(r, 45 + Math.floor(Math.random() * 54)));
+        assertStillActiveAndUnpaused(entry);
         await chrome.debugger.sendCommand({ tabId: entry.tabId }, 'Input.dispatchMouseEvent', {
           type: 'mouseReleased',
           x: out.x,
@@ -2223,7 +2448,19 @@ async function executeBridgeRpc(method, params) {
           clickCount: 1
         });
         cdpDispatched = true;
-      } catch {}
+      } catch {
+        await pollHudUserEvents(entry.tabId, entry);
+        if (!managedTabs.has(entry.tabId) || entry.paused) {
+          await cleanupPendingClickInPage();
+          assertStillActiveAndUnpaused(entry);
+        }
+      }
+
+      await pollHudUserEvents(entry.tabId, entry);
+      if (!managedTabs.has(entry.tabId) || entry.paused) {
+        await cleanupPendingClickInPage();
+        assertStillActiveAndUnpaused(entry);
+      }
 
       await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
           func: (didCdp) => {
@@ -2232,7 +2469,7 @@ async function executeBridgeRpc(method, params) {
             const pending = window.__clivePendingClickEl;
             delete window.__clivePendingClickEl;
             if (pending) {
-              if (!didCdp || !pending.__cliveTrustedReceived) {
+              if (ctrl?._state?.mode !== 'paused' && (!didCdp || !pending.__cliveTrustedReceived)) {
                 pending.click();
               }
               delete pending.__cliveTrustedReceived;
@@ -2357,6 +2594,9 @@ async function executeBridgeRpc(method, params) {
         if (ctrl && typeof ctrl.moveCursor === 'function') {
           ctrl.moveCursor({ x: cx, y: cy, kind: 'type', press: true });
           await new Promise((r) => setTimeout(r, 210 + Math.floor(Math.random() * 60)));
+        }
+        if (ctrl?._state?.mode === 'paused') {
+          return { ok: false, error: 'Aborted: tab automation was paused by user' };
         }
 
         el.focus();

@@ -842,13 +842,22 @@ test('MCP stdio server isolates model-visible monitor from app-only UI actions, 
     const appHtml = resRead.result.contents[0].text;
     assert.match(appHtml, /ui\/initialize/);
     assert.match(appHtml, /pinnedTabClosed/);
-    const secretMatch = appHtml.match(/const UI_SECRET = "([0-9a-f]{64})";/);
-    assert.ok(secretMatch, 'Expected 256-bit UI capability secret inside sandboxed iframe HTML');
-    const uiSecret = secretMatch[1];
+    assert.equal(
+      /[0-9a-f]{64}/i.test(appHtml),
+      false,
+      'resources/read static HTML MUST NOT contain any 256-bit secret readable via model read_resource'
+    );
 
     const monitorCall = await rpc(4, 'tools/call', { name: 'chrome_live_monitor', arguments: { tabId: 77 } });
     assert.ok(monitorCall.result.structuredContent.frameDataUrl.startsWith('data:image/jpeg;base64,'));
     assert.equal(monitorCall.result.structuredContent.frameTabId, 77);
+    const uiSecret = monitorCall.result.structuredContent.uiSecret;
+    assert.match(uiSecret, /^[0-9a-f]{64}$/, 'Expected 256-bit uiSecret inside structuredContent');
+    assert.equal(
+      JSON.stringify(monitorCall.result.content || []).includes(uiSecret),
+      false,
+      'Model-visible text content MUST NOT include uiSecret'
+    );
 
     // Entrypoint launches invoke chrome_live_workspace with empty {}
     const wsCall = await rpc(21, 'tools/call', { name: 'chrome_live_workspace', arguments: {} });
@@ -1251,7 +1260,7 @@ test('Security audit hardening: mutual HTTP/WS HMAC, replay defense, runtime boo
     assert.equal(manualSensitiveSel.statusCode, 500);
     assert.match(manualSensitiveSel.json.error, /sensitive/i);
 
-    // Outgoing state & command results redact sensitive query params (?token= / ?code= / ?access_token=)
+    // Outgoing state, elements[].href, and #hash fragments redact sensitive OAuth tokens
     extWs.sendMaskedJson({
       type: 'status_sync',
       tabs: [
@@ -1260,7 +1269,7 @@ test('Security audit hardening: mutual HTTP/WS HMAC, replay defense, runtime boo
           substate: 'shared',
           paused: false,
           title: 'OAuth Callback',
-          url: 'https://portal.example.com/oauth/cb?page=2&code=secret_oauth_code&access_token=tok_999'
+          url: 'https://portal.example.com/oauth/cb?page=2&code=secret_oauth_code#access_token=hash_tok_999&state=xyz123'
         }
       ],
       activeTabId: 301
@@ -1268,9 +1277,68 @@ test('Security audit hardening: mutual HTTP/WS HMAC, replay defense, runtime boo
     await new Promise((r) => setTimeout(r, 40));
     const redactedState = await httpJson(port, 'GET', '/api/state', { token: testToken });
     const tabUrlOut = redactedState.json.tabs[0].url;
-    assert.ok(!tabUrlOut.includes('secret_oauth_code'), 'Public state must redact OAuth code');
-    assert.ok(!tabUrlOut.includes('tok_999'), 'Public state must redact access_token');
+    assert.ok(!tabUrlOut.includes('secret_oauth_code'), 'Public state must redact OAuth query code');
+    assert.ok(!tabUrlOut.includes('hash_tok_999'), 'Public state must redact #access_token fragment');
+    assert.ok(!tabUrlOut.includes('xyz123'), 'Public state must redact #state fragment');
     assert.ok(tabUrlOut.includes('page=2'), 'Public state preserves benign query params');
+
+    // Hardlink escape inside allowed upload dir MUST be blocked (nlink > 1)
+    const hlDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-hl-test-'));
+    try {
+      const targetSecret = path.join(hlDir, 'real_secret.dat');
+      const innocentLink = path.join(hlDir, 'innocent.png');
+      fs.writeFileSync(targetSecret, 'TOP_SECRET_PAYLOAD');
+      fs.linkSync(targetSecret, innocentLink);
+      const hlCheck = evaluateUploadFileSafety(innocentLink, { allowedDirs: [hlDir] });
+      assert.equal(hlCheck.allowed, false, 'Hard-linked file (nlink > 1) must be blocked');
+      assert.equal(hlCheck.code, 'HARDLINK_BLOCKED');
+    } finally {
+      fs.rmSync(hlDir, { recursive: true, force: true });
+    }
+
+    // Deeply nested elements[].href inside snapshot/batch results must redact query & #hash secrets
+    extWs.removeAllListeners('message');
+    extWs.on('message', (txt) => {
+      const msg = JSON.parse(txt);
+      if (msg.type === 'rpc_request') {
+        extWs.sendMaskedJson({
+          type: 'rpc_response',
+          id: msg.id,
+          ok: true,
+          result: {
+            stepResults: [
+              {
+                step: 0,
+                action: 'snapshot',
+                result: {
+                  url: 'https://app.example.com/home',
+                  elements: [
+                    {
+                      index: 0,
+                      tag: 'a',
+                      label: 'SSO Login',
+                      href: 'https://sso.example.com/magic?keep=1&token=magic_secret_777#id_token=jwt_888'
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        });
+      }
+    });
+    const deepBatchRes = await httpJson(
+      port,
+      'POST',
+      '/api/command',
+      { token: testToken },
+      { method: 'batch', params: { steps: [{ action: 'snapshot' }] } }
+    );
+    assert.equal(deepBatchRes.statusCode, 200);
+    const outHref = deepBatchRes.json.result.stepResults[0].result.elements[0].href;
+    assert.ok(!outHref.includes('magic_secret_777'), 'elements[].href must redact ?token=');
+    assert.ok(!outHref.includes('jwt_888'), 'elements[].href must redact #id_token=');
+    assert.ok(outHref.includes('keep=1'), 'elements[].href preserves benign params');
 
     extWs.socket.destroy();
   } finally {

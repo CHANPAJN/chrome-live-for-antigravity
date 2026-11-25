@@ -2,9 +2,9 @@ import crypto from 'node:crypto';
 import { buildInlineMonitorHtml, INLINE_MONITOR_URI } from './inline-monitor-ui.mjs';
 import { timingSafeEqualToken } from './token-store.mjs';
 
-// Ephemeral 256-bit capability token injected exclusively into the isolated `ui://` iframe document.
-// Because models never receive `resources/read` HTML for `ui://` apps, any model-forged `action` call
-// lacking this secret is deterministically rejected while keeping `chrome_live_monitor` enabled on all hosts.
+// Ephemeral 256-bit capability token delivered ONLY inside `CallToolResult.structuredContent.uiSecret`
+// (which MCP hosts route exclusively to the sandboxed `ui://` iframe via `ui/notifications/tool-result`,
+// never exposing it in `content` or in `resources/read` HTML).
 const UI_CAPABILITY_SECRET = crypto.randomBytes(32).toString('hex');
 
 const SERVER_INFO = {
@@ -374,7 +374,7 @@ export function startMcpStdioServer({ callDaemon }) {
               {
                 uri: INLINE_MONITOR_URI,
                 mimeType: 'text/html;profile=mcp-app',
-                text: buildInlineMonitorHtml(UI_CAPABILITY_SECRET),
+                text: buildInlineMonitorHtml(),
                 _meta: {
                   ui: {
                     prefersBorder: false
@@ -619,7 +619,7 @@ async function invokeTool(toolName, args, callDaemon) {
               text: `${label} (connected=${Boolean(sc?.extensionConnected)}, activeTabs=${tabCount}).`
             }
           ],
-          structuredContent: sc
+          structuredContent: sc && typeof sc === 'object' ? { ...sc, uiSecret: UI_CAPABILITY_SECRET } : { uiSecret: UI_CAPABILITY_SECRET }
         }
       };
     }

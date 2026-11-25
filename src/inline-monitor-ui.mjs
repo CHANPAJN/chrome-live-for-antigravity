@@ -1,7 +1,6 @@
 export const INLINE_MONITOR_URI = 'ui://chrome-live/live-monitor.html';
 
-export function buildInlineMonitorHtml(uiSecret = '') {
-  const safeUiSecretJson = JSON.stringify(String(uiSecret || ''));
+export function buildInlineMonitorHtml() {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -900,20 +899,26 @@ export function buildInlineMonitorHtml(uiSecret = '') {
 
         if (msg.method === 'ui/notifications/tool-result') {
           const sc = msg.params && (msg.params.structuredContent || msg.params);
-          if (sc) renderSnapshot(sc);
+          if (sc) {
+            if (typeof sc.uiSecret === 'string' && sc.uiSecret) {
+              uiSecret = sc.uiSecret;
+            }
+            renderSnapshot(sc);
+            scheduleNextPoll();
+          }
         }
       });
 
-      const UI_SECRET = ${safeUiSecretJson};
+      let uiSecret = '';
 
       async function pollLoop() {
-        if (document.hidden || pollInFlight) {
+        if (!uiSecret || document.hidden || pollInFlight) {
           scheduleNextPoll();
           return;
         }
         pollInFlight = true;
         try {
-          const pollArgs = { action: 'poll', lastFrameTs, uiSecret: UI_SECRET };
+          const pollArgs = { action: 'poll', lastFrameTs, uiSecret };
           if (selectedTabId !== null) pollArgs.tabId = selectedTabId;
           const res = await sendRequest('tools/call', {
             name: 'chrome_live_monitor',
@@ -936,11 +941,15 @@ export function buildInlineMonitorHtml(uiSecret = '') {
       regionBtn.addEventListener('click', () => setMode('region'));
 
       async function callAppAction(actionArgs, labelText) {
+        if (!uiSecret) {
+          showStatus(IS_ZH ? '画框正在等待会话授权令牌...' : 'Waiting for UI session token...', 'info', false);
+          return null;
+        }
         if (labelText) showStatus(labelText, 'info', false);
         try {
           const res = await sendRequest('tools/call', {
             name: 'chrome_live_monitor',
-            arguments: { ...actionArgs, uiSecret: UI_SECRET }
+            arguments: { ...actionArgs, uiSecret }
           });
           if (res && res.isError) {
             const errTxt = (res.content && res.content[0] && res.content[0].text) || 'Action failed';

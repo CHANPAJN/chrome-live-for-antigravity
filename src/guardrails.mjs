@@ -64,15 +64,31 @@ const CHECKOUT_PATH_PATTERNS = [
 const AUDIT_SENSITIVE_PARAM_RX =
   /^(?:token|access_token|id_token|refresh_token|auth.*|code|state|sig|signature|key|api_key|secret|password|session.*)$/i;
 
+const HASH_SENSITIVE_PAIR_RX =
+  /([#?&])(token|access_token|id_token|refresh_token|auth[a-z0-9_.-]*|code|state|sig|signature|key|api_key|secret|password|session[a-z0-9_.-]*)=([^&#]*)/gi;
+
 export function redactUrlForAudit(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return rawUrl;
   try {
     const parsed = new URL(rawUrl.trim());
-    if (!parsed.search) return parsed.toString();
     let mutated = false;
-    for (const [k] of parsed.searchParams.entries()) {
-      if (AUDIT_SENSITIVE_PARAM_RX.test(k)) {
-        parsed.searchParams.set(k, 'REDACTED');
+    if (parsed.username || parsed.password) {
+      parsed.username = '';
+      parsed.password = '';
+      mutated = true;
+    }
+    if (parsed.search) {
+      for (const [k] of parsed.searchParams.entries()) {
+        if (AUDIT_SENSITIVE_PARAM_RX.test(k)) {
+          parsed.searchParams.set(k, 'REDACTED');
+          mutated = true;
+        }
+      }
+    }
+    if (parsed.hash) {
+      const cleanedHash = parsed.hash.replace(HASH_SENSITIVE_PAIR_RX, '$1$2=REDACTED');
+      if (cleanedHash !== parsed.hash) {
+        parsed.hash = cleanedHash;
         mutated = true;
       }
     }
@@ -247,6 +263,20 @@ export function evaluateUploadFileSafety(rawFilePath, options = {}) {
         reason: `Upload path must reside inside the staging directory (${getDefaultUploadStagingDir()}) or CHROME_LIVE_UPLOAD_DIR`
       };
     }
+  }
+
+  // Block multi-hardlink files (e.g. `mklink /H` or `fs.linkSync` pointing an innocent staging filename at a secret file)
+  try {
+    const st = fs.statSync(realPath);
+    if (st.isFile() && typeof st.nlink === 'number' && st.nlink > 1) {
+      return {
+        allowed: false,
+        code: 'HARDLINK_BLOCKED',
+        reason: 'Uploading hard-linked files (nlink > 1) is blocked by local guardrails'
+      };
+    }
+  } catch {
+    // Non-existent file paths are caught by stat/open in daemon prepareUploadParams
   }
 
   return { allowed: true, code: 'OK', reason: '', resolvedPath: realPath };

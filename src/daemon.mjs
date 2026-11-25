@@ -70,15 +70,19 @@ function parseValidExtensionOrigin(originHeader) {
   return null;
 }
 
+const URL_FIELD_KEYS = new Set(['url', 'pageUrl', 'finalUrl', 'href', 'targetUrl']);
+
 function redactPayloadUrls(node, depth = 0) {
-  if (!node || typeof node !== 'object' || depth > 5) return node;
+  if (!node || typeof node !== 'object' || depth > 10) return node;
   if (Array.isArray(node)) {
     return node.map((item) => redactPayloadUrls(item, depth + 1));
   }
   const out = {};
   for (const [k, v] of Object.entries(node)) {
-    if ((k === 'url' || k === 'pageUrl' || k === 'finalUrl') && typeof v === 'string') {
+    if (URL_FIELD_KEYS.has(k) && typeof v === 'string') {
       out[k] = redactUrlForAudit(v);
+    } else if (k === 'urls' && Array.isArray(v)) {
+      out[k] = v.map((u) => (typeof u === 'string' ? redactUrlForAudit(u) : u));
     } else if (v && typeof v === 'object' && !Buffer.isBuffer(v)) {
       out[k] = redactPayloadUrls(v, depth + 1);
     } else {
@@ -325,7 +329,7 @@ export function createDaemonServer(options = {}) {
 
     const resolvedFiles = [];
     let totalBytes = 0;
-    const statsList = [];
+    const filePayloads = [];
 
     for (const item of rawList) {
       const check = evaluateUploadFileSafety(String(item || ''));
@@ -333,28 +337,43 @@ export function createDaemonServer(options = {}) {
         recordAudit('upload', { file: String(item || ''), code: check.code }, 'blocked');
         throw new Error(`[GUARDRAIL:${check.code}] ${check.reason}`);
       }
-      let st;
+      let fd;
       try {
-        st = fs.statSync(check.resolvedPath);
+        fd = fs.openSync(check.resolvedPath, 'r');
       } catch {
         throw new Error(`Local file does not exist: ${check.resolvedPath}`);
       }
-      if (!st.isFile()) {
-        throw new Error(`Upload path is not a regular file: ${check.resolvedPath}`);
+      try {
+        const st = fs.fstatSync(fd);
+        if (!st.isFile()) {
+          throw new Error(`Upload path is not a regular file: ${check.resolvedPath}`);
+        }
+        if (typeof st.nlink === 'number' && st.nlink > 1) {
+          recordAudit('upload', { file: String(item || ''), code: 'HARDLINK_BLOCKED' }, 'blocked');
+          throw new Error('[GUARDRAIL:HARDLINK_BLOCKED] Uploading hard-linked files (nlink > 1) is blocked by local guardrails');
+        }
+        resolvedFiles.push(check.resolvedPath);
+        totalBytes += st.size;
+        if (st.size > 0 && totalBytes <= 3 * 1024 * 1024) {
+          const buf = Buffer.allocUnsafe(st.size);
+          const bytesRead = fs.readSync(fd, buf, 0, st.size, 0);
+          filePayloads.push({
+            name: path.basename(check.resolvedPath),
+            mimeType: guessMimeType(check.resolvedPath),
+            base64: buf.subarray(0, bytesRead).toString('base64')
+          });
+        }
+      } finally {
+        try {
+          fs.closeSync(fd);
+        } catch {}
       }
-      resolvedFiles.push(check.resolvedPath);
-      totalBytes += st.size;
-      statsList.push({ path: check.resolvedPath, size: st.size });
     }
 
     stepParams.files = resolvedFiles;
     // Attach lightweight paste/drop fallback payload when total size <= 3MB (for rich-text editors without <input type="file">)
-    if (totalBytes > 0 && totalBytes <= 3 * 1024 * 1024) {
-      stepParams.pasteFallback = statsList.map((f) => ({
-        name: path.basename(f.path),
-        mimeType: guessMimeType(f.path),
-        base64: fs.readFileSync(f.path).toString('base64')
-      }));
+    if (totalBytes > 0 && totalBytes <= 3 * 1024 * 1024 && filePayloads.length === resolvedFiles.length) {
+      stepParams.pasteFallback = filePayloads;
     }
   }
 
@@ -453,8 +472,8 @@ export function createDaemonServer(options = {}) {
       return;
     }
 
-    // Block arbitrary web page cross-origin requests; only allow non-browser local clients or chrome-extension://
-    if (req.headers.origin && !resolveAllowedExtensionOrigin(req.headers.origin)) {
+    // Block arbitrary web page cross-origin requests; only allow non-browser local clients or valid chrome-extension:// origins
+    if (req.headers.origin && !parseValidExtensionOrigin(req.headers.origin)) {
       res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('Cross-origin web access is prohibited');
       return;
@@ -481,13 +500,15 @@ export function createDaemonServer(options = {}) {
     const parsedUrl = new URL(req.url || '/', `http://127.0.0.1:${boundPort}`);
     const pathname = parsedUrl.pathname;
 
-    // Unauthenticated minimal liveness ping (reveals zero sensitive state or tab titles)
+    // Unauthenticated minimal liveness ping (reveals zero sensitive state, zero CORS headers to unpaired extensions)
     if (req.method === 'GET' && pathname === '/api/ping') {
-      sendJson(req, res, 200, {
-        ok: true,
-        service: 'chrome-live-for-antigravity',
-        extensionConnected: state.extensionConnected && Boolean(extensionPeer && !extensionPeer.closed)
+      const pingPayload = Buffer.from(JSON.stringify({ ok: true, service: 'chrome-live-for-antigravity' }), 'utf8');
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'Content-Length': String(pingPayload.length)
       });
+      res.end(pingPayload);
       return;
     }
 
@@ -497,6 +518,18 @@ export function createDaemonServer(options = {}) {
         error: 'UNAUTHORIZED',
         message: 'Query-string token authentication is prohibited'
       });
+      return;
+    }
+
+    // Pre-validate HMAC headers, skew window, and replay cache BEFORE buffering any POST body (prevents unauthenticated 12MB memory DoS)
+    const prechecked = verifyHttpHmac.precheckHeaders(req);
+    if (!prechecked.ok) {
+      sendJson(req, res, 401, {
+        ok: false,
+        error: 'UNAUTHORIZED',
+        message: prechecked.reason
+      });
+      req.resume();
       return;
     }
 
@@ -511,7 +544,7 @@ export function createDaemonServer(options = {}) {
     }
 
     const pathWithQuery = `${pathname}${parsedUrl.search}`;
-    const authCheck = verifyHttpHmac(req, pathWithQuery, rawBody);
+    const authCheck = verifyHttpHmac.verifyBody(req, pathWithQuery, rawBody, prechecked);
     if (!authCheck.ok) {
       sendJson(req, res, 401, {
         ok: false,
@@ -519,6 +552,10 @@ export function createDaemonServer(options = {}) {
         message: authCheck.reason
       });
       return;
+    }
+    const verifiedHttpExtOrigin = parseValidExtensionOrigin(req.headers.origin);
+    if (verifiedHttpExtOrigin) {
+      pairedExtensionOrigin = verifiedHttpExtOrigin;
     }
     req._hmacAuth = authCheck;
 
@@ -688,7 +725,7 @@ export function createDaemonServer(options = {}) {
       return;
     }
 
-    if (req.headers.origin && !resolveAllowedExtensionOrigin(req.headers.origin)) {
+    if (req.headers.origin && !parseValidExtensionOrigin(req.headers.origin)) {
       socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;
@@ -891,7 +928,7 @@ export function createDaemonServer(options = {}) {
         mimeType,
         data: msg.data,
         title: frame.title,
-        url: frame.url,
+        url: redactUrlForAudit(frame.url),
         activity: frame.activity,
         capturedAt: frame.capturedAt
       });

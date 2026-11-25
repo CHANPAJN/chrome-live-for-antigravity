@@ -64,16 +64,23 @@ export function createReplayProtectedVerifier(authToken) {
     }
   }
 
-  return function verifyRequest(req, pathWithQuery, bodyBuf = null) {
-    // Reject any legacy plaintext token header or query string immediately
+  function precheckHeaders(req) {
+    // Reject any legacy plaintext token header immediately BEFORE reading request body
     if (req.headers['x-chrome-live-token'] || req.headers.authorization) {
       return { ok: false, reason: 'Plaintext token headers are rejected; use HMAC request signature' };
     }
     const tsRaw = String(req.headers['x-chrome-live-ts'] || '').trim();
     const nonce = String(req.headers['x-chrome-live-nonce'] || '').trim();
     const sig = String(req.headers['x-chrome-live-sig'] || '').trim();
-    if (!tsRaw || !nonce || !sig || nonce.length < 16 || nonce.length > 128) {
-      return { ok: false, reason: 'Missing HMAC authentication headers' };
+    if (
+      !tsRaw ||
+      !nonce ||
+      !sig ||
+      nonce.length < 16 ||
+      nonce.length > 128 ||
+      !/^[0-9a-f]{64}$/i.test(sig)
+    ) {
+      return { ok: false, reason: 'Missing or malformed HMAC authentication headers' };
     }
     const tsNum = Number(tsRaw);
     const now = Date.now();
@@ -84,11 +91,29 @@ export function createReplayProtectedVerifier(authToken) {
     if (seenNonces.has(nonce)) {
       return { ok: false, reason: 'Replayed HMAC request nonce rejected' };
     }
-    const expected = computeHttpRequestHmac(authToken, req.method || 'GET', pathWithQuery, tsRaw, nonce, bodyBuf);
+    return { ok: true, ts: tsRaw, nonce, sig, now };
+  }
+
+  function verifyBody(req, pathWithQuery, bodyBuf = null, prechecked = null) {
+    const headerCheck = prechecked || precheckHeaders(req);
+    if (!headerCheck.ok) return headerCheck;
+    const { ts, nonce, sig } = headerCheck;
+    const now = Date.now();
+    prune(now);
+    if (seenNonces.has(nonce)) {
+      return { ok: false, reason: 'Replayed HMAC request nonce rejected' };
+    }
+    const expected = computeHttpRequestHmac(authToken, req.method || 'GET', pathWithQuery, ts, nonce, bodyBuf);
     if (!timingSafeEqualToken(sig, expected)) {
       return { ok: false, reason: 'Invalid HMAC signature' };
     }
+    // Record nonce ONLY after cryptographic HMAC verification succeeds (prevents unauthenticated cache eviction)
     seenNonces.set(nonce, now + AUTH_MAX_SKEW_MS + 5000);
-    return { ok: true, ts: tsRaw, nonce };
-  };
+    return { ok: true, ts, nonce };
+  }
+
+  const verifyFn = (req, pathWithQuery, bodyBuf = null) => verifyBody(req, pathWithQuery, bodyBuf, null);
+  verifyFn.precheckHeaders = precheckHeaders;
+  verifyFn.verifyBody = verifyBody;
+  return verifyFn;
 }
