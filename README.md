@@ -9,8 +9,16 @@
 Instead of launching a blank, logged-out sandboxed browser that triggers anti-bot captchas or forces repeated logins, you can either **share a single signed-in tab on demand** (`Alt+Shift+L` / `Option+Shift+L` on macOS) or let your agent work quietly inside **collapsed background tab groups** while interacting through the built-in **Antigravity MCP App (SEP-1865)** inline in chat, docked in the side pane, or full-page from the sidebar.
 
 <p align="center">
-  <img src="./docs/demo.gif" alt="Chrome Live for Antigravity live demo: single-roundtrip batch, inline MCP App visual pick & relay, and local financial guardrails" width="880" />
+  <img src="./docs/real-demo.gif" alt="Real Chrome live capture: CLI driving native Chrome with HUD cursor, collapsed cyan background tab group, and local payment guardrail" width="880" />
 </p>
+<p align="center"><sub>Unedited real Chrome session captured 1:1 alongside the live CLI: foreground HUD cursor &amp; glass pill, silent collapsed <code>Live · Active</code> background tab group, clean text extraction, and local payment guardrail blocking <code>checkout.stripe.com</code>.</sub></p>
+
+<details>
+<summary><strong>View Antigravity MCP App inline monitor &amp; batch workflow walkthrough</strong></summary>
+<p align="center">
+  <img src="./docs/demo.gif" alt="Chrome Live for Antigravity MCP App inline monitor, visual element pick, human relay, and single-roundtrip batch walkthrough" width="880" />
+</p>
+</details>
 
 ---
 
