@@ -34,11 +34,11 @@ Connect **Google Antigravity** directly to your everyday signed-in Chrome or Edg
 
 - **Signed-In Tab Reuse & Anti-Misclick Lock**: Press `Alt+Shift+L` (`Option+Shift+L` on macOS) to share the active tab with Antigravity without blank headless profiles or repeated login loops. A transparent lock shield (`not-allowed` circle-slash cursor) prevents accidental clicks while the agent works; click **Pause** on the bottom floating HUD or hold left-click for 3 seconds to take over anytime. Running `done` detaches the debugger without closing your shared tab.
 - **Color-Coded Tab Groups & Auto-Collapse**: Active AI tabs sit inside a cyan **`Live · Active`** tab group, and background research tabs auto-collapse into a compact pill without stealing window focus. Pausing, holding left-click for 3 seconds, or popping out a relay window immediately switches the tab group and page border to yellow **`Live · Paused`** so control state is unmistakable.
-- **0-Token Live Preview in Antigravity (`SEP-1865`)**: Streams live frames inline in chat (`chrome_live_monitor`), docked in the side pane, or full-page in the sidebar (`chrome_live_workspace`) without burning model tokens. The toolbar includes 6 direct controls:
+- **0-Token Live Preview & Multi-Tab Switching (`SEP-1865`)**: Streams live frames inline in chat (`chrome_live_monitor`), docked in the side pane, or full-page in the sidebar (`chrome_live_workspace`) without burning model tokens. Supports managing multiple controlled tabs simultaneously with per-`tabId` isolated frame caches and a top tab switcher inside the live monitor, plus 6 direct controls:
   - **Control**: Click, scroll, and type directly on the live frame;
   - **Pick**: Drag a box on the stream to extract real DOM selectors (traversing open Shadow DOM) straight into chat;
   - **Attach**: Push the current tab's title, URL, and `tabId` into the next prompt via `ui/update-model-context`;
-  - **Popout / Merge**: Pop a controlled tab out into a standalone window for manual QR login, 2FA, or verification, then merge it back to its original tab index to resume AI control;
+  - **Popout / Merge**: Pop a controlled tab out into a standalone window for manual QR login, 2FA, or verification; click **Merge** (or simply close the popout window) to return the tab to its original window position with your signed-in session intact;
   - **Refresh / Release**: Pull a fresh frame immediately or detach control on demand.
 - **Human-Like Motion, Single-Roundtrip `batch` & Clean Extraction**: Pointer movements follow Bezier curves with approach deceleration and staggered typing cadence. Pipe `open -> type -> click -> wait -> snapshot -> done` through stdin in a single turn, extract clean text and full-res image URLs across multiple background tabs via `extract`, and inspect `{DISABLED}`, `{checked}`, `{selected}`, `{expanded}`, and validation alerts through open Shadow DOM.
 - **Opt-In Local Site Playbooks (`playbook on`, Off by Default)**: Disabled (`false`) out of the box. When enabled in the extension side panel or via CLI, stores sanitized deep-link routes, stable CSS selectors, and widget tips locally in `~/.chrome-live-antigravity/site-playbooks.json` (`0600`) so repeat visits skip landing-page discovery.
@@ -134,6 +134,13 @@ Chrome displays a top infobar whenever an extension attaches `chrome.debugger` (
     open -b com.google.Chrome --args --silent-debugger-extension-api
     ```
   - **Linux**: Run `google-chrome --silent-debugger-extension-api`, or append the flag to the `Exec=` line in your `.desktop` launcher under `~/.local/share/applications/`.
+
+**Multi-Tab Concurrency & Model Recommendations**
+
+- **Multi-tab scope**: Monitoring multiple controlled tabs simultaneously in the live preview tab bar and running parallel read-only `extract` jobs work cleanly with strict `tabId` isolation. For multi-site rich-text posting or complex forms that share system clipboard / window focus, run one site serially at a time rather than firing parallel writes.
+- **Recommended models for efficiency**:
+  - **Everyday lookup, extraction & single-roundtrip `batch`**: Fast / Flash-tier models respond quickly and pair best with `batch --compact` and opt-in local Site Playbooks (`playbook on`).
+  - **Complex admin forms, Shadow DOM widgets & debugging**: Switch to a higher-reasoning Pro-tier model for reliable ARIA alert handling and multi-step planning.
 
 ## How It Works & Operational Transparency
 

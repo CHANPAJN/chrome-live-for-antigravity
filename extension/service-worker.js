@@ -1351,7 +1351,7 @@ async function executeBridgeRpc(method, params) {
         stepParams.tabId = currentTabId;
       }
 
-      if (currentTabId !== undefined && managedTabs.has(currentTabId)) {
+      if (action !== 'open' && currentTabId !== undefined && managedTabs.has(currentTabId)) {
         const curEntry = managedTabs.get(currentTabId);
         curEntry.activity = `${tr().batchStep(i + 1, steps.length)} · ${action}`;
         await syncHud(currentTabId, {
