@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "chrome-live": {
+      "command": "node",
+      "args": ["__CHROME_LIVE_CLI_PATH__", "mcp"]
+    }
+  }
+}

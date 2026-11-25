@@ -1,0 +1,38 @@
+{
+  "name": "chrome-live-for-antigravity",
+  "version": "1.0.0",
+  "description": "Zero-dependency local Chrome MV3 bridge, live screencast sidecar, CLI & MCP server for Antigravity — reuse your signed-in browser sessions in background tab groups.",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "chrome-live": "./bin/chrome-live.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "extension/",
+    "plugin-template/",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node ./src/daemon.mjs",
+    "cli": "node ./bin/chrome-live.mjs",
+    "mcp": "node ./bin/chrome-live.mjs mcp",
+    "build:icons": "node ./scripts/generate-icons.mjs",
+    "test": "node --test ./test/cleanroom-and-protocol.test.mjs"
+  },
+  "keywords": [
+    "antigravity",
+    "chrome-extension",
+    "browser-automation",
+    "cdp",
+    "mcp",
+    "live-screencast",
+    "tab-groups"
+  ]
+}

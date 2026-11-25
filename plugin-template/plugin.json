@@ -1,0 +1,12 @@
+{
+  "name": "chrome-live-for-antigravity",
+  "displayName": "Chrome Live Bridge",
+  "version": "1.0.0",
+  "description": "Reuse your signed-in Chrome tabs and background tab groups in Antigravity with live screencast sidecar preview and financial guardrails.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Check my shared Chrome tab and summarize the current page",
+    "Open Hacker News in a background Chrome tab group and extract the top 3 stories",
+    "Open the Chrome Live View side pane"
+  ]
+}
