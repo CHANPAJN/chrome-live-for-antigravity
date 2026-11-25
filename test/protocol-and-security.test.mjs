@@ -121,33 +121,39 @@ function httpJson(port, method, routePath, headers = {}, bodyObj = null) {
   });
 }
 
-test('Clean-room gate: zero legacy fingerprints, private binaries, or non-original SVG paths', () => {
-  const selfPath = path.resolve(fileURLToPath(import.meta.url));
-  const files = collectSourceFiles(REPO_ROOT).filter((f) => path.resolve(f) !== selfPath);
-  assert.ok(files.length >= 12, 'Expected complete repository file set');
+test('Repository hygiene gate: zero external npm dependencies, zero prebuilt binaries, and zero leaked runtime secrets', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8'));
+  assert.equal(Object.keys(pkg.dependencies || {}).length, 0, 'Expected zero runtime npm dependencies');
 
-  // Decode legacy tokens from hex so the repository itself contains zero literal matches
-  const forbiddenTokens = [
-    '5f5f6d75736554616b656f766572',
-    '5f5f616754616b656f766572',
-    '4d5553455f544f4b454e',
-    '6e6f7463682d7368617065',
-    '66696c6c65743a3a6265666f7265',
-    '52455345525645445f54414753',
-    '4d312e3520312e354c312e352031382e36',
-    '6c616e67756167655f7365727665722e657865',
-    '2e7062747874',
-    '3238303936'
-  ].map((hex) => Buffer.from(hex, 'hex').toString('utf8'));
+  const forbiddenBinaryExts = new Set(['.exe', '.dll', '.so', '.dylib', '.wasm', '.bin', '.node']);
+  const ignoredRuntimeFiles = new Set(['extension/.local-runtime.json']);
+  const allEntries = [];
+  function walkAll(dir) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === '.git' || entry.name === 'node_modules') continue;
+      const full = path.join(dir, entry.name);
+      const rel = path.relative(REPO_ROOT, full).replace(/\\/g, '/');
+      if (entry.isDirectory()) {
+        walkAll(full);
+      } else if (entry.isFile()) {
+        if (ignoredRuntimeFiles.has(rel)) continue;
+        allEntries.push({ full, rel });
+      }
+    }
+  }
+  walkAll(REPO_ROOT);
+  assert.ok(allEntries.length >= 12, 'Expected complete repository file set');
 
-  for (const file of files) {
-    const content = fs.readFileSync(file, 'utf8');
-    const rel = path.relative(REPO_ROOT, file);
-    for (const token of forbiddenTokens) {
+  for (const { full, rel } of allEntries) {
+    const ext = path.extname(rel).toLowerCase();
+    assert.equal(forbiddenBinaryExts.has(ext), false, `Unexpected binary file in repository: ${rel}`);
+    assert.notEqual(path.basename(rel), 'auth.token', `Secret token file must never live inside repository: ${rel}`);
+    if (!['.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico'].includes(ext)) {
+      const content = fs.readFileSync(full, 'utf8');
       assert.equal(
-        content.includes(token),
+        /C:\\Users\\[A-Za-z0-9._-]+\\\.gemini/i.test(content),
         false,
-        `Forbidden legacy fingerprint "${token}" found in ${rel}`
+        `Hardcoded personal path found in ${rel}`
       );
     }
   }

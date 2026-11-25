@@ -24,7 +24,7 @@
     "cli": "node ./bin/chrome-live.mjs",
     "mcp": "node ./bin/chrome-live.mjs mcp",
     "build:icons": "node ./scripts/generate-icons.mjs",
-    "test": "node --test ./test/cleanroom-and-protocol.test.mjs"
+    "test": "node --test ./test/protocol-and-security.test.mjs"
   },
   "keywords": [
     "antigravity",

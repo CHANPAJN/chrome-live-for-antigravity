@@ -145,12 +145,12 @@ Chrome displays a top infobar whenever an extension attaches `chrome.debugger` (
 ## How It Works & Operational Transparency
 
 - **On-Demand Debugger Attachment**: `chrome.debugger` (`1.3`) attaches only during active commands or live streaming and auto-detaches after 18 seconds of idle time, keeping idle CPU under `0.01%`.
-- **Loopback Isolation & Timing-Safe Auth**: The daemon binds strictly to `127.0.0.1:28196` (override with `CHROME_LIVE_PORT`), validates the `Host` header, rejects all browser `Origin` headers with `403`, and verifies the local 256-bit token with `crypto.timingSafeEqual`.
-- **Dual-Layer Financial & Sensitive Path Guardrails**: Both the daemon and the extension block payment gateways (Stripe, PayPal, Alipay, WeChat Pay, banking portals, cloud billing consoles), `chrome://` / `edge://`, and `/checkout`, `/payment`, `/pay`, `/cashier`, `/billing` routes (including SPA hash paths) before touching the tab. If a controlled page redirects to a protected domain, the debugger detaches immediately. CDP file uploads also reject `.ssh`, `.env`, and `.aws` credential paths.
+- **Loopback Isolation & Timing-Safe Auth**: The daemon binds strictly to `127.0.0.1:28196` (override with `CHROME_LIVE_PORT`), validates the `Host` header, rejects all browser `Origin` headers with `403`, enforces RFC 6455 client frame masking, and verifies the local 256-bit token via `X-Chrome-Live-Token` headers or WebSocket first-frame auth (never query strings) using `crypto.timingSafeEqual`. Both `auth.token` and `extension/.local-runtime.json` are written with `0600` permissions, and in-memory audit URLs automatically redact sensitive query parameters.
+- **Dual-Layer Financial & Sensitive Path Guardrails**: Both the daemon and the extension block payment gateways (Stripe, PayPal, Alipay, WeChat Pay, banking portals, cloud billing consoles), `chrome://` / `edge://`, and `/checkout`, `/pay`, `/payment`, `/cashier`, `/billing` routes (including SPA hash paths) across `open`, `navigate`, `batch`, and `extract` before touching the tab. If a controlled page redirects to a protected domain, the debugger detaches immediately. CDP file uploads also reject `.ssh`, `.env`, and `.aws` credential paths.
 - **Zero Host Patching & Clean Uninstall**: Built purely on Node.js `>= 20` standard modules and plain MV3 JavaScript — zero npm packages, zero prebuilt binaries, and zero edits to Antigravity binaries. Closed Shadow DOM, cross-origin payment `<iframe>` frames, and native OS file dialogs remain isolated by the browser sandbox. To verify or uninstall:
 
 ```bash
-npm test                                                    # Run clean-room, guardrail & protocol test suite
+npm test                                                    # Run security, guardrail & protocol test suite
 node ./bin/chrome-live.mjs stop                             # Stop daemon, then remove extension & ~/.chrome-live-antigravity
 ```
 

@@ -145,12 +145,12 @@ node ./bin/chrome-live.mjs done "任务完成"                  # 断开调试�
 ## 架构与透明边界
 
 - **按需挂载调试器**：仅在执行命令或拉取实时画面期间挂载 `chrome.debugger`（`1.3`），空闲满 18 秒自动卸载释放，保持 `< 0.01%` 空闲 CPU 占用。
-- **本地回环隔离与常量时间鉴权**：守护进程严格监听 `127.0.0.1:28196`（可用环境变量 `CHROME_LIVE_PORT` 修改），校验 `Host` 头，对所有网页来源的 `Origin` 请求返回 `403`，并使用 `crypto.timingSafeEqual` 核验本地 256 位随机口令。
-- **双层金融与敏感路由拦截**：守护进程与扩展后台同时内置支付网关（支付宝、微信支付、Stripe、PayPal、网银、云账单）、`chrome://` / `edge://` 及 `/checkout`、`/payment`、`/pay`、`/cashier`、`/billing`（含 SPA Hash 路由）拦截；若受控页面发生跳转进入受保护域名，扩展会立即断开调试器交还人工。CDP 文件上传同样拦截 `.ssh`、`.env`、`.aws` 等凭据路径。
+- **本地回环隔离与常量时间鉴权**：守护进程严格监听 `127.0.0.1:28196`（可用环境变量 `CHROME_LIVE_PORT` 修改），校验 `Host` 头，对所有网页来源的 `Origin` 请求返回 `403`，按 RFC 6455 强制校验客户端帧掩码，并仅通过请求头或 WebSocket 首帧鉴权（拒绝 URL `?token=` 查询串）配合 `crypto.timingSafeEqual` 核验本地 256 位随机口令；`auth.token` 与 `extension/.local-runtime.json` 均设 `0600` 权限，内存审计流水自动脱敏敏感查询参数。
+- **双层金融与敏感路由拦截**：守护进程与扩展后台在 `open`、`navigate`、`batch` 与 `extract` 全链路均双层内置支付网关（支付宝、微信支付、Stripe、PayPal、网银、云账单）、`chrome://` / `edge://` 及 `/checkout`、`/pay`、`/payment`、`/cashier`、`/billing`（含 SPA Hash 路由）拦截；若受控页面发生跳转进入受保护域名，扩展会立即断开调试器交还人工。CDP 文件上传同样拦截 `.ssh`、`.env`、`.aws` 等凭据路径。
 - **零客户端修改、零第三方依赖 & 干净卸载**：全部代码基于 Node.js `>= 20` 内置标准库与明文 MV3 JavaScript 编写，不修改 Antigravity 客户端任何文件；关闭式 Shadow DOM、跨源支付 `<iframe>` 与系统级文件对话框均受浏览器沙箱隔离不可访问。运行测试或彻底卸载：
 
 ```bash
-npm test                                                    # 运行净室、安全护栏与协议自动化测试
+npm test                                                    # 运行安全护栏、协议与端到端集成测试
 node ./bin/chrome-live.mjs stop                             # 停止服务后，在扩展页移除扩展并删除 ~/.chrome-live-antigravity
 ```
 
