@@ -4,7 +4,7 @@
 
 > 独立社区开源项目，与 Google LLC 或 Meta Platforms, Inc. 无关联。
 
-把 Antigravity（以及 Claude Code、Codex、OpenCode 等支持 CLI 或 MCP 的工具）直接连到你平时已登录的 Chrome / Edge 上，不用再每次开空白的无头浏览器重新登录、过验证码。
+把 Antigravity 直接连到你平时已登录的 Chrome / Edge 上，不用再每次开空白的无头浏览器重新登录、过验证码。
 
 <p align="center">
   <img src="./docs/real-dual-demo-zh.gif" alt="Chrome Live for Antigravity demo" width="880" />
@@ -29,8 +29,8 @@
 
 Chrome Live 通过本地守护进程（`127.0.0.1:28196`）加一个原生 MV3 扩展，换了一种方式：
 
-- **按标签页复用已登录浏览器**：按 `Alt+Shift+L`（macOS 为 `Option+Shift+L`）把当前已登录的标签页交给 Agent 操作，任务结束执行 `done` 只会断开调试器，不会关闭你原本打开的页面。
-- **后台自动折叠，不抢焦点**：新开的查询页面会自动归进顶部青色标签组 **`Live · 操控中`** 并自动折叠缩小成一个胶囊，不弹新窗口，不打断前台操作。
+- **按标签页复用已登录浏览器 + 防误触锁**：按 `Alt+Shift+L`（macOS 为 `Option+Shift+L`）把当前已登录标签页交给 Antigravity，页面自动开启全屏防误触护盾（鼠标显示禁止点击圆圈图标，防手滑打断）；需要手动接手时按住左键满 3 秒或点底部「暂停」即可解锁。执行 `done` 只断开调试器，绝不关闭你的原页面。
+- **彩色标签组状态一目了然，后台自动折叠不抢焦点**：AI 执行时页面归入顶部青色 **`Live · 操控中`** 标签组，后台新开查询页会自动折叠成一个小胶囊，不弹新窗不抢焦点；当你点击「暂停」、长按 3 秒解锁或弹出独立副屏人工接手时，标签组与边框会立即切为明黄色 **`Live · 已暂停`**，清清楚楚区分当前归谁操作。
 - **拟人轨迹与随时暂停**：点击和输入带贝塞尔曲线轨迹、接近减速和错落打字节奏；受控页面底部有悬浮状态条，随时点「暂停」或按住左键 3 秒即可拿回控制权。
 - **聊天内实时画框（Antigravity MCP App / SEP-1865）**：支持聊天内联（`chrome_live_monitor`）、右侧分屏和左侧独立视图（`chrome_live_workspace`），实时流不消耗模型 Token。顶栏自带 6 个常用动作：
   - **接管**：直接在画框里远程点击、滚轮和输入；
@@ -59,9 +59,9 @@ Chrome Live 通过本地守护进程（`127.0.0.1:28196`）加一个原生 MV3 �
 
 ## 安装与使用
 
-### 方式 1：让你的 AI 直接帮你装
+### 方式 1：让 Antigravity 直接帮你装
 
-把下面这段话直接发给 Antigravity、Claude Code、Codex、OpenCode 或 Cursor：
+把下面这段话直接发给 Antigravity：
 
 ```text
 请阅读 https://github.com/CHANPAJN/chrome-live-for-antigravity/blob/main/AI_INSTALL.md ，按步骤帮我克隆并配置好 chrome-live-for-antigravity，生成本地配对口令并启动桥接服务，最后把需要拖入 chrome://extensions 的本地目录路径发给我。
@@ -92,7 +92,7 @@ node ./bin/chrome-live.mjs setup
 node ./bin/chrome-live.mjs health
 ```
 
-**3. 接入 Antigravity 或其他 MCP 客户端**
+**3. 接入 Antigravity**
 
 默认不会自动改动你的 `~/.gemini/config/`，按需二选一：
 
@@ -102,7 +102,7 @@ node ./bin/chrome-live.mjs health
 node ./bin/chrome-live.mjs install --with-plugin
 ```
 
-- **以标准 `stdio` MCP Server 接入（Claude Code / Codex / OpenCode 等）**：
+- **或手动以标准 `stdio` MCP Server 方式挂载**：
 
 ```json
 {

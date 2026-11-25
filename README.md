@@ -4,7 +4,7 @@
 
 > Independent community project. Not affiliated with or endorsed by Google LLC or Meta Platforms, Inc.
 
-Connect Antigravity (or Claude Code, Codex, OpenCode, and any CLI / MCP agent) directly to your everyday signed-in Chrome or Edge browser—no blank sandbox profiles, no repeated login loops, and no third-party npm packages.
+Connect Antigravity directly to your everyday signed-in Chrome or Edge browser—no blank sandbox profiles, no repeated login loops, and no third-party npm packages.
 
 <p align="center">
   <img src="./docs/real-dual-demo.gif" alt="Chrome Live for Antigravity demo" width="880" />
@@ -29,8 +29,8 @@ Running browser tasks through headless Playwright or sandboxed MCP servers gets 
 
 Chrome Live pairs a local Node.js daemon (`127.0.0.1:28196`) with a plain Manifest V3 extension to work alongside your real browser instead:
 
-- **Share one signed-in tab on demand**: Press `Alt+Shift+L` (`Option+Shift+L` on macOS) to hand the active tab to your agent. Running `done` detaches the debugger and never closes your shared tab.
-- **Auto-collapsing background tab group**: Research tabs open quietly inside a cyan **`Live · Active`** tab group that automatically collapses into a compact pill without pulling Chrome to the front.
+- **Share one signed-in tab + anti-misclick lock**: Press `Alt+Shift+L` (`Option+Shift+L` on macOS) to hand the active tab to Antigravity. A transparent lock shield (`not-allowed` circle-slash cursor) prevents accidental clicks during automation; hold left-click for 3 seconds or click Pause to take over immediately. Running `done` detaches the debugger without closing your shared tab.
+- **Color-coded tab groups & auto-collapse**: Active AI tabs sit inside a cyan **`Live · Active`** tab group (background research tabs auto-collapse into a compact pill without pulling Chrome to the front). When you click Pause, hold left-click 3s to unlock, or pop out a standalone window for manual login/2FA, the tab group and page border switch to yellow **`Live · Paused`** so control state is unmistakable.
 - **Human-like motion & instant pause**: Cursor movement follows Bezier curves with approach deceleration and staggered typing cadence. A floating HUD bar at the bottom of the page lets you click Pause (or hold left-click for 3 seconds) to take over immediately.
 - **Built-in Antigravity MCP App (SEP-1865)**: Streams a 0-token live preview inline in chat (`chrome_live_monitor`), docked in the side pane, or full-page in the sidebar (`chrome_live_workspace`), with 6 built-in controls:
   - **Control**: Click, scroll, and type directly on the live stream;
@@ -59,9 +59,9 @@ Background footprint: `< 0.01%` idle CPU (`0.0096%` measured), `~30–34 MB` pri
 
 ## Quick Start
 
-### Option 1: Let your AI agent install it
+### Option 1: Let Antigravity install it for you
 
-Send this prompt to Antigravity, Claude Code, Codex, OpenCode, or Cursor:
+Send this prompt to Antigravity:
 
 ```text
 Read https://github.com/CHANPAJN/chrome-live-for-antigravity/blob/main/AI_INSTALL.md and follow it step by step to clone and configure chrome-live-for-antigravity, generate the local pairing token, start the bridge daemon, and return the local extension/ folder path for me to load in chrome://extensions.
@@ -92,7 +92,7 @@ node ./bin/chrome-live.mjs setup
 node ./bin/chrome-live.mjs health
 ```
 
-**3. Connect Antigravity or any MCP client**
+**3. Connect to Antigravity**
 
 Nothing is written to `~/.gemini/config/` until you opt in:
 
@@ -102,7 +102,7 @@ Nothing is written to `~/.gemini/config/` until you opt in:
 node ./bin/chrome-live.mjs install --with-plugin
 ```
 
-- **Or mount as a standard `stdio` MCP server (Claude Code / Codex / OpenCode)**:
+- **Or mount manually as a standard `stdio` MCP server**:
 
 ```json
 {
