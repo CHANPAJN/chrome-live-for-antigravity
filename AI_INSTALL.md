@@ -1,7 +1,7 @@
 # AI Automated Setup Guide (`AI_INSTALL.md`)
 
-> **For Coding Agents (Antigravity / Claude Code / Codex / OpenCode / Cursor):**
-> Follow the deterministic steps below to set up `chrome-live-for-antigravity` on the user's machine. Do **not** modify global agent config directories (`~/.gemini`, `~/.claude`, etc.) without asking the user first.
+> **For Antigravity:**
+> Follow the deterministic steps below to set up `chrome-live-for-antigravity` on the user's machine. Do **not** modify `~/.gemini` without asking the user first.
 
 ---
 
@@ -69,8 +69,8 @@ Ask the user how they want to wire `chrome-live` into their agent environment:
   ```bash
   node ./bin/chrome-live.mjs install --with-plugin
   ```
-- **Option B — Standard `stdio` MCP Server (Claude Code / Codex / Cursor / OpenCode / Antigravity):**
-  Register the following entry in the client's MCP configuration (replacing `<ABSOLUTE_PATH_TO_REPO>`):
+- **Option B — Manual `stdio` MCP Server Entry:**
+  Register the following entry in your Antigravity MCP configuration (replacing `<ABSOLUTE_PATH_TO_REPO>`):
   ```json
   {
     "mcpServers": {
