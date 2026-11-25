@@ -9,9 +9,9 @@
 无需再忍受空白无 Cookie 的沙箱浏览器反复弹验证码或每次弹远程调试 `Allow` 授权框：你可以随时按 `Alt+Shift+L`（macOS 为 `Option+Shift+L`）**将当前已登录标签页一键接管给 Agent 操作**，也可以让它在**当前窗口折叠的后台彩色标签组**里静默查资料，同时直接在内置 **Antigravity MCP App（SEP-1865）** 的聊天流内联画框、右侧分屏或左侧全局栏里同屏观看与接力操控。
 
 <p align="center">
-  <img src="./docs/real-dual-demo.gif" alt="100% 双真机同步实录：官方正式版 Antigravity（内联 SEP-1865 MCP App 实时画框）与真实 Chrome 同屏联动、青色后台折叠标签组与本地支付护栏拦截" width="880" />
+  <img src="./docs/real-dual-demo-zh.gif" alt="100% 纯中文双真机同步实录：官方正式版 Antigravity 内联实时画框、2.38× 顶部青色折叠标签组 Live · 操控中 放大特写、单轮连招省 83% Token 与本地支付护栏拦截" width="880" />
 </p>
-<p align="center"><sub>100% 真实桌面双窗同步实录（零合成零模拟）：左侧官方正式版 Antigravity（原生内联 <code>chrome_live_monitor</code> 实时画框、<code>LIVE · 0 Token</code> 与 6 键顶栏），右侧真实 Chrome（毛玻璃灵动岛、零抢焦点青色折叠后台标签组 <code>Live · Active</code>、本地拦截 <code>checkout.stripe.com</code>）。</sub></p>
+<p align="center"><sub>100% 纯中文真实桌面双窗实录（零合成零模拟）：直接复用日常 Chrome 告别反复登录验证码 · 聊天内 <code>LIVE · 0 Token</code> 实时画框 · <code>2.38×</code> 特写展示后台任务自动折叠进顶部青色胶囊 <code>Live · 操控中</code> 不抢焦点 · 本地硬护栏拦截 <code>checkout.stripe.com</code> 支付页。</sub></p>
 
 <details>
 <summary><strong>展开查看纯 CLI 终端 + 真实 Chrome 实录演示（适用于 Claude Code / Codex / OpenCode）</strong></summary>
