@@ -9,14 +9,14 @@
 无需再忍受空白无 Cookie 的沙箱浏览器反复弹验证码或每次弹远程调试 `Allow` 授权框：你可以随时按 `Alt+Shift+L`（macOS 为 `Option+Shift+L`）**将当前已登录标签页一键接管给 Agent 操作**，也可以让它在**当前窗口折叠的后台彩色标签组**里静默查资料，同时直接在内置 **Antigravity MCP App（SEP-1865）** 的聊天流内联画框、右侧分屏或左侧全局栏里同屏观看与接力操控。
 
 <p align="center">
-  <img src="./docs/real-demo.gif" alt="真实 Chrome 1:1 实录演示：实时 CLI 驱动原版 Chrome、协作飞镖光标与毛玻璃灵动岛、青色后台折叠标签组、本地支付护栏拦截" width="880" />
+  <img src="./docs/real-dual-demo.gif" alt="100% 双真机同步实录：官方正式版 Antigravity（内联 SEP-1865 MCP App 实时画框）与真实 Chrome 同屏联动、青色后台折叠标签组与本地支付护栏拦截" width="880" />
 </p>
-<p align="center"><sub>真实 Chrome 1:1 窗口同步实录：前台 Live HUD 飞镖光标与灵动岛、零抢焦点青色折叠后台标签组 <code>Live · Active</code>、纯净网页提取，以及本地拦截 <code>checkout.stripe.com</code> 支付页。</sub></p>
+<p align="center"><sub>100% 真实桌面双窗同步实录（零合成零模拟）：左侧官方正式版 Antigravity（原生内联 <code>chrome_live_monitor</code> 实时画框、<code>LIVE · 0 Token</code> 与 6 键顶栏），右侧真实 Chrome（毛玻璃灵动岛、零抢焦点青色折叠后台标签组 <code>Live · Active</code>、本地拦截 <code>checkout.stripe.com</code>）。</sub></p>
 
 <details>
-<summary><strong>展开查看 Antigravity 内联 MCP App 监控画框与批处理工作流演示</strong></summary>
+<summary><strong>展开查看纯 CLI 终端 + 真实 Chrome 实录演示（适用于 Claude Code / Codex / OpenCode）</strong></summary>
 <p align="center">
-  <img src="./docs/demo.gif" alt="Chrome Live for Antigravity 实操演示：单轮 batch 连招、内联 MCP App 圈选与副屏接力、本地金融护栏" width="880" />
+  <img src="./docs/real-demo.gif" alt="真实 Chrome 1:1 实录演示：实时 CLI 驱动原版 Chrome、协作飞镖光标与毛玻璃灵动岛、青色后台折叠标签组、本地支付护栏拦截" width="880" />
 </p>
 </details>
 

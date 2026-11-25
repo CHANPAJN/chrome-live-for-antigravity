@@ -490,7 +490,8 @@ export function createDaemonServer(options = {}) {
         const body = await readJsonBody(req);
         const method = String(body.method || body.cmd || '').trim();
         const params = body.params && typeof body.params === 'object' ? body.params : {};
-        const timeoutMs = Number(body.timeoutMs) > 0 ? Number(body.timeoutMs) : 28000;
+        const defaultTimeoutMs = method === 'batch' || method === 'extract' ? 90000 : 28000;
+        const timeoutMs = Number(body.timeoutMs) > 0 ? Number(body.timeoutMs) : defaultTimeoutMs;
 
         if (!method) {
           sendJson(req, res, 400, { ok: false, error: 'Missing command method' });

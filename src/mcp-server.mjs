@@ -697,8 +697,8 @@ async function invokeTool(toolName, args, callDaemon) {
           urls: args.urls,
           scrollSteps: args.scrollSteps ?? 1
         },
-        timeoutMs: 45000
-      });
+        timeoutMs: 85000
+      }, 90000);
     case 'chrome_live_batch':
       return await callDaemon(
         'POST',
@@ -709,9 +709,9 @@ async function invokeTool(toolName, args, callDaemon) {
             tabId: args.tabId,
             steps: args.steps
           },
-          timeoutMs: 55000
+          timeoutMs: 90000
         },
-        60000
+        95000
       );
     case 'chrome_live_playbook': {
       const act = args.action;
