@@ -436,22 +436,51 @@ export function startMcpStdioServer({ callDaemon }) {
     }
   }
 
+  const MAX_MCP_MESSAGE_BYTES = 16 * 1024 * 1024;
+  const MAX_MCP_HEADER_BYTES = 8192;
+
   process.stdin.on('data', (chunk) => {
     rawBuffer = rawBuffer.length === 0 ? chunk : Buffer.concat([rawBuffer, chunk]);
 
     while (rawBuffer.length > 0) {
-      const asciiHead = rawBuffer.subarray(0, Math.min(rawBuffer.length, 32)).toString('utf8');
-      if (/^Content-Length:/i.test(asciiHead)) {
+      // Strip leading CR/LF/whitespace between frames without misclassifying fragmented headers
+      let leadIdx = 0;
+      while (
+        leadIdx < rawBuffer.length &&
+        (rawBuffer[leadIdx] === 0x20 ||
+          rawBuffer[leadIdx] === 0x09 ||
+          rawBuffer[leadIdx] === 0x0d ||
+          rawBuffer[leadIdx] === 0x0a)
+      ) {
+        leadIdx++;
+      }
+      if (leadIdx > 0) {
+        rawBuffer = rawBuffer.subarray(leadIdx);
+        if (rawBuffer.length === 0) return;
+      }
+
+      const firstByte = rawBuffer[0];
+      // JSON-RPC line framing always starts with '{' (0x7b) or '[' (0x5b); anything else is HTTP-style header framing
+      if (firstByte !== 0x7b && firstByte !== 0x5b) {
         framingMode = 'header';
         const sepIdx = rawBuffer.indexOf('\r\n\r\n');
-        if (sepIdx === -1) return;
+        if (sepIdx === -1) {
+          if (rawBuffer.length > MAX_MCP_HEADER_BYTES) {
+            rawBuffer = Buffer.alloc(0);
+          }
+          return;
+        }
         const headerStr = rawBuffer.subarray(0, sepIdx).toString('utf8');
-        const m = headerStr.match(/Content-Length:\s*(\d+)/i);
+        const m = headerStr.match(/(?:^|\r\n)Content-Length:\s*(\d+)/i);
         if (!m) {
           rawBuffer = rawBuffer.subarray(sepIdx + 4);
           continue;
         }
         const contentLen = Number.parseInt(m[1], 10);
+        if (!Number.isFinite(contentLen) || contentLen < 0 || contentLen > MAX_MCP_MESSAGE_BYTES) {
+          rawBuffer = Buffer.alloc(0);
+          return;
+        }
         const totalNeeded = sepIdx + 4 + contentLen;
         if (rawBuffer.length < totalNeeded) return;
         const bodyStr = rawBuffer.subarray(sepIdx + 4, totalNeeded).toString('utf8');
@@ -461,7 +490,12 @@ export function startMcpStdioServer({ callDaemon }) {
         } catch {}
       } else {
         const nlIdx = rawBuffer.indexOf(0x0a);
-        if (nlIdx === -1) return;
+        if (nlIdx === -1) {
+          if (rawBuffer.length > MAX_MCP_MESSAGE_BYTES) {
+            rawBuffer = Buffer.alloc(0);
+          }
+          return;
+        }
         const line = rawBuffer.subarray(0, nlIdx).toString('utf8').trim();
         rawBuffer = rawBuffer.subarray(nlIdx + 1);
         if (!line) continue;
@@ -498,7 +532,7 @@ async function buildMonitorStructuredState(callDaemon, lastFrameTs = 0, targetTa
   let fullState = baseState;
   if (hasExplicitTab && !resolvedPrimary) {
     fullState = { ...baseState, requestedTabId: targetTabId, requestedTabMissing: true };
-  } else if (hasTab && cachedIds.includes(effectiveTabId)) {
+  } else if (hasTab && !resolvedPrimary?.paused && cachedIds.includes(effectiveTabId)) {
     if (lastFrameTs === 0 || serverFrameTs !== lastFrameTs || baseState?.latestFrameMeta?.tabId !== effectiveTabId) {
       fullState = await callDaemon('GET', `/api/state?includeFrame=1${tabQuery}`);
     }
@@ -578,7 +612,9 @@ async function executeMonitorAppAction(args, callDaemon) {
   } else {
     throw new Error(`Unsupported UI action: ${act}`);
   }
-  const followUpTabId = act === 'release_tab' ? undefined : (typeof args?.tabId === 'number' ? args.tabId : undefined);
+  // Keep explicit `args.tabId` even after `release_tab` so multi-tab sessions return `requestedTabMissing: true`
+  // instead of silently attaching debugger & capturing a screenshot of another shared tab!
+  const followUpTabId = typeof args?.tabId === 'number' ? args.tabId : undefined;
   const sc = await buildMonitorStructuredState(callDaemon, 0, followUpTabId, false);
   if (regionResult && sc && typeof sc === 'object') {
     sc.regionResult = regionResult;

@@ -49,8 +49,10 @@ export function verifySignedHttpResponse(token, statusCode, resHeaders, sentTs, 
   return timingSafeEqualToken(serverSig, expected);
 }
 
-export function createReplayProtectedVerifier(authToken) {
+export function createReplayProtectedVerifier(tokenOrProvider) {
   const seenNonces = new Map(); // nonce -> expiresAt
+  const resolveToken = () =>
+    typeof tokenOrProvider === 'function' ? String(tokenOrProvider() || '') : String(tokenOrProvider || '');
 
   function prune(now) {
     if (seenNonces.size === 0) return;
@@ -103,7 +105,7 @@ export function createReplayProtectedVerifier(authToken) {
     if (seenNonces.has(nonce)) {
       return { ok: false, reason: 'Replayed HMAC request nonce rejected' };
     }
-    const expected = computeHttpRequestHmac(authToken, req.method || 'GET', pathWithQuery, ts, nonce, bodyBuf);
+    const expected = computeHttpRequestHmac(resolveToken(), req.method || 'GET', pathWithQuery, ts, nonce, bodyBuf);
     if (!timingSafeEqualToken(sig, expected)) {
       return { ok: false, reason: 'Invalid HMAC signature' };
     }

@@ -38,7 +38,7 @@
   - **接管**：直接在画框里远程点击、滚轮翻页和输入文字；
   - **圈选**：在画框上拉框选区域，穿透开放 Shadow DOM 提取真实选择器和文本发回对话；
   - **挂入**：把当前页面标题、URL 和 `tabId` 附到下一条提示词上下文；
-  - **副屏 / 归队**：遇到扫码或人机验证时一键弹出独立小窗手动处理，完成后点「归队」或直接点右上角 `×` 关掉副屏窗口，都会自动带登录态归队回原主窗口原位交还 AI；
+  - **副屏 / 归队**：遇到扫码或人机验证时一键弹出独立小窗手动处理；在浏览器悬浮条点「继续」即可合回并恢复 AI 接管，若从外部点「归队」或直接点右上角 `×` 关掉副屏窗口，页面会带 Cookie 归队回主窗口并保持「已暂停」保护态（关窗重开会重新加载该页 URL，在浏览器内点「继续」后恢复操控）；
   - **刷新 / 释放**：手动拉取最新一帧，或立即解除受控并卸载调试器。
 - **拟人化交互、单轮 `batch` 连招与并发正文提取**：鼠标移动带贝塞尔曲线轨迹与接近减速，打字带错落间隔；支持通过 stdin 把 `open → type → click → wait → snapshot → done` 合并为 1 轮调用；`extract` 在后台标签页并发抓正文和原图直链、抓完即关；`snapshot` 穿透开放 Shadow DOM，准确标出 `{DISABLED}`、`{checked}`、`{selected}`、`{expanded}` 与页面校验报错。
 - **按需开启的本地站点路书（`playbook on`，默认关闭）**：代码默认 `false`。在扩展侧边栏或命令行开启后，自动剔除敏感与追踪查询参数，在本地 `~/.chrome-live-antigravity/site-playbooks.json`（`0600` 权限）记录直达路由、稳定 CSS 选择器与避坑提示，二次访问同域名直接跳过摸索。
@@ -114,7 +114,7 @@ node ./bin/chrome-live.mjs upload "./demo.png"              # 通过原生 CDP �
 node ./bin/chrome-live.mjs batch - --compact                # 从 stdin 单轮执行多步连招
 node ./bin/chrome-live.mjs extract "https://a.com"          # 后台并发提取正文与原图直链
 node ./bin/chrome-live.mjs relay popout                     # 弹出独立副屏供人工处理扫码/验证
-node ./bin/chrome-live.mjs relay merge                      # 归队回原窗口原位并交还 AI
+node ./bin/chrome-live.mjs relay merge                      # 合回原主窗口（保持已暂停保护态，在浏览器内点继续恢复 AI）
 node ./bin/chrome-live.mjs release                          # 释放当前页控制权（不关闭页面）
 node ./bin/chrome-live.mjs done "任务完成"                  # 断开调试器并清理临时工作页
 ```

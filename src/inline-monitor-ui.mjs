@@ -656,7 +656,9 @@ export function buildInlineMonitorHtml() {
         const vars = ctx.styles && ctx.styles.variables;
         if (vars && typeof vars === 'object') {
           for (const [k, v] of Object.entries(vars)) {
-            if (typeof v === 'string') document.documentElement.style.setProperty(k, v);
+            if (typeof k === 'string' && k.startsWith('--') && typeof v === 'string') {
+              document.documentElement.style.setProperty(k, v);
+            }
           }
         }
       }
@@ -816,7 +818,13 @@ export function buildInlineMonitorHtml() {
             relayBtn.dataset.relay = 'popout';
             setBtnLabel(relayBtn, L.relayOut);
             if (prevInRelay) {
-              showStatus(IS_ZH ? '副屏已归队，AI 恢复接管' : 'Relay merged back; AI resumed', 'ok', false);
+              showStatus(
+                isPaused
+                  ? (IS_ZH ? '副屏已归队（仍处于暂停态，在 Chrome 内点继续可恢复 AI）' : 'Relay merged back (Paused · Click Resume in Chrome)')
+                  : (IS_ZH ? '副屏已归队，AI 恢复接管' : 'Relay merged back; AI resumed'),
+                'ok',
+                false
+              );
             }
           }
         } else {
@@ -841,8 +849,17 @@ export function buildInlineMonitorHtml() {
           data.latestFrameMeta && data.latestFrameMeta.capturedAt
             ? data.latestFrameMeta.capturedAt
             : 0;
-        const frameMatchesPrimary = Boolean(primary && frameTabId === primary.tabId);
-        if (frameMatchesPrimary && data.frameDataUrl && (ts !== lastFrameTs || frameTabId !== lastFrameTabId)) {
+        const frameMatchesPrimary = Boolean(primary && !isPaused && frameTabId === primary.tabId);
+        if (isPaused) {
+          lastFrameTs = 0;
+          lastFrameTabId = null;
+          screenImg.removeAttribute('src');
+          screenImg.style.display = 'none';
+          emptyEl.textContent = IS_ZH
+            ? '已暂停 · 人工接管期间实时画面流已停止'
+            : 'Paused · Live stream stopped during manual control';
+          emptyEl.style.display = 'block';
+        } else if (frameMatchesPrimary && data.frameDataUrl && (ts !== lastFrameTs || frameTabId !== lastFrameTabId)) {
           lastFrameTs = ts || Date.now();
           lastFrameTabId = frameTabId;
           screenImg.onload = () => reportSize();
@@ -856,9 +873,7 @@ export function buildInlineMonitorHtml() {
           screenImg.removeAttribute('src');
           screenImg.style.display = 'none';
           emptyEl.textContent = primary
-            ? (isPaused
-                ? (IS_ZH ? '已暂停 · 人工接管期间实时画面流已停止' : 'Paused · Live stream stopped during manual control')
-                : (IS_ZH ? '正在同步当前标签页画面...' : 'Syncing frame for selected tab...'))
+            ? (IS_ZH ? '正在同步当前标签页画面...' : 'Syncing frame for selected tab...')
             : pinnedTabClosed
               ? (tabs.length > 0
                   ? (IS_ZH ? '原监控标签页已关闭或释放 · 请点击上方标签切换' : 'Watched tab was closed or released · Click a tab above to switch')
@@ -870,6 +885,7 @@ export function buildInlineMonitorHtml() {
       }
 
       window.addEventListener('message', (ev) => {
+        if (ev.source !== window.parent) return;
         const msg = ev.data;
         if (!msg || typeof msg !== 'object' || msg.jsonrpc !== '2.0') return;
 

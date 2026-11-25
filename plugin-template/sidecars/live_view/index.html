@@ -216,6 +216,8 @@
 
         let lastCapturedAt = 0;
         let activeTabId = null;
+        let pinnedTabId = null;
+        let pinnedTabClosed = false;
         let pollInFlight = false;
 
         const sidecarFetch = (route, opts = {}) => {
@@ -259,22 +261,44 @@
               return;
             }
 
-            const target = tabs[0] || null;
+            let target = null;
+            if (pinnedTabId !== null) {
+              target = tabs.find((t) => t.tabId === pinnedTabId) || null;
+              pinnedTabClosed = target === null;
+            } else if (!pinnedTabClosed) {
+              target = tabs.find((t) => t.substate === 'shared') || tabs[0] || null;
+              pinnedTabId = target ? target.tabId : null;
+            }
             activeTabId = target ? target.tabId : null;
-            focusBtn.disabled = activeTabId === null;
+            focusBtn.disabled = activeTabId === null || Boolean(target && target.paused);
 
             if (!target) {
               lastCapturedAt = 0;
               statusTitle.textContent = TXT.connectedIdle;
               urlLabel.textContent = '127.0.0.1:28196';
+              liveImg.removeAttribute('src');
               liveImg.style.display = 'none';
-              emptyMsg.textContent = TXT.emptyHint;
+              emptyMsg.textContent =
+                pinnedTabClosed && tabs.length > 0
+                  ? (IS_ZH ? '原监控页已关闭或释放' : 'Watched tab was closed or released')
+                  : TXT.emptyHint;
               emptyMsg.style.display = 'block';
               return;
             }
 
             statusTitle.textContent = target.activity || TXT.connectedIdle;
             urlLabel.textContent = target.url || target.title || '127.0.0.1:28196';
+
+            if (target.paused) {
+              lastCapturedAt = 0;
+              liveImg.removeAttribute('src');
+              liveImg.style.display = 'none';
+              emptyMsg.textContent = IS_ZH
+                ? '已暂停 · 人工接管期间画面流已停止'
+                : 'Paused · Stream stopped during manual control';
+              emptyMsg.style.display = 'block';
+              return;
+            }
 
             const remoteTs = s.latestFrameMeta?.capturedAt || 0;
             if (remoteTs && (remoteTs !== lastCapturedAt || forceFrame)) {

@@ -38,9 +38,9 @@ Connect **Google Antigravity** directly to your everyday signed-in Chrome or Edg
   - **Control**: Click, scroll, and type directly on the live frame;
   - **Pick**: Drag a box on the stream to extract real DOM selectors (traversing open Shadow DOM) straight into chat;
   - **Attach**: Push the current tab's title, URL, and `tabId` into the next prompt via `ui/update-model-context`;
-  - **Popout / Merge**: Pop a controlled tab out into a standalone window for manual QR login, 2FA, or verification; click **Merge** (or simply close the popout window) to return the tab to its original window position with your signed-in session intact;
+  - **Popout / Merge**: Pop a controlled tab out into a standalone window for manual QR login, 2FA, or verification; click **Resume** inside Chrome to merge and continue automation, or click **Merge** / close the popout window to return the tab to your main window in **Paused** state (preserving cookies; closing the window reloads the tab URL);
   - **Refresh / Release**: Pull a fresh frame immediately or detach control on demand.
-- **Human-Like Motion, Single-Roundtrip `batch` & Clean Extraction**: Pointer movements follow Bezier curves with approach deceleration and staggered typing cadence. Pipe `open -> type -> click -> wait -> snapshot -> done` through stdin in a single turn, extract clean text and full-res image URLs across multiple background tabs via `extract`, and inspect `{DISABLED}`, `{checked}`, `{selected}`, `{expanded}`, and validation alerts through open Shadow DOM.
+- **Human-Like Motion, Single-Roundtrip `batch` & Clean Extraction**: Pointer movements follow quadratic Bezier curves with approach deceleration and staggered typing cadence. Pipe `open -> type -> click -> wait -> snapshot -> done` through stdin in a single turn, extract clean text and full-res image URLs across multiple background tabs via `extract`, and inspect `{DISABLED}`, `{checked}`, `{selected}`, `{expanded}`, and validation alerts through open Shadow DOM.
 - **Opt-In Local Site Playbooks (`playbook on`, Off by Default)**: Disabled (`false`) out of the box. When enabled in the extension side panel or via CLI, stores sanitized deep-link routes, stable CSS selectors, and widget tips locally in `~/.chrome-live-antigravity/site-playbooks.json` (`0600`) so repeat visits skip landing-page discovery.
 
 ## Benchmarks
@@ -114,7 +114,7 @@ node ./bin/chrome-live.mjs upload "./demo.png"              # Attach local file 
 node ./bin/chrome-live.mjs batch - --compact                # Run multi-step stdin pipeline in 1 turn
 node ./bin/chrome-live.mjs extract "https://a.com"          # Extract clean text & image URLs in parallel
 node ./bin/chrome-live.mjs relay popout                     # Pop tab into standalone window for manual login/2FA
-node ./bin/chrome-live.mjs relay merge                      # Merge tab back to original index & resume AI
+node ./bin/chrome-live.mjs relay merge                      # Merge popout back to main window (stays Paused until Resume in Chrome)
 node ./bin/chrome-live.mjs release                          # Detach control without closing the tab
 node ./bin/chrome-live.mjs done "Task complete"             # Detach debugger & close temporary worker tabs
 ```

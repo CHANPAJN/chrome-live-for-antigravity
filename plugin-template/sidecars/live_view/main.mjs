@@ -38,6 +38,7 @@ function maybeBootstrapDaemon() {
     { host: DAEMON_HOST, port: DAEMON_PORT, path: '/api/ping', method: 'GET', timeout: 800 },
     (res) => res.resume()
   );
+  probe.on('timeout', () => probe.destroy());
   probe.on('error', () => {
     try {
       const child = spawn(process.execPath, [DAEMON_SCRIPT], {

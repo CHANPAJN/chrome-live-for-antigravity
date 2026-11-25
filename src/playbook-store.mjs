@@ -1,14 +1,29 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { evaluateUrlSafety } from './guardrails.mjs';
+import { AUDIT_SENSITIVE_PARAM_RX, evaluateUrlSafety } from './guardrails.mjs';
 import { getStateDir } from './token-store.mjs';
 
 const MAX_SITES = 120;
 const MAX_ROUTES_PER_SITE = 18;
 const MAX_TIPS_PER_SITE = 12;
 const MAX_SELECTORS_PER_SITE = 12;
+const FORBIDDEN_PROTO_KEYS = new Set(['__proto__', 'constructor', 'prototype', 'toString', 'valueOf']);
 const SENSITIVE_SELECTOR_RX =
-  /(?:password|passwd|passcode|pwd|one-time|otp|2fa|totp|cvv|cvc|secret|pin|token)/i;
+  /(?:password|passwd|passcode|pwd|one-time|otp|2fa|totp|cvv|cvc|secret|pin|token|sms|verify|captcha|code|auth|密码|口令|验证码|动态码|安全码|密钥|支付)/i;
+
+function isSafeDictKey(k) {
+  return typeof k === 'string' && k.length > 0 && !FORBIDDEN_PROTO_KEYS.has(k);
+}
+
+function toNullProtoDict(src) {
+  const out = Object.create(null);
+  if (src && typeof src === 'object' && !Array.isArray(src)) {
+    for (const [k, v] of Object.entries(src)) {
+      if (isSafeDictKey(k)) out[k] = v;
+    }
+  }
+  return out;
+}
 
 // Strip tracking noise AND sensitive auth/session query parameters before persisting locally
 const STRIP_QUERY_PATTERNS = [
@@ -23,20 +38,7 @@ const STRIP_QUERY_PATTERNS = [
   /^ts$/i,
   /^timestamp$/i,
   /^nonce$/i,
-  /^token$/i,
-  /^access_token$/i,
-  /^id_token$/i,
-  /^refresh_token$/i,
-  /^auth/i,
-  /^code$/i,
-  /^state$/i,
-  /^sig$/i,
-  /^signature$/i,
-  /^key$/i,
-  /^api_key$/i,
-  /^secret$/i,
-  /^password$/i,
-  /^session/i
+  AUDIT_SENSITIVE_PARAM_RX
 ];
 
 // Skip ephemeral feed items, search query result pages, and one-off post URLs during auto-learn
@@ -80,7 +82,7 @@ function defaultStore() {
     version: 1,
     enabled: false,
     updatedAt: 0,
-    sites: {}
+    sites: Object.create(null)
   };
 }
 
@@ -98,11 +100,23 @@ function loadStore() {
     }
     const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
     if (parsed && typeof parsed === 'object') {
+      const cleanSites = Object.create(null);
+      if (parsed.sites && typeof parsed.sites === 'object' && !Array.isArray(parsed.sites)) {
+        for (const [dom, entry] of Object.entries(parsed.sites)) {
+          if (!isSafeDictKey(dom) || !entry || typeof entry !== 'object') continue;
+          cleanSites[dom] = {
+            routes: toNullProtoDict(entry.routes),
+            selectors: toNullProtoDict(entry.selectors),
+            tips: Array.isArray(entry.tips) ? entry.tips.filter((t) => typeof t === 'string') : [],
+            updatedAt: Number(entry.updatedAt) || 0
+          };
+        }
+      }
       memoryCache = {
         version: 1,
         enabled: Boolean(parsed.enabled),
         updatedAt: Number(parsed.updatedAt) || 0,
-        sites: parsed.sites && typeof parsed.sites === 'object' ? parsed.sites : {}
+        sites: cleanSites
       };
       memoryMtimeMs = st.mtimeMs;
       return memoryCache;
@@ -144,7 +158,8 @@ export function normalizeDomain(urlOrDomain) {
   if (!raw) return '';
   try {
     const u = raw.includes('://') ? new URL(raw) : new URL(`https://${raw}`);
-    return u.hostname.toLowerCase().replace(/\.$/, '');
+    const host = u.hostname.toLowerCase().replace(/\.$/, '');
+    return isSafeDictKey(host) ? host : '';
   } catch {
     return '';
   }
@@ -164,7 +179,7 @@ export function sanitizeRouteUrl(rawUrl) {
 
   u.username = '';
   u.password = '';
-  if (u.hash && (u.hash.length > 64 || /(?:token|code|auth|session|utm_)=/i.test(u.hash))) {
+  if (u.hash && (u.hash.length > 48 || AUDIT_SENSITIVE_PARAM_RX.test(u.hash) || /utm_/i.test(u.hash))) {
     u.hash = '';
   }
 
@@ -193,7 +208,7 @@ function shouldAutoLearnUrl(cleanUrl) {
 }
 
 function ensureSiteBucket(store, domain) {
-  if (!store.sites[domain]) {
+  if (!Object.hasOwn(store.sites, domain)) {
     const keys = Object.keys(store.sites);
     if (keys.length >= MAX_SITES) {
       // Evict oldest site entry
@@ -209,8 +224,8 @@ function ensureSiteBucket(store, domain) {
       if (oldestKey) delete store.sites[oldestKey];
     }
     store.sites[domain] = {
-      routes: {},
-      selectors: {},
+      routes: Object.create(null),
+      selectors: Object.create(null),
       tips: [],
       updatedAt: Date.now()
     };
@@ -271,14 +286,14 @@ export function learnFromPageVisit({ url, title, elements = [] } = {}) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 64);
-  if (!cleanTitle) return false;
+  if (!isSafeDictKey(cleanTitle)) return false;
 
   const bucket = ensureSiteBucket(store, domain);
   let changed = false;
 
   const routeKeys = Object.keys(bucket.routes);
   if (bucket.routes[cleanTitle] !== cleanUrl) {
-    if (routeKeys.length >= MAX_ROUTES_PER_SITE && !(cleanTitle in bucket.routes)) {
+    if (routeKeys.length >= MAX_ROUTES_PER_SITE && !Object.hasOwn(bucket.routes, cleanTitle)) {
       delete bucket.routes[routeKeys[0]];
     }
     bucket.routes[cleanTitle] = cleanUrl;
@@ -290,7 +305,7 @@ export function learnFromPageVisit({ url, title, elements = [] } = {}) {
     for (const el of elements) {
       if (el && el.stableSelector && el.label && Object.keys(bucket.selectors).length < MAX_SELECTORS_PER_SITE) {
         const key = String(el.label).slice(0, 40);
-        if (SENSITIVE_SELECTOR_RX.test(key) || SENSITIVE_SELECTOR_RX.test(String(el.stableSelector))) {
+        if (!isSafeDictKey(key) || SENSITIVE_SELECTOR_RX.test(key) || SENSITIVE_SELECTOR_RX.test(String(el.stableSelector))) {
           continue;
         }
         if (bucket.selectors[key] !== el.stableSelector) {
@@ -319,8 +334,8 @@ export function learnInteractionSelector({ url, label, selector } = {}) {
 
   const cleanKey = String(label).replace(/\s+/g, ' ').trim().slice(0, 42);
   const cleanCss = String(selector).trim().slice(0, 140);
-  if (!cleanKey || !cleanCss) return false;
-  if (/(?:password|passwd|passcode|pwd|one-time|otp|2fa|totp|cvv|cvc|secret|pin|token)/i.test(`${cleanKey} ${cleanCss}`)) {
+  if (!isSafeDictKey(cleanKey) || !cleanCss) return false;
+  if (SENSITIVE_SELECTOR_RX.test(`${cleanKey} ${cleanCss}`)) {
     return false;
   }
 
@@ -328,7 +343,7 @@ export function learnInteractionSelector({ url, label, selector } = {}) {
   if (bucket.selectors[cleanKey] === cleanCss) return false;
 
   const keys = Object.keys(bucket.selectors);
-  if (keys.length >= MAX_SELECTORS_PER_SITE && !(cleanKey in bucket.selectors)) {
+  if (keys.length >= MAX_SELECTORS_PER_SITE && !Object.hasOwn(bucket.selectors, cleanKey)) {
     delete bucket.selectors[keys[0]];
   }
   bucket.selectors[cleanKey] = cleanCss;
@@ -362,12 +377,17 @@ export function saveManualPlaybook({ domain: rawDomain, route, tip, tipIndex, se
     }
     const cleanUrl = sanitizeRouteUrl(candidateUrl);
     if (!cleanUrl) throw new Error('Route URL is invalid or blocked by guardrails');
+    const routeHost = normalizeDomain(cleanUrl);
+    if (!routeHost || (routeHost !== domain && !routeHost.endsWith(`.${domain}`))) {
+      throw new Error(`Route URL host "${routeHost}" does not match playbook domain "${domain}"`);
+    }
     const name = String(route.name).trim().slice(0, 64);
-    if (route.oldName && route.oldName !== name && route.oldName in bucket.routes) {
+    if (!isSafeDictKey(name)) throw new Error('Invalid route shortcut name');
+    if (route.oldName && route.oldName !== name && Object.hasOwn(bucket.routes, route.oldName)) {
       delete bucket.routes[route.oldName];
     }
     const keys = Object.keys(bucket.routes);
-    if (keys.length >= MAX_ROUTES_PER_SITE && !(name in bucket.routes)) {
+    if (keys.length >= MAX_ROUTES_PER_SITE && !Object.hasOwn(bucket.routes, name)) {
       delete bucket.routes[keys[0]];
     }
     bucket.routes[name] = cleanUrl;
@@ -376,14 +396,15 @@ export function saveManualPlaybook({ domain: rawDomain, route, tip, tipIndex, se
   if (selector && typeof selector === 'object' && selector.name && selector.css) {
     const name = String(selector.name).trim().slice(0, 48);
     const css = String(selector.css).trim().slice(0, 140);
+    if (!isSafeDictKey(name)) throw new Error('Invalid selector alias');
     if (SENSITIVE_SELECTOR_RX.test(name) || SENSITIVE_SELECTOR_RX.test(css)) {
       throw new Error('Refusing to store sensitive password/OTP/token selector in playbook');
     }
-    if (selector.oldName && selector.oldName !== name && selector.oldName in bucket.selectors) {
+    if (selector.oldName && selector.oldName !== name && Object.hasOwn(bucket.selectors, selector.oldName)) {
       delete bucket.selectors[selector.oldName];
     }
     const keys = Object.keys(bucket.selectors);
-    if (keys.length >= MAX_SELECTORS_PER_SITE && !(name in bucket.selectors)) {
+    if (keys.length >= MAX_SELECTORS_PER_SITE && !Object.hasOwn(bucket.selectors, name)) {
       delete bucket.selectors[keys[0]];
     }
     bucket.selectors[name] = css;
@@ -464,9 +485,9 @@ export function clearPlaybooks(rawDomain = '') {
   const store = loadStore();
   if (rawDomain) {
     const d = normalizeDomain(rawDomain);
-    delete store.sites[d];
+    if (d) delete store.sites[d];
   } else {
-    store.sites = {};
+    store.sites = Object.create(null);
   }
   persistStore(store);
   return getPlaybookSummary();

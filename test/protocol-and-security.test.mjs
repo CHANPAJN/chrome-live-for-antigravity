@@ -10,9 +10,21 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { computeChallengeHmac, createDaemonServer } from '../src/daemon.mjs';
-import { evaluateUploadFileSafety, evaluateUrlSafety, getDefaultUploadStagingDir } from '../src/guardrails.mjs';
+import {
+  evaluateUploadFileSafety,
+  evaluateUrlSafety,
+  getDefaultUploadStagingDir,
+  redactUrlForAudit
+} from '../src/guardrails.mjs';
 import { buildSignedHttpHeaders, verifySignedHttpResponse } from '../src/hmac-auth.mjs';
-import { learnFromPageVisit, learnInteractionSelector, lookupDomainPlaybook, sanitizeRouteUrl, setPlaybookEnabled } from '../src/playbook-store.mjs';
+import {
+  learnFromPageVisit,
+  learnInteractionSelector,
+  lookupDomainPlaybook,
+  sanitizeRouteUrl,
+  saveManualPlaybook,
+  setPlaybookEnabled
+} from '../src/playbook-store.mjs';
 import { computeWebSocketAccept, encodeWsFrame, NativeWsPeer } from '../src/ws-codec.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -599,12 +611,41 @@ test('Edge-case regressions: SPA hash checkout guardrail, UTF-8 multibyte WS clo
     await closePromise;
     assert.equal(wsClient.closed, true);
 
-    // Verify UTF-8 multibyte close reason never produces >125B payload
+    // Verify UTF-8 multibyte close reason never produces >125B payload or broken UTF-8 (RFC 6455 §5.5)
     const client2 = await connectTestWsClient(port, '/ws/extension', testToken);
-    const rawChunks = [];
-    client2.socket.on('data', (c) => rawChunks.push(c));
-    client2.close(1000, '这是一段非常长的中文关闭原因用于验证多字节截断绝不会超过一百二十五字节上限'.repeat(3));
-    await new Promise((r) => setTimeout(r, 60));
+    const writtenFrames = [];
+    const origEnd = client2.socket.end.bind(client2.socket);
+    client2.socket.end = (chunk, ...rest) => {
+      if (chunk) writtenFrames.push(Buffer.from(chunk));
+      return origEnd(chunk, ...rest);
+    };
+    // Add 1 ASCII byte prefix so byte 123 lands inside a 3-byte Chinese code point if naively sliced
+    const longReason = 'A' + '这是一段非常长的中文关闭原因用于验证多字节截断绝不会超过一百二十五字节上限'.repeat(3);
+    const client2ClosePromise = new Promise((resolve) => client2.on('close', resolve));
+    client2.close(1000, longReason);
+    await client2ClosePromise;
+    const closeFrame = writtenFrames.find((buf) => (buf[0] & 0x0f) === 0x08);
+    assert.ok(closeFrame, 'Expected an outbound 0x08 close control frame');
+    const isMasked = (closeFrame[1] & 0x80) !== 0;
+    const payloadLenByte = closeFrame[1] & 0x7f;
+    assert.ok(payloadLenByte <= 125, `Control frame length byte must be <= 125, got ${payloadLenByte}`);
+    assert.equal(closeFrame.length, 2 + (isMasked ? 4 : 0) + payloadLenByte, 'Close frame total bytes must match <=125B payload');
+    const decodedReason = closeFrame.subarray(2 + (isMasked ? 4 : 0) + 2).toString('utf8');
+    assert.equal(decodedReason.includes('\uFFFD'), false, 'Truncated UTF-8 close reason must not split multi-byte characters');
+
+    // Verify non-zero RSV bits (e.g. RSV1=1 -> 0x40) are rejected with protocol error 1002
+    const client3 = await connectTestWsClient(port, '/ws/extension', testToken);
+    const rsvClosePromise = new Promise((resolve) => client3.on('close', (code) => resolve(code)));
+    const rsvMask = crypto.randomBytes(4);
+    const rsvPayload = Buffer.from('{}', 'utf8');
+    const rsvFrame = Buffer.allocUnsafe(6 + rsvPayload.length);
+    rsvFrame[0] = 0x80 | 0x40 | 0x01; // FIN=1, RSV1=1 (illegal without negotiated extension), opcode=text
+    rsvFrame[1] = 0x80 | rsvPayload.length;
+    rsvMask.copy(rsvFrame, 2);
+    for (let i = 0; i < rsvPayload.length; i++) rsvFrame[6 + i] = rsvPayload[i] ^ rsvMask[i & 3];
+    client3.socket.write(rsvFrame);
+    const rsvCloseCode = await rsvClosePromise;
+    assert.equal(rsvCloseCode, 1002, 'Non-zero RSV bits without extension negotiation must close with 1002');
   } finally {
     await daemon.close();
   }
@@ -1524,7 +1565,358 @@ test('Security audit hardening: mutual HTTP/WS HMAC, replay defense, runtime boo
   // Verify extension panel sender isolation, HUD isTrusted guard, and TreeWalker draft/hidden exclusions
   assert.match(swSource, /const expectedPanelPrefix = chrome\.runtime\.getURL\('panel\/'\);/);
   assert.match(swSource, /if \(sender\.tab \|\| typeof sender\.url !== 'string' \|\| !sender\.url\.startsWith\(expectedPanelPrefix\)\)/);
-  assert.match(swSource, /\[contenteditable="true"\], \[hidden\], \[aria-hidden="true"\]/);
+  assert.match(swSource, /\[contenteditable\]:not\(\[contenteditable="false"\]\)/);
   const hudSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'hud.js'), 'utf8');
   assert.match(hudSource, /if \(!ev\.isTrusted\) return;/);
+});
+
+test('Blind-audit round-1 regressions: multi-tab release isolation, paused frame purge, dynamic token rotation, 4009 eviction, stdio Content-Length framing, tilde/ADS upload guardrails & playbook prototype safety', async () => {
+  const { spawn } = await import('node:child_process');
+
+  // 1. Expanded URL & fragment redaction (client_secret, x-amz-signature, opaque #eyJ... JWT fragment)
+  const oauthCallbackUrl =
+    'https://app.example.com/cb?client_secret=cs_live_999&X-Amz-Signature=sig_abc&page=2#eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secretpayload';
+  const redactedOauth = redactUrlForAudit(oauthCallbackUrl);
+  assert.equal(redactedOauth.includes('cs_live_999'), false);
+  assert.equal(redactedOauth.includes('sig_abc'), false);
+  assert.equal(redactedOauth.includes('eyJhbGci'), false);
+  assert.match(redactedOauth, /page=2/);
+
+  // 2. Upload guardrails: ~ expansion, Fail-Closed empty CHROME_LIVE_UPLOAD_DIR, NTFS ADS & trailing dot blocking
+  const prevHome = process.env.CHROME_LIVE_HOME;
+  const prevUploadDir = process.env.CHROME_LIVE_UPLOAD_DIR;
+  const prevEnvToken = process.env.CHROME_LIVE_TOKEN;
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-r2-home-'));
+  try {
+    delete process.env.CHROME_LIVE_TOKEN;
+    process.env.CHROME_LIVE_HOME = tempHome;
+    process.env.CHROME_LIVE_UPLOAD_DIR = ' ; ; '; // Empty segments MUST fail-closed to default staging dir
+    const outsideTmpFile = path.join(os.tmpdir(), `outside-${Date.now()}.png`);
+    fs.writeFileSync(outsideTmpFile, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    try {
+      const outsideCheck = evaluateUploadFileSafety(outsideTmpFile);
+      assert.equal(outsideCheck.allowed, false);
+      assert.equal(outsideCheck.code, 'UPLOAD_DIR_RESTRICTED');
+    } finally {
+      fs.rmSync(outsideTmpFile, { force: true });
+    }
+
+    const stagingDir = getDefaultUploadStagingDir();
+    fs.mkdirSync(stagingDir, { recursive: true });
+    const stagedImg = path.join(stagingDir, 'ok.png');
+    fs.writeFileSync(stagedImg, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    assert.equal(evaluateUploadFileSafety(stagedImg).allowed, true);
+
+    // NTFS Alternate Data Stream syntax & trailing dot bypasses must be rejected before fs access
+    const adsCheck = evaluateUploadFileSafety(`${stagedImg}::$DATA`);
+    assert.equal(adsCheck.allowed, false);
+    assert.equal(adsCheck.code, 'INVALID_FILE');
+
+    const trailingDotCheck = evaluateUploadFileSafety(path.join(stagingDir, '.env.'));
+    assert.equal(trailingDotCheck.allowed, false);
+
+    // Tilde expansion (~/)
+    const realHomeSubCheck = evaluateUploadFileSafety('~/.ssh/id_rsa');
+    assert.equal(realHomeSubCheck.allowed, false);
+
+    // 3. Playbook prototype safety & Chinese sensitive selector rejection & route domain boundary
+    setPlaybookEnabled(true);
+    assert.equal(learnFromPageVisit({ url: 'https://__proto__/orders', title: 'Polluted' }), false);
+    assert.equal(learnFromPageVisit({ url: 'https://shop.example.com/orders', title: '__proto__' }), false);
+    assert.equal(learnFromPageVisit({ url: 'https://shop.example.com/orders', title: 'constructor' }), false);
+    assert.equal(({}).polluted, undefined);
+    assert.equal(lookupDomainPlaybook('__proto__'), null);
+    assert.equal(lookupDomainPlaybook('constructor'), null);
+
+    assert.equal(
+      learnInteractionSelector({ url: 'https://shop.example.com/login', label: '短信验证码', selector: '#sms-input' }),
+      false
+    );
+    assert.equal(
+      learnInteractionSelector({ url: 'https://shop.example.com/login', label: '支付密码', selector: '#pay-pwd' }),
+      false
+    );
+    assert.equal(
+      learnInteractionSelector({ url: 'https://shop.example.com/items', label: '搜索商品', selector: '#search-box' }),
+      true
+    );
+    const pb = lookupDomainPlaybook('shop.example.com');
+    assert.ok(pb);
+    assert.equal(Object.keys(pb.selectors).some((k) => k.includes('验证码') || k.includes('密码')), false);
+    assert.equal(pb.selectors['搜索商品'], '#search-box');
+
+    saveManualPlaybook({
+      domain: 'shop.example.com',
+      route: { name: 'okRoute', url: 'https://sub.shop.example.com/orders?access_token=leak123&tab=all' }
+    });
+    assert.throws(
+      () =>
+        saveManualPlaybook({
+          domain: 'shop.example.com',
+          route: { name: 'crossDomainEvil', url: 'https://attacker.example.org/phish' }
+        }),
+      /does not match playbook domain/
+    );
+    assert.throws(
+      () =>
+        saveManualPlaybook({
+          domain: 'shop.example.com',
+          route: { name: '__proto__', url: 'https://shop.example.com/proto' }
+        }),
+      /Invalid route shortcut name/
+    );
+    const pbAfterManual = lookupDomainPlaybook('shop.example.com');
+    assert.equal(pbAfterManual.routes.crossDomainEvil, undefined, 'Cross-domain manual route must be rejected');
+    assert.equal(pbAfterManual.routes.okRoute.includes('leak123'), false, 'Manual route must strip sensitive query');
+
+    // 4. Daemon dynamic disk token rotation, 4009 peer eviction, paused frame purge, and image URL redaction
+    let activeToken = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(path.join(tempHome, 'auth.token'), `${activeToken}\n`, 'utf8');
+    const daemon = createDaemonServer({
+      host: '127.0.0.1',
+      port: 0
+    });
+    const port = await daemon.listen();
+
+    let mcpProc = null;
+    let ext1 = null;
+    let ext2 = null;
+    try {
+      ext1 = await connectTestWsClient(port, '/ws/extension', activeToken);
+      const ext1CloseCodePromise = new Promise((resolve) => ext1.on('close', (code) => resolve(code)));
+
+      // Connecting a second extension profile must evict the first with 4009 (not 1000)
+      ext2 = await connectTestWsClient(port, '/ws/extension', activeToken);
+      const evictedCode = await ext1CloseCodePromise;
+      assert.equal(evictedCode, 4009, 'Replaced extension socket must close with 4009 to prevent reconnect storms');
+
+      const rpcCallsSeen = [];
+      let tabsState = [
+        { tabId: 77, substate: 'shared', paused: false, title: 'Tab 77', url: 'https://a.example.com/?token=secret77' },
+        { tabId: 88, substate: 'shared', paused: false, title: 'Tab 88', url: 'https://b.example.com/' }
+      ];
+
+      ext2.sendMaskedJson({ type: 'hello', version: '1.0.0', tabs: tabsState });
+      ext2.sendMaskedJson({
+        type: 'screencast_frame',
+        tabId: 88,
+        mimeType: 'image/jpeg',
+        data: Buffer.from('jpeg-88').toString('base64'),
+        title: 'Tab 88',
+        url: 'https://b.example.com/'
+      });
+      ext2.sendMaskedJson({
+        type: 'screencast_frame',
+        tabId: 77,
+        mimeType: 'image/jpeg',
+        data: Buffer.from('jpeg-77').toString('base64'),
+        title: 'Tab 77',
+        url: 'https://a.example.com/?token=secret77#eyJhbGciOiJIUzI1NiJ9.secret'
+      });
+
+      ext2.on('message', (raw) => {
+        const msg = JSON.parse(raw.toString('utf8'));
+        if (msg.type === 'rpc_request') {
+          rpcCallsSeen.push({ method: msg.method, params: msg.params });
+          if (msg.method === 'release_tab' && msg.params?.tabId === 88) {
+            tabsState = tabsState.filter((t) => t.tabId !== 88);
+            ext2.sendMaskedJson({ type: 'status_sync', tabs: tabsState, activeTabId: 77 });
+            ext2.sendMaskedJson({ type: 'rpc_response', id: msg.id, ok: true, result: { released: true, tabId: 88 } });
+            return;
+          }
+          if (msg.method === 'extract') {
+            ext2.sendMaskedJson({
+              type: 'rpc_response',
+              id: msg.id,
+              ok: true,
+              result: {
+                url: 'https://a.example.com/?api_secret=topsecret',
+                images: ['https://cdn.example.com/img.png?X-Amz-Signature=amz_secret_999']
+              }
+            });
+            return;
+          }
+          ext2.sendMaskedJson({ type: 'rpc_response', id: msg.id, ok: true, result: { ok: true } });
+        }
+      });
+      await new Promise((r) => setTimeout(r, 40));
+
+      // Verify frame URL ingested into daemon has query/hash secrets redacted
+      const signedGet = (reqPath, tok = activeToken) =>
+        new Promise((resolve, reject) => {
+          const { headers } = buildSignedHttpHeaders(tok, 'GET', reqPath);
+          http
+            .get({ host: '127.0.0.1', port, path: reqPath, headers, agent: false }, (res) => {
+              const chunks = [];
+              res.on('data', (c) => chunks.push(c));
+              res.on('end', () => {
+                const rawBuf = Buffer.concat(chunks);
+                const isJson = String(res.headers['content-type'] || '').includes('application/json');
+                resolve({
+                  status: res.statusCode,
+                  headers: res.headers,
+                  rawBuf,
+                  body: isJson && rawBuf.length > 0 ? JSON.parse(rawBuf.toString('utf8')) : null
+                });
+              });
+            })
+            .on('error', reject);
+        });
+
+      const frameBeforePause = await signedGet('/api/frame?tabId=77');
+      assert.equal(frameBeforePause.status, 200);
+      assert.equal(frameBeforePause.rawBuf.toString('utf8'), 'jpeg-77');
+
+      const stateBeforePause = await signedGet('/api/state');
+      assert.equal(stateBeforePause.status, 200);
+      assert.equal(JSON.stringify(stateBeforePause.body).includes('secret77'), false);
+      assert.equal(JSON.stringify(stateBeforePause.body).includes('eyJhbGci'), false);
+
+      // Verify images[] redaction on RPC responses
+      const signedPost = (reqPath, payload, tok = activeToken) =>
+        new Promise((resolve, reject) => {
+          const bodyBuf = Buffer.from(JSON.stringify(payload), 'utf8');
+          const { headers: sigHeaders } = buildSignedHttpHeaders(tok, 'POST', reqPath, bodyBuf);
+          const headers = {
+            'Content-Type': 'application/json',
+            'Content-Length': bodyBuf.length,
+            ...sigHeaders
+          };
+          const req = http.request(
+            { host: '127.0.0.1', port, path: reqPath, method: 'POST', headers, agent: false },
+            (res) => {
+              const chunks = [];
+              res.on('data', (c) => chunks.push(c));
+              res.on('end', () =>
+                resolve({ status: res.statusCode, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) })
+              );
+            }
+          );
+          req.on('error', reject);
+          req.end(bodyBuf);
+        });
+
+      const extractRes = await signedPost('/api/command', { method: 'extract', params: { tabId: 77 } });
+      assert.equal(extractRes.status, 200);
+      assert.equal(JSON.stringify(extractRes.body).includes('topsecret'), false);
+      assert.equal(JSON.stringify(extractRes.body).includes('amz_secret_999'), false);
+
+      // Verify MCP Content-Length multi-header fragmented framing & multi-tab release_tab isolation
+      const cliPath = path.join(REPO_ROOT, 'bin', 'chrome-live.mjs');
+      mcpProc = spawn(process.execPath, [cliPath, 'mcp'], {
+        env: { ...process.env, CHROME_LIVE_PORT: String(port), CHROME_LIVE_HOME: tempHome },
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+
+      const framedResponses = new Map();
+      let outBuf = Buffer.alloc(0);
+      mcpProc.stdout.on('data', (chunk) => {
+        outBuf = Buffer.concat([outBuf, chunk]);
+        while (true) {
+          const sep = outBuf.indexOf('\r\n\r\n');
+          if (sep === -1) break;
+          const hdr = outBuf.slice(0, sep).toString('ascii');
+          const m = hdr.match(/content-length:\s*(\d+)/i);
+          assert.ok(m, 'Expected Content-Length response framing when request used Content-Length');
+          const len = Number(m[1]);
+          if (outBuf.length < sep + 4 + len) break;
+          const jsonBytes = outBuf.slice(sep + 4, sep + 4 + len);
+          outBuf = outBuf.slice(sep + 4 + len);
+          const parsed = JSON.parse(jsonBytes.toString('utf8'));
+          if (parsed.id !== undefined) framedResponses.set(parsed.id, parsed);
+        }
+      });
+
+      const writeFragmentedContentLengthRpc = async (id, method, params = {}) => {
+        const bodyBuf = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id, method, params }), 'utf8');
+        const headerStr =
+          `Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n` +
+          `Content-Length: ${bodyBuf.length}\r\n\r\n`;
+        const fullFrame = Buffer.concat([Buffer.from(headerStr, 'ascii'), bodyBuf]);
+        // Drip in tiny 7-byte chunks (< 15 bytes!) to exercise split header parsing
+        for (let off = 0; off < fullFrame.length; off += 7) {
+          mcpProc.stdin.write(fullFrame.slice(off, Math.min(off + 7, fullFrame.length)));
+          await new Promise((r) => setTimeout(r, 2));
+        }
+        for (let i = 0; i < 60; i++) {
+          if (framedResponses.has(id)) return framedResponses.get(id);
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        throw new Error(`Timeout waiting for framed MCP response id=${id}`);
+      };
+
+      const initFramed = await writeFragmentedContentLengthRpc(101, 'initialize', { protocolVersion: '2024-11-05' });
+      assert.ok(initFramed.result?.serverInfo);
+
+      const monInit = await writeFragmentedContentLengthRpc(102, 'tools/call', {
+        name: 'chrome_live_monitor',
+        arguments: { tabId: 88 }
+      });
+      const uiSecret = monInit.result.structuredContent.uiSecret;
+      assert.equal(monInit.result.structuredContent.frameTabId, 88);
+
+      // Releasing tab 88 while tab 77 is still active MUST NOT trigger screenshot on tab 77 or leak tab 77's frame
+      rpcCallsSeen.length = 0;
+      const rel88 = await writeFragmentedContentLengthRpc(103, 'tools/call', {
+        name: 'chrome_live_monitor',
+        arguments: { action: 'release_tab', tabId: 88, uiSecret }
+      });
+      assert.equal(rel88.result.structuredContent.requestedTabMissing, true);
+      assert.equal(rel88.result.structuredContent.frameDataUrl ?? null, null);
+      assert.equal(
+        rpcCallsSeen.some((c) => c.method === 'screenshot'),
+        false,
+        'Releasing tab 88 must never attach debugger / screenshot remaining tab 77'
+      );
+
+      // Pausing tab 77 MUST purge its cached frame from daemon
+      tabsState = [{ tabId: 77, substate: 'shared', paused: true, title: 'Tab 77', url: 'https://a.example.com/' }];
+      ext2.sendMaskedJson({ type: 'status_sync', tabs: tabsState, activeTabId: 77 });
+      await new Promise((r) => setTimeout(r, 40));
+
+      const frameAfterPause = await signedGet('/api/frame?tabId=77');
+      assert.equal(frameAfterPause.status, 204, 'Paused tab cached frame must be purged (204 No Content)');
+
+      const monPaused77 = await writeFragmentedContentLengthRpc(104, 'tools/call', {
+        name: 'chrome_live_monitor',
+        arguments: { action: 'poll', lastFrameTs: 0, tabId: 77, uiSecret }
+      });
+      assert.equal(monPaused77.result.structuredContent.frameDataUrl ?? null, null, 'Paused tab poll must return null frame');
+
+      // Dynamic token rotation without daemon restart
+      const oldToken = activeToken;
+      const rotatedToken = crypto.randomBytes(32).toString('hex');
+      activeToken = rotatedToken;
+      fs.writeFileSync(path.join(tempHome, 'auth.token'), `${rotatedToken}\n`, 'utf8');
+
+      const staleReq = await signedGet('/api/state', oldToken);
+      assert.equal(staleReq.status, 401, 'Old token must be rejected immediately after rotation');
+      const freshReq = await signedGet('/api/state', rotatedToken);
+      assert.equal(freshReq.status, 200, 'Rotated token must succeed without restarting daemon');
+    } finally {
+      try {
+        ext1?.socket?.destroy();
+      } catch {}
+      try {
+        ext2?.socket?.destroy();
+      } catch {}
+      if (mcpProc) {
+        try {
+          mcpProc.stdin?.destroy();
+          mcpProc.stdout?.destroy();
+          mcpProc.stderr?.destroy();
+        } catch {}
+        mcpProc.kill();
+      }
+      await daemon.close();
+    }
+  } finally {
+    if (prevHome === undefined) delete process.env.CHROME_LIVE_HOME;
+    else process.env.CHROME_LIVE_HOME = prevHome;
+    if (prevUploadDir === undefined) delete process.env.CHROME_LIVE_UPLOAD_DIR;
+    else process.env.CHROME_LIVE_UPLOAD_DIR = prevUploadDir;
+    if (prevEnvToken === undefined) delete process.env.CHROME_LIVE_TOKEN;
+    else process.env.CHROME_LIVE_TOKEN = prevEnvToken;
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
 });

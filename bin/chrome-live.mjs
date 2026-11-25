@@ -5,7 +5,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getDefaultUploadStagingDir } from '../src/guardrails.mjs';
+import { expandLeadingTilde, getDefaultUploadStagingDir } from '../src/guardrails.mjs';
 import { buildSignedHttpHeaders, verifySignedHttpResponse } from '../src/hmac-auth.mjs';
 import { startMcpStdioServer } from '../src/mcp-server.mjs';
 import {
@@ -321,8 +321,14 @@ async function main() {
     try {
       const res = await requestDaemon('POST', '/api/shutdown', {}, 2500);
       process.stdout.write(`${JSON.stringify(res)}\n`);
-    } catch {
-      process.stdout.write(`{"ok":true,"alreadyStopped":true}\n`);
+    } catch (err) {
+      const code = err && typeof err === 'object' ? err.code : '';
+      const msg = err instanceof Error ? err.message : String(err);
+      if (code === 'ECONNREFUSED' || code === 'ECONNRESET' || /ECONNREFUSED|socket hang up/i.test(msg)) {
+        process.stdout.write(`{"ok":true,"alreadyStopped":true}\n`);
+      } else {
+        throw new Error(`Failed to stop running daemon on ${DEFAULT_HOST}:${DEFAULT_PORT}: ${msg}`);
+      }
     }
     return;
   }
@@ -485,7 +491,7 @@ async function main() {
     let fileArgs = positional;
 
     if (flags.target === undefined && positional.length >= 2) {
-      const firstAsPath = path.resolve(positional[0]);
+      const firstAsPath = path.resolve(expandLeadingTilde(positional[0]));
       let firstIsFile = false;
       try {
         firstIsFile = fs.existsSync(firstAsPath) && fs.statSync(firstAsPath).isFile();
@@ -496,9 +502,10 @@ async function main() {
       }
     }
 
+    const expandedFiles = fileArgs.map((f) => expandLeadingTilde(String(f || '')));
     const res = await callDaemonWithAutoStart('POST', '/api/command', {
       method: 'upload',
-      params: { target, files: fileArgs, tabId }
+      params: { target, files: expandedFiles, tabId }
     });
     process.stdout.write(`${JSON.stringify(res.result, null, 2)}\n`);
     return;

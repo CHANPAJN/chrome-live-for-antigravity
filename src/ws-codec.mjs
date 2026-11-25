@@ -53,6 +53,17 @@ export function encodeWsFrame(opcode, payloadBuffer, mask = false) {
   return frame;
 }
 
+function truncateUtf8Bytes(input, maxBytes) {
+  const full = Buffer.from(String(input ?? ''), 'utf8');
+  if (full.length <= maxBytes) return full;
+  let end = maxBytes;
+  // Walk back over UTF-8 continuation bytes (10xxxxxx) so we never split a multi-byte code point
+  while (end > 0 && (full[end] & 0xc0) === 0x80) {
+    end -= 1;
+  }
+  return full.subarray(0, end);
+}
+
 export class NativeWsPeer extends EventEmitter {
   constructor(socket, { maxPayloadBytes = 16 * 1024 * 1024, requireMask = false } = {}) {
     super();
@@ -101,12 +112,12 @@ export class NativeWsPeer extends EventEmitter {
     }
   }
 
-  close(code = 1000, reason = '') {
+  close(code = 1000, reason = '', emitCode = code, emitReason = reason) {
     if (this.closed) return;
     this.closed = true;
     try {
-      // RFC 6455 Section 5.5: Control frames MUST have a payload length <= 125 bytes (2-byte code + <=123 UTF-8 bytes)
-      const reasonBuf = Buffer.from(String(reason), 'utf8').subarray(0, 123);
+      // RFC 6455 Section 5.5: Control frames MUST have payload <= 125 bytes (2-byte code + <=123 valid UTF-8 bytes)
+      const reasonBuf = truncateUtf8Bytes(reason, 123);
       const body = Buffer.allocUnsafe(2 + reasonBuf.length);
       body.writeUInt16BE(code, 0);
       reasonBuf.copy(body, 2);
@@ -116,7 +127,7 @@ export class NativeWsPeer extends EventEmitter {
         this.socket.destroy();
       } catch {}
     }
-    this.emit('close');
+    this.emit('close', emitCode, String(emitReason ?? ''));
   }
 
   _markClosed() {
@@ -124,7 +135,7 @@ export class NativeWsPeer extends EventEmitter {
     this.closed = true;
     this._buffer = Buffer.alloc(0);
     this._fragments = [];
-    this.emit('close');
+    this.emit('close', 1006, '');
   }
 
   _onData(chunk) {
@@ -134,6 +145,10 @@ export class NativeWsPeer extends EventEmitter {
     while (this._buffer.length >= 2) {
       const first = this._buffer[0];
       const second = this._buffer[1];
+      if ((first & 0x70) !== 0) {
+        this.close(1002, 'RSV bits must be 0 per RFC 6455');
+        return;
+      }
       const fin = (first & 0x80) !== 0;
       const opcode = first & 0x0f;
       const masked = (second & 0x80) !== 0;
@@ -197,7 +212,14 @@ export class NativeWsPeer extends EventEmitter {
       }
     }
     if (opcode === 0x08) {
-      this.close(1000, 'Peer closed');
+      if (payload.length === 1) {
+        this.close(1002, 'Invalid 1-byte close payload');
+        return;
+      }
+      const peerCode = payload.length >= 2 ? payload.readUInt16BE(0) : 1005;
+      const peerReason = payload.length > 2 ? payload.subarray(2).toString('utf8') : '';
+      const replyCode = peerCode >= 1000 && peerCode <= 4999 && peerCode !== 1005 && peerCode !== 1006 ? peerCode : 1000;
+      this.close(replyCode, 'Peer closed', peerCode, peerReason);
       return;
     }
     if (opcode === 0x09) {
@@ -264,7 +286,12 @@ export class NativeWsPeer extends EventEmitter {
   }
 }
 
-export function upgradeHttpToWebSocket(req, socket, head, { requireMask = true } = {}) {
+export function upgradeHttpToWebSocket(
+  req,
+  socket,
+  head,
+  { requireMask = true, maxPayloadBytes = 16 * 1024 * 1024 } = {}
+) {
   const key = req.headers['sec-websocket-key'];
   if (!key || typeof key !== 'string') {
     socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
@@ -281,7 +308,7 @@ export function upgradeHttpToWebSocket(req, socket, head, { requireMask = true }
   ].join('\r\n');
 
   socket.write(responseHeaders);
-  const peer = new NativeWsPeer(socket, { requireMask });
+  const peer = new NativeWsPeer(socket, { requireMask, maxPayloadBytes });
   if (head && head.length > 0) {
     peer._onData(head);
   }

@@ -859,6 +859,7 @@
         if (selfDestructIfOrphan()) return;
         this._cancelHoldUnlock();
         this._clearConfirmState();
+        this._state.mode = 'paused';
         this._state.visible = false;
         this._notifyBackground('release');
         this._render();

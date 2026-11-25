@@ -1,6 +1,17 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { getStateDir } from './token-store.mjs';
+
+export function expandLeadingTilde(rawPath) {
+  if (typeof rawPath !== 'string') return '';
+  const trimmed = rawPath.trim();
+  if (trimmed === '~') return os.homedir();
+  if (trimmed.startsWith('~/') || trimmed.startsWith('~\\')) {
+    return path.join(os.homedir(), trimmed.slice(2));
+  }
+  return trimmed;
+}
 
 const BLOCKED_PROTOCOLS = new Set([
   'chrome:',
@@ -61,11 +72,11 @@ const CHECKOUT_PATH_PATTERNS = [
   /\/wallet\/transfer(?:\/|\?|$|#)/i
 ];
 
-const AUDIT_SENSITIVE_PARAM_RX =
-  /^(?:token|access_token|id_token|refresh_token|auth.*|code|state|sig|signature|key|api_key|secret|password|session.*)$/i;
+export const AUDIT_SENSITIVE_PARAM_RX =
+  /(?:token|secret|passw|pwd|apikey|api[-_]?key|access[-_]?key|private[-_]?key|auth|code|state|sig|jwt|bearer|ticket|session|sid|csrf|xsrf|otp|credential)/i;
 
 const HASH_SENSITIVE_PAIR_RX =
-  /([#?&])(token|access_token|id_token|refresh_token|auth[a-z0-9_.-]*|code|state|sig|signature|key|api_key|secret|password|session[a-z0-9_.-]*)=([^&#]*)/gi;
+  /([#?&])([^=&#]*(?:token|secret|passw|pwd|apikey|api[-_]?key|access[-_]?key|private[-_]?key|auth|code|state|sig|jwt|bearer|ticket|session|sid|csrf|xsrf|otp|credential)[^=&#]*)=([^&#]*)/gi;
 
 export function redactUrlForAudit(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return rawUrl;
@@ -86,7 +97,10 @@ export function redactUrlForAudit(rawUrl) {
       }
     }
     if (parsed.hash) {
-      const cleanedHash = parsed.hash.replace(HASH_SENSITIVE_PAIR_RX, '$1$2=REDACTED');
+      let cleanedHash = parsed.hash.replace(HASH_SENSITIVE_PAIR_RX, '$1$2=REDACTED');
+      if (cleanedHash === parsed.hash && /^#(?:eyJ[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{32,})$/.test(parsed.hash)) {
+        cleanedHash = '#REDACTED';
+      }
       if (cleanedHash !== parsed.hash) {
         parsed.hash = cleanedHash;
         mutated = true;
@@ -96,6 +110,11 @@ export function redactUrlForAudit(rawUrl) {
   } catch {
     return rawUrl;
   }
+}
+
+export function redactUrlsInText(rawText) {
+  if (typeof rawText !== 'string' || !rawText.includes('http')) return rawText;
+  return rawText.replace(/https?:\/\/[^\s"'<>)\]]+/gi, (m) => redactUrlForAudit(m));
 }
 
 export function evaluateUrlSafety(rawUrl, customBlockedDomains = []) {
@@ -169,9 +188,9 @@ export function evaluateUrlSafety(rawUrl, customBlockedDomains = []) {
 }
 
 const SENSITIVE_FILE_DIR_RX =
-  /(?:^|\/)(?:\.ssh|\.gnupg|\.aws|\.kube|\.chrome-live-antigravity)(?:\/|$)/i;
+  /(?:^|\/)(?:\.ssh|\.gnupg|\.aws|\.kube|\.azure|\.gcloud|\.docker|\.chrome-live-antigravity|gcloud)(?:\/|$)/i;
 const SENSITIVE_FILE_NAME_RX =
-  /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|auth\.token|\.local-runtime\.json|agent_vault\.enc|\.env(?:\..+)?|\.npmrc|\.pypirc|\.netrc|Cookies(?:-journal)?|Login Data(?:\s+For\s+Account)?|Web Data|.*\.(?:pem|key|p12|pfx|kdbx|ovpn|jks|keystore))$/i;
+  /^(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts|auth\.token|\.local-runtime\.json|agent_vault\.enc|\.env(?:\..+)?|\.npmrc|\.pypirc|\.netrc|\.git-credentials|credentials(?:\.json)?|application_default_credentials\.json|Cookies(?:-journal)?|Login Data(?:\s+For\s+Account)?|Web Data|.*\.(?:pem|key|p12|pfx|kdbx|ovpn|jks|keystore))$/i;
 
 function resolveCanonicalPath(targetPath) {
   try {
@@ -205,20 +224,23 @@ function parseAllowedUploadDirs(explicitDirs) {
   } else if (typeof process.env.CHROME_LIVE_UPLOAD_DIR === 'string' && process.env.CHROME_LIVE_UPLOAD_DIR.trim()) {
     rawList = process.env.CHROME_LIVE_UPLOAD_DIR.split(path.delimiter);
   } else {
-    // Secure-by-default: restrict uploads to the dedicated staging directory (~/.chrome-live-antigravity/uploads)
-    // so ordinary local documents, invoices, or spreadsheets cannot be selected accidentally.
+    rawList = [];
+  }
+  const dirs = [];
+  for (const raw of rawList) {
+    const trimmed = expandLeadingTilde(String(raw || ''));
+    if (!trimmed) continue;
+    const abs = path.resolve(trimmed);
+    dirs.push(resolveCanonicalPath(abs));
+  }
+  // Strict Fail-Closed: if explicitDirs or CHROME_LIVE_UPLOAD_DIR resolves to zero valid directories
+  // (e.g. ";" or empty array), always fall back to the isolated default staging directory.
+  if (dirs.length === 0) {
     const defaultDir = getDefaultUploadStagingDir();
     try {
       fs.mkdirSync(defaultDir, { recursive: true, mode: 0o700 });
     } catch {}
-    rawList = [defaultDir];
-  }
-  const dirs = [];
-  for (const raw of rawList) {
-    const trimmed = String(raw || '').trim();
-    if (!trimmed) continue;
-    const abs = path.resolve(trimmed);
-    dirs.push(resolveCanonicalPath(abs));
+    dirs.push(resolveCanonicalPath(path.resolve(defaultDir)));
   }
   return dirs;
 }
@@ -227,7 +249,19 @@ export function evaluateUploadFileSafety(rawFilePath, options = {}) {
   if (!rawFilePath || typeof rawFilePath !== 'string' || !rawFilePath.trim()) {
     return { allowed: false, code: 'INVALID_FILE', reason: 'Empty file path' };
   }
-  const resolvedPath = path.resolve(rawFilePath.trim());
+  const rawTrimmed = rawFilePath.trim();
+  // Reject NTFS Alternate Data Streams (`file.env::$DATA`), control chars, or trailing dots/spaces used to evade basename regexes
+  const withoutDrive = rawTrimmed.replace(/^[A-Za-z]:/, '');
+  if (withoutDrive.includes(':') || /[\x00-\x1f]/.test(rawTrimmed) || /[.\s]$/.test(rawTrimmed)) {
+    return {
+      allowed: false,
+      code: 'INVALID_FILE',
+      reason: 'File path contains restricted stream syntax, control characters, or trailing dots/spaces'
+    };
+  }
+
+  const expandedPath = expandLeadingTilde(rawTrimmed);
+  const resolvedPath = path.resolve(expandedPath);
   const realPath = resolveCanonicalPath(resolvedPath);
 
   const allowedDirs = parseAllowedUploadDirs(options.allowedDirs);
@@ -236,7 +270,7 @@ export function evaluateUploadFileSafety(rawFilePath, options = {}) {
   const defaultUploadsDir = resolveCanonicalPath(path.resolve(getDefaultUploadStagingDir()));
   for (const candidate of realPath === resolvedPath ? [resolvedPath] : [resolvedPath, realPath]) {
     const normalized = candidate.replace(/\\/g, '/');
-    const baseName = path.basename(candidate);
+    const baseName = path.basename(candidate).replace(/[.\s]+$/, '');
     if (SENSITIVE_FILE_NAME_RX.test(baseName)) {
       return {
         allowed: false,
@@ -254,15 +288,13 @@ export function evaluateUploadFileSafety(rawFilePath, options = {}) {
     }
   }
 
-  if (allowedDirs.length > 0) {
-    const insideAllowed = allowedDirs.some((dir) => isPathInsideDir(realPath, dir));
-    if (!insideAllowed) {
-      return {
-        allowed: false,
-        code: 'UPLOAD_DIR_RESTRICTED',
-        reason: `Upload path must reside inside the staging directory (${getDefaultUploadStagingDir()}) or CHROME_LIVE_UPLOAD_DIR`
-      };
-    }
+  const insideAllowed = allowedDirs.some((dir) => isPathInsideDir(realPath, dir));
+  if (!insideAllowed) {
+    return {
+      allowed: false,
+      code: 'UPLOAD_DIR_RESTRICTED',
+      reason: `Upload path must reside inside the staging directory (${getDefaultUploadStagingDir()}) or CHROME_LIVE_UPLOAD_DIR`
+    };
   }
 
   // Block multi-hardlink files (e.g. `mklink /H` or `fs.linkSync` pointing an innocent staging filename at a secret file)

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { URL, fileURLToPath } from 'node:url';
-import { evaluateUploadFileSafety, evaluateUrlSafety, redactUrlForAudit } from './guardrails.mjs';
+import { evaluateUploadFileSafety, evaluateUrlSafety, redactUrlForAudit, redactUrlsInText } from './guardrails.mjs';
 import {
   computeChallengeHmac,
   computeHttpResponseHmac,
@@ -71,6 +71,7 @@ function parseValidExtensionOrigin(originHeader) {
 }
 
 const URL_FIELD_KEYS = new Set(['url', 'pageUrl', 'finalUrl', 'href', 'targetUrl']);
+const URL_ARRAY_KEYS = new Set(['urls', 'images']);
 
 function redactPayloadUrls(node, depth = 0) {
   if (!node || typeof node !== 'object' || depth > 10) return node;
@@ -81,8 +82,16 @@ function redactPayloadUrls(node, depth = 0) {
   for (const [k, v] of Object.entries(node)) {
     if (URL_FIELD_KEYS.has(k) && typeof v === 'string') {
       out[k] = redactUrlForAudit(v);
-    } else if (k === 'urls' && Array.isArray(v)) {
+    } else if (k === 'error' && typeof v === 'string') {
+      out[k] = redactUrlsInText(v);
+    } else if (URL_ARRAY_KEYS.has(k) && Array.isArray(v)) {
       out[k] = v.map((u) => (typeof u === 'string' ? redactUrlForAudit(u) : u));
+    } else if (k === 'routes' && v && typeof v === 'object' && !Array.isArray(v)) {
+      const cleanRoutes = {};
+      for (const [rk, rv] of Object.entries(v)) {
+        cleanRoutes[rk] = typeof rv === 'string' ? redactUrlForAudit(rv) : rv;
+      }
+      out[k] = cleanRoutes;
     } else if (v && typeof v === 'object' && !Buffer.isBuffer(v)) {
       out[k] = redactPayloadUrls(v, depth + 1);
     } else {
@@ -124,10 +133,15 @@ function parseJsonBuffer(rawBuf) {
 export function createDaemonServer(options = {}) {
   const host = options.host || DEFAULT_HOST;
   const requestedPort = options.port ?? DEFAULT_PORT;
-  const authToken = options.token || ensureAuthToken();
+  const resolveAuthToken = () =>
+    typeof options.token === 'function'
+      ? String(options.token() || '').trim()
+      : options.token
+        ? String(options.token)
+        : ensureAuthToken();
 
   let extensionPeer = null;
-  let pairedExtensionOrigin = null;
+  const pairedExtensionOrigins = new Set();
   const liveViewPeers = new Set();
   const upgradeSockets = new Set();
   const pendingRpc = new Map();
@@ -136,7 +150,7 @@ export function createDaemonServer(options = {}) {
   function resolveAllowedExtensionOrigin(originHeader) {
     const parsedOrigin = parseValidExtensionOrigin(originHeader);
     if (!parsedOrigin) return null;
-    if (pairedExtensionOrigin && parsedOrigin !== pairedExtensionOrigin) {
+    if (pairedExtensionOrigins.size > 0 && !pairedExtensionOrigins.has(parsedOrigin)) {
       return null;
     }
     return String(originHeader).trim();
@@ -179,18 +193,22 @@ export function createDaemonServer(options = {}) {
   }
 
   function pruneClosedTabFrames(liveTabs) {
-    if (!Array.isArray(liveTabs) || state.framesByTab.size === 0) return;
-    const liveIds = new Set(
+    if (!Array.isArray(liveTabs)) return;
+    const unpausedLiveIds = new Set(
       liveTabs
-        .map((t) => (t && typeof t.tabId === 'number' ? t.tabId : null))
-        .filter((id) => id !== null)
+        .filter((t) => t && typeof t.tabId === 'number' && !t.paused)
+        .map((t) => t.tabId)
     );
     for (const cachedId of Array.from(state.framesByTab.keys())) {
-      if (!liveIds.has(cachedId)) {
+      if (!unpausedLiveIds.has(cachedId)) {
         state.framesByTab.delete(cachedId);
       }
     }
-    if (state.latestFrame && typeof state.latestFrame.tabId === 'number' && !liveIds.has(state.latestFrame.tabId)) {
+    if (
+      state.latestFrame &&
+      typeof state.latestFrame.tabId === 'number' &&
+      !unpausedLiveIds.has(state.latestFrame.tabId)
+    ) {
       const remaining = Array.from(state.framesByTab.values());
       state.latestFrame = remaining.length > 0 ? remaining[remaining.length - 1] : null;
     }
@@ -266,12 +284,12 @@ export function createDaemonServer(options = {}) {
     }
   }
 
-  const verifyHttpHmac = createReplayProtectedVerifier(authToken);
+  const verifyHttpHmac = createReplayProtectedVerifier(resolveAuthToken);
 
   function attachServerProofHeader(req, statusCode, headers) {
     if (req._hmacAuth?.ts && req._hmacAuth?.nonce) {
       headers['X-Chrome-Live-Server-Sig'] = computeHttpResponseHmac(
-        authToken,
+        resolveAuthToken(),
         statusCode,
         req._hmacAuth.ts,
         req._hmacAuth.nonce
@@ -555,7 +573,7 @@ export function createDaemonServer(options = {}) {
     }
     const verifiedHttpExtOrigin = parseValidExtensionOrigin(req.headers.origin);
     if (verifiedHttpExtOrigin) {
-      pairedExtensionOrigin = verifiedHttpExtOrigin;
+      pairedExtensionOrigins.add(verifiedHttpExtOrigin);
     }
     req._hmacAuth = authCheck;
 
@@ -708,9 +726,10 @@ export function createDaemonServer(options = {}) {
 
       sendJson(req, res, 404, { ok: false, error: `Route not found: ${pathname}` });
     } catch (err) {
+      const rawErrMsg = err instanceof Error ? err.message : String(err);
       sendJson(req, res, 500, {
         ok: false,
-        error: err instanceof Error ? err.message : String(err)
+        error: redactUrlsInText(rawErrMsg)
       });
     }
   });
@@ -749,20 +768,26 @@ export function createDaemonServer(options = {}) {
       return;
     }
 
-    const peer = upgradeHttpToWebSocket(req, socket, head, { requireMask: true });
+    // Cap pre-authentication WS payload at 4KB; expand to 16MB only after mutual HMAC handshake succeeds
+    const peer = upgradeHttpToWebSocket(req, socket, head, {
+      requireMask: true,
+      maxPayloadBytes: 4096
+    });
     if (!peer) return;
     peer.on('error', () => {});
 
     const attachAuthenticatedPeer = (authPayload = null) => {
+      peer.maxPayloadBytes = 16 * 1024 * 1024;
       if (pathname === '/ws/extension') {
         const verifiedOrigin = parseValidExtensionOrigin(req.headers.origin);
         if (verifiedOrigin) {
-          pairedExtensionOrigin = verifiedOrigin;
+          pairedExtensionOrigins.add(verifiedOrigin);
         }
         // Extension has persisted the pairing token into chrome.storage.local; shred any leftover bootstrap file
         consumeAndShredLocalRuntimeBootstrap();
         if (extensionPeer && !extensionPeer.closed) {
-          extensionPeer.close(1000, 'Replaced by newer extension connection');
+          // Close code 4009 instructs the older browser profile not to auto-reconnect in a loop
+          extensionPeer.close(4009, 'Replaced by another browser profile');
         }
         extensionPeer = peer;
         state.extensionConnected = true;
@@ -800,7 +825,7 @@ export function createDaemonServer(options = {}) {
           mimeType: state.latestFrame.mimeType,
           data: state.latestFrame.buffer.toString('base64'),
           title: state.latestFrame.title,
-          url: state.latestFrame.url,
+          url: redactUrlForAudit(state.latestFrame.url),
           activity: state.latestFrame.activity,
           capturedAt: state.latestFrame.capturedAt
         });
@@ -831,6 +856,7 @@ export function createDaemonServer(options = {}) {
         return;
       }
       if (!authenticated) {
+        const curToken = resolveAuthToken();
         // Mutual HMAC-SHA256 challenge-response (zero plaintext token over WebSocket)
         if (msg && msg.type === 'auth_init' && !pendingChallenge) {
           const clientNonce = typeof msg.clientNonce === 'string' ? msg.clientNonce.trim() : '';
@@ -841,14 +867,14 @@ export function createDaemonServer(options = {}) {
           }
           const serverNonce = crypto.randomBytes(32).toString('hex');
           pendingChallenge = { clientNonce, serverNonce };
-          const serverProof = computeChallengeHmac(authToken, 'server', clientNonce, serverNonce);
+          const serverProof = computeChallengeHmac(curToken, 'server', clientNonce, serverNonce);
           peer.sendJson({ type: 'auth_challenge', serverNonce, serverProof });
           return;
         }
         if (msg && msg.type === 'auth_response' && pendingChallenge) {
           const clientProof = typeof msg.clientProof === 'string' ? msg.clientProof.trim() : '';
           const expectedClientProof = computeChallengeHmac(
-            authToken,
+            curToken,
             'client',
             pendingChallenge.clientNonce,
             pendingChallenge.serverNonce
@@ -911,12 +937,13 @@ export function createDaemonServer(options = {}) {
     if (msg.type === 'screencast_frame' && typeof msg.data === 'string' && msg.data.length > 0) {
       const mimeType = msg.mimeType === 'image/png' ? 'image/png' : 'image/jpeg';
       const buffer = Buffer.from(msg.data, 'base64');
+      const cleanFrameUrl = redactUrlForAudit(String(msg.url || ''));
       const frame = {
         tabId: msg.tabId ?? null,
         mimeType,
         buffer,
         title: String(msg.title || ''),
-        url: String(msg.url || ''),
+        url: cleanFrameUrl,
         activity: String(msg.activity || ''),
         capturedAt: Date.now()
       };
@@ -928,7 +955,7 @@ export function createDaemonServer(options = {}) {
         mimeType,
         data: msg.data,
         title: frame.title,
-        url: redactUrlForAudit(frame.url),
+        url: cleanFrameUrl,
         activity: frame.activity,
         capturedAt: frame.capturedAt
       });
@@ -982,7 +1009,9 @@ export function createDaemonServer(options = {}) {
 
   return {
     server,
-    authToken,
+    get authToken() {
+      return resolveAuthToken();
+    },
     getSnapshot: buildPublicSnapshot,
     dispatchExtensionRpc,
     listen() {
