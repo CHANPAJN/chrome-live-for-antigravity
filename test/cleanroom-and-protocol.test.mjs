@@ -786,11 +786,21 @@ test('Multi-tab concurrency & form-state regressions: per-tab frame isolation, A
   assert.match(swSource, /entryObj\.checked = checkedState/);
   assert.match(swSource, /\[role="alert"\], \[aria-live="assertive"\]/);
 
-  // 3. Click guards against plain-text HTML tag false positives and surfaces disabled controls
+  // 3. Click guards against plain-text HTML tag false positives, skips hidden elements, and surfaces disabled controls
   assert.ok(swSource.includes('/[#.\\[\\]>:+~=]/.test(raw)'));
   assert.match(swSource, /Element is disabled:/);
+  assert.match(swSource, /let fuzzyMatch = null/);
 
-  // 4. CLI exposes release command and formats element state badges & alerts
+  // 4. Clean text extraction strips inline <style>/<script> nodes via TreeWalker
+  assert.match(swSource, /new Set\(\['STYLE', 'SCRIPT', 'NOSCRIPT', 'TEMPLATE', 'SVG'\]\)/);
+  assert.match(swSource, /document\.createTreeWalker/);
+
+  // 5. Daemon stores single binary buffer per frame (no duplicate base64 copy) with bounded cache
+  const daemonSource = fs.readFileSync(path.join(REPO_ROOT, 'src', 'daemon.mjs'), 'utf8');
+  assert.match(daemonSource, /const MAX_TAB_FRAMES = 6/);
+  assert.ok(!daemonSource.includes('base64: msg.data'));
+
+  // 6. CLI exposes release command and formats element state badges & alerts
   const cliSource = fs.readFileSync(path.join(REPO_ROOT, 'bin', 'chrome-live.mjs'), 'utf8');
   assert.match(cliSource, /if \(cmd === 'release'\)/);
   assert.match(cliSource, /function formatSnapshotElementLine/);

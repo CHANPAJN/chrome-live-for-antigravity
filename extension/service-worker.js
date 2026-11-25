@@ -1491,12 +1491,33 @@ async function executeBridgeRpc(method, params) {
                 }
                 const root =
                   document.querySelector('article, main, [role="main"]') || document.body;
-                const text = (root ? root.textContent : '')
-                  .replace(/\s+\n/g, '\n')
-                  .replace(/\n{3,}/g, '\n\n')
-                  .replace(/[ \t]{2,}/g, ' ')
-                  .trim()
-                  .slice(0, 18000);
+                const SKIP_TAGS = new Set(['STYLE', 'SCRIPT', 'NOSCRIPT', 'TEMPLATE', 'SVG']);
+                let text = '';
+                if (root) {
+                  const parts = [];
+                  let accLen = 0;
+                  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                  let node;
+                  while ((node = walker.nextNode())) {
+                    const p = node.parentElement;
+                    if (!p) continue;
+                    if (SKIP_TAGS.has(p.tagName) || p.closest('style, script, noscript, template, [data-chrome-live-hud]')) {
+                      continue;
+                    }
+                    const chunk = node.nodeValue || '';
+                    if (!chunk.trim()) continue;
+                    parts.push(chunk);
+                    accLen += chunk.length + 1;
+                    if (accLen >= 22000) break;
+                  }
+                  text = parts
+                    .join(' ')
+                    .replace(/\s+\n/g, '\n')
+                    .replace(/\n{3,}/g, '\n\n')
+                    .replace(/[ \t]{2,}/g, ' ')
+                    .trim()
+                    .slice(0, 18000);
+                }
 
                 const imgSet = new Set();
                 for (const img of document.querySelectorAll('img')) {
@@ -1688,10 +1709,27 @@ async function executeBridgeRpc(method, params) {
         const alerts = Array.from(alertSet);
 
         const mainRoot = document.querySelector('main, article, [role="main"]') || document.body;
-        const excerpt = (mainRoot ? mainRoot.textContent : '')
-          .replace(/\s+/g, ' ')
-          .trim()
-          .slice(0, 4500);
+        const SKIP_TAGS = new Set(['STYLE', 'SCRIPT', 'NOSCRIPT', 'TEMPLATE', 'SVG']);
+        let excerpt = '';
+        if (mainRoot) {
+          const parts = [];
+          let accLen = 0;
+          const walker = document.createTreeWalker(mainRoot, NodeFilter.SHOW_TEXT);
+          let tNode;
+          while ((tNode = walker.nextNode())) {
+            const p = tNode.parentElement;
+            if (!p) continue;
+            if (SKIP_TAGS.has(p.tagName) || p.closest('style, script, noscript, template, [data-chrome-live-hud]')) {
+              continue;
+            }
+            const v = tNode.nodeValue || '';
+            if (!v.trim()) continue;
+            parts.push(v);
+            accLen += v.length + 1;
+            if (accLen >= 6000) break;
+          }
+          excerpt = parts.join(' ').replace(/\s+/g, ' ').trim().slice(0, 4500);
+        }
 
         return {
           title: document.title,
@@ -1761,7 +1799,13 @@ async function executeBridgeRpc(method, params) {
               document,
               'a, button, summary, label, [role="button"], [role="link"], [role="tab"], [role="switch"], [role="radio"], [role="checkbox"], [role="option"], [role="menuitem"], input[type="submit"], input[type="button"]'
             );
+            let fuzzyMatch = null;
             for (const item of all) {
+              if (item.closest && item.closest('[data-chrome-live-hud]')) continue;
+              const st = window.getComputedStyle(item);
+              if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
+              const rc = item.getBoundingClientRect();
+              if (rc.width < 4 || rc.height < 4) continue;
               const txt = (
                 item.textContent ||
                 item.value ||
@@ -1772,11 +1816,15 @@ async function executeBridgeRpc(method, params) {
                 .replace(/\s+/g, ' ')
                 .trim()
                 .toLowerCase();
-              if (txt === needle || (needle.length >= 2 && txt.includes(needle))) {
+              if (txt === needle) {
                 el = item;
                 break;
               }
+              if (!fuzzyMatch && needle.length >= 2 && txt.includes(needle)) {
+                fuzzyMatch = item;
+              }
             }
+            if (!el && fuzzyMatch) el = fuzzyMatch;
           }
         }
         if (!el) return { ok: false, error: `Element not found for target: ${tgt}` };

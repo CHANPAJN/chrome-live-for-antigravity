@@ -16,6 +16,13 @@
    git clone https://github.com/CHANPAJN/chrome-live-for-antigravity.git
    cd chrome-live-for-antigravity
    ```
+   *No `git` installed? Download and unpack the ZIP directly (works out of the box on clean Windows/macOS/Linux machines):*
+   ```powershell
+   # Windows PowerShell
+   Invoke-WebRequest -Uri "https://github.com/CHANPAJN/chrome-live-for-antigravity/archive/refs/heads/main.zip" -OutFile "chrome-live.zip"
+   Expand-Archive -Path "chrome-live.zip" -DestinationPath "." -Force
+   cd chrome-live-for-antigravity-main
+   ```
    *(Zero `npm install` is needed — the project uses 100% Node.js standard library modules with zero external dependencies.)*
 
 ---

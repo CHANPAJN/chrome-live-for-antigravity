@@ -87,7 +87,7 @@ export function createDaemonServer(options = {}) {
   const pendingRpc = new Map();
   const auditLog = [];
 
-  const MAX_TAB_FRAMES = 16;
+  const MAX_TAB_FRAMES = 6;
 
   const state = {
     extensionConnected: false,
@@ -97,7 +97,7 @@ export function createDaemonServer(options = {}) {
     activeTabId: null,
     tabs: [],
     customBlockedDomains: [],
-    latestFrame: null, // { tabId, mimeType, buffer, base64, title, url, activity, capturedAt }
+    latestFrame: null, // { tabId, mimeType, buffer, title, url, activity, capturedAt }
     framesByTab: new Map() // tabId -> frame
   };
 
@@ -415,8 +415,8 @@ export function createDaemonServer(options = {}) {
         snap.cachedFrameTabIds = Array.from(state.framesByTab.keys());
         if (parsedUrl.searchParams.get('includeFrame') === '1') {
           const targetFrame = resolveFrame(parsedUrl.searchParams.get('tabId'));
-          if (targetFrame?.base64) {
-            snap.frameDataUrl = `data:${targetFrame.mimeType || 'image/jpeg'};base64,${targetFrame.base64}`;
+          if (targetFrame?.buffer) {
+            snap.frameDataUrl = `data:${targetFrame.mimeType || 'image/jpeg'};base64,${targetFrame.buffer.toString('base64')}`;
             snap.frameTabId = targetFrame.tabId ?? null;
           }
         }
@@ -631,12 +631,12 @@ export function createDaemonServer(options = {}) {
       if (!peer) return;
       liveViewPeers.add(peer);
       peer.sendJson({ type: 'state', snapshot: buildPublicSnapshot() });
-      if (state.latestFrame) {
+      if (state.latestFrame && state.latestFrame.buffer) {
         peer.sendJson({
           type: 'frame',
           tabId: state.latestFrame.tabId,
           mimeType: state.latestFrame.mimeType,
-          data: state.latestFrame.base64,
+          data: state.latestFrame.buffer.toString('base64'),
           title: state.latestFrame.title,
           url: state.latestFrame.url,
           activity: state.latestFrame.activity,
@@ -692,7 +692,6 @@ export function createDaemonServer(options = {}) {
         tabId: msg.tabId ?? null,
         mimeType,
         buffer,
-        base64: msg.data,
         title: String(msg.title || ''),
         url: String(msg.url || ''),
         activity: String(msg.activity || ''),
