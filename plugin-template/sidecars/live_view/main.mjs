@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -51,11 +52,46 @@ function maybeBootstrapDaemon() {
   probe.end();
 }
 
+function signDaemonHttp(token, method, routePath, payload) {
+  const ts = String(Date.now());
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const bodyHash = crypto
+    .createHash('sha256')
+    .update(payload || Buffer.alloc(0))
+    .digest('hex');
+  const reqCanonical = `chrome-live:http-req:v1:${String(method || 'GET').toUpperCase()}:${routePath}:${ts}:${nonce}:${bodyHash}`;
+  const sig = crypto.createHmac('sha256', token).update(reqCanonical, 'utf8').digest('hex');
+  return {
+    ts,
+    nonce,
+    headers: {
+      'X-Chrome-Live-Ts': ts,
+      'X-Chrome-Live-Nonce': nonce,
+      'X-Chrome-Live-Sig': sig
+    }
+  };
+}
+
+function verifyDaemonHttp(token, statusCode, resHeaders, ts, nonce) {
+  const serverSig = String(resHeaders?.['x-chrome-live-server-sig'] || '');
+  if (!serverSig || !token) return false;
+  const expected = crypto
+    .createHmac('sha256', token)
+    .update(`chrome-live:http-res:v1:${Number(statusCode) || 0}:${ts}:${nonce}`, 'utf8')
+    .digest('hex');
+  const a = Buffer.from(serverSig, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 function callDaemon(method, routePath, bodyObj = null, timeoutMs = 6000) {
   const token = readLocalToken();
+  if (!token) {
+    return Promise.reject(new Error('Local pairing token not found; run chrome-live setup'));
+  }
   return new Promise((resolve, reject) => {
     const payload = bodyObj ? Buffer.from(JSON.stringify(bodyObj), 'utf8') : null;
-    const baseHeaders = token ? { 'X-Chrome-Live-Token': token } : {};
+    const { ts, nonce, headers: baseHeaders } = signDaemonHttp(token, method, routePath, payload);
     const req = http.request(
       {
         host: DAEMON_HOST,
@@ -75,8 +111,13 @@ function callDaemon(method, routePath, bodyObj = null, timeoutMs = 6000) {
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
         res.on('end', () => {
+          const status = res.statusCode || 500;
+          if (!verifyDaemonHttp(token, status, res.headers, ts, nonce)) {
+            reject(new Error('Unverified local service on daemon port'));
+            return;
+          }
           resolve({
-            status: res.statusCode || 200,
+            status,
             contentType: res.headers['content-type'] || 'application/octet-stream',
             buffer: Buffer.concat(chunks)
           });
@@ -105,7 +146,11 @@ app.api(
     maybeBootstrapDaemon();
     try {
       const includeFrame = data && data.includeFrame === '1' ? '1' : '0';
-      const r = await callDaemon('GET', `/api/state?includeFrame=${includeFrame}`, null, 3000);
+      const tabParam =
+        data && data.tabId !== undefined && data.tabId !== ''
+          ? `&tabId=${encodeURIComponent(String(data.tabId))}`
+          : '';
+      const r = await callDaemon('GET', `/api/state?includeFrame=${includeFrame}${tabParam}`, null, 3000);
       return JSON.parse(r.buffer.toString('utf8'));
     } catch (err) {
       return {

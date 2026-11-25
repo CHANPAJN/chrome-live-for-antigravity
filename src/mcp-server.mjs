@@ -24,11 +24,30 @@ const MCP_TOOLS = [
     name: 'chrome_live_monitor',
     title: 'Chrome Live Inline Monitor',
     description:
-      'Render a live, auto-updating Chrome screencast preview card directly inline in the foreground chat conversation (without opening any right-hand side pane). Call once with optional tabId when starting a visual browser task; the action fields are used internally by interactive buttons inside the card.',
+      'Render a live, auto-updating Chrome screencast preview card directly inline in the foreground chat conversation (without opening any right-hand side pane). Call once with optional tabId when starting a visual browser task.',
     inputSchema: {
       type: 'object',
       properties: {
-        tabId: { type: 'integer', description: 'Optional target tabId to focus in the inline stream' },
+        tabId: { type: 'integer', description: 'Optional target tabId to focus in the inline stream' }
+      },
+      additionalProperties: false
+    },
+    _meta: {
+      ui: {
+        resourceUri: INLINE_MONITOR_URI,
+        visibility: ['model']
+      }
+    }
+  },
+  {
+    name: 'chrome_live_ui_action',
+    title: 'Chrome Live UI Action',
+    description:
+      'App-only interactive callback endpoint used exclusively by the Chrome Live MCP App UI (hidden from the model).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tabId: { type: 'integer' },
         action: {
           type: 'string',
           enum: [
@@ -42,10 +61,9 @@ const MCP_TOOLS = [
             'remote_wheel',
             'remote_type',
             'inspect_region'
-          ],
-          description: 'Internal UI callback action (omit when mounting from the model)'
+          ]
         },
-        lastFrameTs: { type: 'number', description: 'Internal poll timestamp' },
+        lastFrameTs: { type: 'number' },
         rx: { type: 'number' },
         ry: { type: 'number' },
         rx1: { type: 'number' },
@@ -56,12 +74,12 @@ const MCP_TOOLS = [
         text: { type: 'string' },
         submit: { type: 'boolean' }
       },
+      required: ['action'],
       additionalProperties: false
     },
     _meta: {
       ui: {
-        resourceUri: INLINE_MONITOR_URI,
-        visibility: ['model', 'app']
+        visibility: ['app']
       }
     }
   },
@@ -498,12 +516,11 @@ async function buildMonitorStructuredState(callDaemon, lastFrameTs = 0, targetTa
   const hasExplicitTab = typeof targetTabId === 'number' && Number.isInteger(targetTabId);
   const baseState = await callDaemon('GET', '/api/state');
   const tabs = Array.isArray(baseState?.tabs) ? baseState.tabs : [];
-  const resolvedPrimary =
-    (hasExplicitTab && tabs.find((t) => t.tabId === targetTabId)) ||
-    tabs.find((t) => t.substate === 'shared') ||
-    tabs[0] ||
-    null;
-  const effectiveTabId = resolvedPrimary ? resolvedPrimary.tabId : (hasExplicitTab ? targetTabId : undefined);
+  // Never silently fall back to capturing a different shared tab when an explicit tabId was closed or released
+  const resolvedPrimary = hasExplicitTab
+    ? tabs.find((t) => t.tabId === targetTabId) || null
+    : tabs.find((t) => t.substate === 'shared') || tabs[0] || null;
+  const effectiveTabId = resolvedPrimary ? resolvedPrimary.tabId : undefined;
   const hasTab = typeof effectiveTabId === 'number' && Number.isInteger(effectiveTabId);
 
   if (forceSnap && hasTab && !resolvedPrimary?.paused) {
@@ -517,7 +534,9 @@ async function buildMonitorStructuredState(callDaemon, lastFrameTs = 0, targetTa
   const serverFrameTs = baseState?.latestFrameMeta?.capturedAt || 0;
   const cachedIds = Array.isArray(baseState?.cachedFrameTabIds) ? baseState.cachedFrameTabIds : [];
   let fullState = baseState;
-  if (hasTab && cachedIds.includes(effectiveTabId)) {
+  if (hasExplicitTab && !resolvedPrimary) {
+    fullState = { ...baseState, requestedTabId: targetTabId, requestedTabMissing: true };
+  } else if (hasTab && cachedIds.includes(effectiveTabId)) {
     if (lastFrameTs === 0 || serverFrameTs !== lastFrameTs || baseState?.latestFrameMeta?.tabId !== effectiveTabId) {
       fullState = await callDaemon('GET', `/api/state?includeFrame=1${tabQuery}`);
     }
@@ -527,8 +546,11 @@ async function buildMonitorStructuredState(callDaemon, lastFrameTs = 0, targetTa
       params: { tabId: effectiveTabId }
     }).catch(() => {});
     fullState = await callDaemon('GET', `/api/state?includeFrame=1${tabQuery}`);
-  } else if (!hasTab && serverFrameTs && serverFrameTs !== lastFrameTs) {
+  } else if (!hasExplicitTab && !hasTab && serverFrameTs && serverFrameTs !== lastFrameTs) {
     fullState = await callDaemon('GET', '/api/state?includeFrame=1');
+  }
+  if (hasExplicitTab && fullState && typeof fullState === 'object') {
+    fullState.requestedTabId = targetTabId;
   }
   return fullState;
 }
@@ -547,6 +569,7 @@ async function executeMonitorAppAction(args, callDaemon) {
   }
 
   let regionResult = null;
+  // Never swallow command errors: propagate failures directly so the UI never shows a false success toast
   if (
     act === 'screenshot' ||
     act === 'focus_tab' ||
@@ -557,17 +580,17 @@ async function executeMonitorAppAction(args, callDaemon) {
     await callDaemon('POST', '/api/command', {
       method: act,
       params: { tabId: args.tabId }
-    }).catch(() => {});
+    });
   } else if (act === 'remote_click') {
     await callDaemon('POST', '/api/command', {
       method: 'remote_interact',
       params: { kind: 'click', tabId: args.tabId, rx: args.rx, ry: args.ry }
-    }).catch(() => {});
+    });
   } else if (act === 'remote_wheel') {
     await callDaemon('POST', '/api/command', {
       method: 'remote_interact',
       params: { kind: 'wheel', tabId: args.tabId, deltaY: args.deltaY }
-    }).catch(() => {});
+    });
   } else if (act === 'remote_type') {
     await callDaemon('POST', '/api/command', {
       method: 'remote_interact',
@@ -577,7 +600,7 @@ async function executeMonitorAppAction(args, callDaemon) {
         text: args.text || '',
         submit: Boolean(args.submit)
       }
-    }).catch(() => {});
+    });
   } else if (act === 'inspect_region') {
     const reg = await callDaemon('POST', '/api/command', {
       method: 'inspect_region',
@@ -588,11 +611,13 @@ async function executeMonitorAppAction(args, callDaemon) {
         rx2: args.rx2,
         ry2: args.ry2
       }
-    }).catch(() => null);
+    });
     regionResult = reg?.result || null;
+  } else {
+    throw new Error(`Unsupported UI action: ${act}`);
   }
-  const targetTabId = typeof args?.tabId === 'number' ? args.tabId : undefined;
-  const sc = await buildMonitorStructuredState(callDaemon, 0, targetTabId, false);
+  const followUpTabId = act === 'release_tab' ? undefined : (typeof args?.tabId === 'number' ? args.tabId : undefined);
+  const sc = await buildMonitorStructuredState(callDaemon, 0, followUpTabId, false);
   if (regionResult && sc && typeof sc === 'object') {
     sc.regionResult = regionResult;
   }
@@ -608,8 +633,10 @@ async function invokeTool(toolName, args, callDaemon) {
   switch (toolName) {
     case 'chrome_live_monitor':
     case 'chrome_live_workspace': {
-      if (toolName === 'chrome_live_monitor' && args && typeof args.action === 'string' && args.action.length > 0) {
-        return await executeMonitorAppAction(args, callDaemon);
+      if (args && typeof args.action === 'string' && args.action.length > 0) {
+        throw new Error(
+          'Interactive UI actions are restricted to the app-only chrome_live_ui_action endpoint and cannot be invoked via chrome_live_monitor.'
+        );
       }
       const targetTabId = typeof args?.tabId === 'number' ? args.tabId : undefined;
       const sc = await buildMonitorStructuredState(callDaemon, 0, targetTabId, targetTabId !== undefined);
@@ -630,11 +657,12 @@ async function invokeTool(toolName, args, callDaemon) {
         }
       };
     }
-    case 'chrome_live_app_poll': {
-      return await executeMonitorAppAction({ ...args, action: 'poll' }, callDaemon);
-    }
+    case 'chrome_live_ui_action':
     case 'chrome_live_app_action': {
       return await executeMonitorAppAction(args, callDaemon);
+    }
+    case 'chrome_live_app_poll': {
+      return await executeMonitorAppAction({ ...args, action: 'poll' }, callDaemon);
     }
     case 'chrome_live_status':
       return await callDaemon('GET', '/api/health');

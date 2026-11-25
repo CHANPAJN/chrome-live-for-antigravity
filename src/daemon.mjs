@@ -5,6 +5,11 @@ import path from 'node:path';
 import { URL, fileURLToPath } from 'node:url';
 import { evaluateUploadFileSafety, evaluateUrlSafety, redactUrlForAudit } from './guardrails.mjs';
 import {
+  computeChallengeHmac,
+  computeHttpResponseHmac,
+  createReplayProtectedVerifier
+} from './hmac-auth.mjs';
+import {
   clearPlaybooks,
   deletePlaybookItem,
   getPlaybookSummary,
@@ -27,12 +32,22 @@ import { upgradeHttpToWebSocket } from './ws-codec.mjs';
 const MAX_AUDIT_ENTRIES = 80;
 const MAX_BODY_BYTES = 12 * 1024 * 1024;
 const HEARTBEAT_INTERVAL_MS = 25000;
+const __daemonFilename = fileURLToPath(import.meta.url);
+const REPO_ROOT_DIR = path.resolve(path.dirname(__daemonFilename), '..');
 
-export function computeChallengeHmac(token, role, clientNonce, serverNonce) {
-  return crypto
-    .createHmac('sha256', String(token || ''))
-    .update(`chrome-live:${role}:${clientNonce}:${serverNonce}`, 'utf8')
-    .digest('hex');
+export { computeChallengeHmac };
+
+function consumeAndShredLocalRuntimeBootstrap() {
+  const runtimeFile = path.join(REPO_ROOT_DIR, 'extension', '.local-runtime.json');
+  try {
+    if (fs.existsSync(runtimeFile)) {
+      const st = fs.statSync(runtimeFile);
+      if (st.isFile() && st.size > 0) {
+        fs.writeFileSync(runtimeFile, Buffer.alloc(st.size, 0));
+      }
+      fs.unlinkSync(runtimeFile);
+    }
+  } catch {}
 }
 
 function isAllowedHostHeader(hostHeader, boundPort) {
@@ -55,7 +70,7 @@ function resolveAllowedExtensionOrigin(originHeader) {
   return null;
 }
 
-function readJsonBody(req) {
+function readRawBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let total = 0;
@@ -69,18 +84,19 @@ function readJsonBody(req) {
       chunks.push(chunk);
     });
     req.on('end', () => {
-      if (total === 0) {
-        resolve({});
-        return;
-      }
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-      } catch (err) {
-        reject(new Error(`Invalid JSON body: ${err.message}`));
-      }
+      resolve(total === 0 ? Buffer.alloc(0) : Buffer.concat(chunks));
     });
     req.on('error', reject);
   });
+}
+
+function parseJsonBuffer(rawBuf) {
+  if (!rawBuf || rawBuf.length === 0) return {};
+  try {
+    return JSON.parse(rawBuf.toString('utf8'));
+  } catch (err) {
+    throw new Error(`Invalid JSON body: ${err.message}`);
+  }
 }
 
 export function createDaemonServer(options = {}) {
@@ -212,18 +228,17 @@ export function createDaemonServer(options = {}) {
     }
   }
 
-  function extractHeaderToken(req) {
-    return String(
-      req.headers['x-chrome-live-token'] ||
-        (req.headers.authorization?.startsWith('Bearer ')
-          ? req.headers.authorization.slice(7)
-          : '') ||
-        ''
-    );
-  }
+  const verifyHttpHmac = createReplayProtectedVerifier(authToken);
 
-  function checkAuthorized(req) {
-    return timingSafeEqualToken(extractHeaderToken(req), authToken);
+  function attachServerProofHeader(req, statusCode, headers) {
+    if (req._hmacAuth?.ts && req._hmacAuth?.nonce) {
+      headers['X-Chrome-Live-Server-Sig'] = computeHttpResponseHmac(
+        authToken,
+        statusCode,
+        req._hmacAuth.ts,
+        req._hmacAuth.nonce
+      );
+    }
   }
 
   function sendJson(req, res, statusCode, bodyObj) {
@@ -234,8 +249,10 @@ export function createDaemonServer(options = {}) {
     };
     if (extOrigin) {
       headers['Access-Control-Allow-Origin'] = extOrigin;
+      headers['Access-Control-Expose-Headers'] = 'X-Chrome-Live-Server-Sig';
       headers['Vary'] = 'Origin';
     }
+    attachServerProofHeader(req, statusCode, headers);
     const payload = Buffer.from(JSON.stringify(bodyObj), 'utf8');
     headers['Content-Length'] = String(payload.length);
     res.writeHead(statusCode, headers);
@@ -419,7 +436,8 @@ export function createDaemonServer(options = {}) {
       res.writeHead(204, {
         'Access-Control-Allow-Origin': extOrigin,
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, X-Chrome-Live-Token, Authorization',
+        'Access-Control-Allow-Headers': 'Content-Type, X-Chrome-Live-Ts, X-Chrome-Live-Nonce, X-Chrome-Live-Sig',
+        'Access-Control-Expose-Headers': 'X-Chrome-Live-Server-Sig',
         'Access-Control-Max-Age': '600'
       });
       res.end();
@@ -439,14 +457,36 @@ export function createDaemonServer(options = {}) {
       return;
     }
 
-    if (!checkAuthorized(req, parsedUrl)) {
+    if (parsedUrl.searchParams.has('token')) {
       sendJson(req, res, 401, {
         ok: false,
         error: 'UNAUTHORIZED',
-        message: 'Missing or invalid X-Chrome-Live-Token'
+        message: 'Query-string token authentication is prohibited'
       });
       return;
     }
+
+    let rawBody = Buffer.alloc(0);
+    try {
+      if (req.method === 'POST') {
+        rawBody = await readRawBody(req);
+      }
+    } catch (readErr) {
+      sendJson(req, res, 400, { ok: false, error: readErr.message });
+      return;
+    }
+
+    const pathWithQuery = `${pathname}${parsedUrl.search}`;
+    const authCheck = verifyHttpHmac(req, pathWithQuery, rawBody);
+    if (!authCheck.ok) {
+      sendJson(req, res, 401, {
+        ok: false,
+        error: 'UNAUTHORIZED',
+        message: authCheck.reason
+      });
+      return;
+    }
+    req._hmacAuth = authCheck;
 
     try {
       if (req.method === 'GET' && (pathname === '/api/health' || pathname === '/api/state')) {
@@ -475,7 +515,7 @@ export function createDaemonServer(options = {}) {
       }
 
       if (req.method === 'POST' && pathname === '/api/playbook') {
-        const body = await readJsonBody(req);
+        const body = parseJsonBuffer(rawBody);
         const action = String(body.action || '').trim();
         if (action === 'set_enabled') {
           const summary = setPlaybookEnabled(Boolean(body.enabled));
@@ -508,7 +548,9 @@ export function createDaemonServer(options = {}) {
       if (req.method === 'GET' && pathname === '/api/frame') {
         const targetFrame = resolveFrame(parsedUrl.searchParams.get('tabId'));
         if (!targetFrame || !targetFrame.buffer) {
-          res.writeHead(204, { 'Cache-Control': 'no-store' });
+          const noContentHeaders = { 'Cache-Control': 'no-store' };
+          attachServerProofHeader(req, 204, noContentHeaders);
+          res.writeHead(204, noContentHeaders);
           res.end();
           return;
         }
@@ -520,13 +562,14 @@ export function createDaemonServer(options = {}) {
         if (typeof targetFrame.tabId === 'number') {
           headers['X-Chrome-Live-Tab-Id'] = String(targetFrame.tabId);
         }
+        attachServerProofHeader(req, 200, headers);
         res.writeHead(200, headers);
         res.end(targetFrame.buffer);
         return;
       }
 
       if (req.method === 'POST' && pathname === '/api/command') {
-        const body = await readJsonBody(req);
+        const body = parseJsonBuffer(rawBody);
         const method = String(body.method || body.cmd || '').trim();
         const params = body.params && typeof body.params === 'object' ? body.params : {};
         const defaultTimeoutMs = method === 'batch' || method === 'extract' ? 90000 : 28000;
@@ -618,7 +661,11 @@ export function createDaemonServer(options = {}) {
     }
 
     const parsedUrl = new URL(req.url || '/', `http://127.0.0.1:${boundPort}`);
-    if (parsedUrl.searchParams.has('token')) {
+    if (
+      parsedUrl.searchParams.has('token') ||
+      req.headers['x-chrome-live-token'] ||
+      req.headers.authorization
+    ) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;
@@ -631,23 +678,14 @@ export function createDaemonServer(options = {}) {
       return;
     }
 
-    const headerToken = extractHeaderToken(req);
-    let preAuthed = false;
-    if (headerToken) {
-      if (!timingSafeEqualToken(headerToken, authToken)) {
-        socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
-        socket.destroy();
-        return;
-      }
-      preAuthed = true;
-    }
-
     const peer = upgradeHttpToWebSocket(req, socket, head, { requireMask: true });
     if (!peer) return;
     peer.on('error', () => {});
 
     const attachAuthenticatedPeer = (authPayload = null) => {
       if (pathname === '/ws/extension') {
+        // Extension has persisted the pairing token into chrome.storage.local; shred any leftover bootstrap file
+        consumeAndShredLocalRuntimeBootstrap();
         if (extensionPeer && !extensionPeer.closed) {
           extensionPeer.close(1000, 'Replaced by newer extension connection');
         }
@@ -697,22 +735,17 @@ export function createDaemonServer(options = {}) {
       });
     };
 
-    let authenticated = preAuthed;
+    let authenticated = false;
     let pendingChallenge = null; // { clientNonce, serverNonce }
-    let authTimer = null;
-    if (authenticated) {
-      attachAuthenticatedPeer(null);
-    } else {
-      authTimer = setTimeout(() => {
-        if (!authenticated && !peer.closed) {
-          peer.close(4001, 'Authentication timeout');
-        }
-      }, 3000);
-      authTimer.unref();
-      peer.on('close', () => {
-        if (authTimer) clearTimeout(authTimer);
-      });
-    }
+    let authTimer = setTimeout(() => {
+      if (!authenticated && !peer.closed) {
+        peer.close(4001, 'Authentication timeout');
+      }
+    }, 3000);
+    authTimer.unref();
+    peer.on('close', () => {
+      if (authTimer) clearTimeout(authTimer);
+    });
 
     peer.on('message', (rawText) => {
       let msg;

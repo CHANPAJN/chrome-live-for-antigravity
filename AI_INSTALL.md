@@ -29,11 +29,11 @@
 
 ## Step 2 — Generate Local Pairing Token & Run Self-Test
 
-Run `setup` to generate a local 256-bit random token (`~/.chrome-live-antigravity/auth.token`, `0600` permissions) and write the git-ignored extension bootstrap file (`extension/.local-runtime.json`), then run the test suite:
+Run `setup` to generate a local 256-bit random token (`~/.chrome-live-antigravity/auth.token`, `0600` permissions), create the default `~/.chrome-live-antigravity/uploads` staging directory, and write the one-time extension bootstrap file (`extension/.local-runtime.json`, which the daemon automatically shreds after the extension completes its first handshake). Note: run `npm test` before `setup`, or after the extension connects and consumes the one-time bootstrap:
 
 ```bash
-node ./bin/chrome-live.mjs setup
 npm test
+node ./bin/chrome-live.mjs setup
 ```
 
 ---

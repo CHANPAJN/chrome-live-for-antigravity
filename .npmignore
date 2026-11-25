@@ -1,0 +1,8 @@
+# Never include local pairing bootstrap files, tokens, or tests in npm tarballs
+extension/.local-runtime.json
+.local-runtime.json
+*.token
+auth.token
+test/
+docs/
+.github/

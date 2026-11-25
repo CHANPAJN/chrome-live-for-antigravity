@@ -34,7 +34,8 @@ node "__CHROME_LIVE_CLI_PATH__" batch '[{"action":"open","url":"https://example.
 # 5. Interact step-by-step by element index, selector, or visible label
 node "__CHROME_LIVE_CLI_PATH__" click 0
 node "__CHROME_LIVE_CLI_PATH__" type 1 "search term" --submit
-node "__CHROME_LIVE_CLI_PATH__" upload "./screenshot.png"
+# Stage files into ~/.chrome-live-antigravity/uploads/ before uploading (default upload sandbox)
+node "__CHROME_LIVE_CLI_PATH__" upload "~/.chrome-live-antigravity/uploads/screenshot.png"
 node "__CHROME_LIVE_CLI_PATH__" scroll down 600
 
 # 6. Concurrent multi-URL text & image extraction
@@ -60,4 +61,6 @@ node "__CHROME_LIVE_CLI_PATH__" release --all
 
 ## Safety Boundaries
 
-- Payment gateways, retail banking, cloud billing consoles, and `/checkout` routes are blocked locally by default; never attempt to bypass financial guardrails.
+- Payment gateways, retail banking, cloud billing consoles, and `/checkout`, `/pay`, `/billing` routes are blocked locally by default; never attempt to bypass financial guardrails.
+- File uploads are restricted by default to `~/.chrome-live-antigravity/uploads` (or `CHROME_LIVE_UPLOAD_DIR`); copy user-approved upload assets into that staging directory first rather than pointing at arbitrary desktop/document paths.
+- When a tab is paused by the user (`paused: true`), stop attempting browser actions until the user resumes inside Chrome.

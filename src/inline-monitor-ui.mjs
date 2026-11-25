@@ -732,7 +732,7 @@ export function buildInlineMonitorHtml() {
       }
 
       function renderTabStrip(tabs) {
-        if (tabs.length < 2) {
+        if (tabs.length === 0 || (tabs.length === 1 && currentTab && tabs[0].tabId === currentTab.tabId)) {
           tabStrip.style.display = 'none';
           tabStrip.replaceChildren();
           return;
@@ -743,10 +743,11 @@ export function buildInlineMonitorHtml() {
           const b = document.createElement('button');
           b.type = 'button';
           b.className = 'tab-pill';
-          b.dataset.active = String(t.tabId === (currentTab && currentTab.tabId));
+          b.dataset.active = String(Boolean(currentTab && t.tabId === currentTab.tabId));
           b.textContent = (t.title || t.url || ('#' + t.tabId)).slice(0, 22);
           b.addEventListener('click', async () => {
             selectedTabId = t.tabId;
+            pinnedTabClosed = false;
             lastFrameTs = 0;
             await callAppAction(
               { action: 'screenshot', tabId: t.tabId },
@@ -756,6 +757,8 @@ export function buildInlineMonitorHtml() {
           tabStrip.appendChild(b);
         }
       }
+
+      let pinnedTabClosed = false;
 
       function renderSnapshot(data) {
         if (!data || data.ok === false) {
@@ -775,13 +778,21 @@ export function buildInlineMonitorHtml() {
         const tabs = Array.isArray(data.tabs) ? data.tabs : [];
         hasActiveTabs = tabs.length > 0;
         const prevInRelay = Boolean(currentTab && currentTab.inRelayPopout);
-        const primary =
-          (selectedTabId !== null && tabs.find((t) => t.tabId === selectedTabId)) ||
-          tabs.find((t) => t.substate === 'shared') ||
-          tabs[0] ||
-          null;
+
+        if (typeof data.requestedTabId === 'number' && selectedTabId === null) {
+          selectedTabId = data.requestedTabId;
+        }
+
+        let primary = null;
+        if (selectedTabId !== null) {
+          primary = tabs.find((t) => t.tabId === selectedTabId) || null;
+          // Do NOT silently jump to capturing another shared tab when the watched tab closes or is released
+          pinnedTabClosed = primary === null;
+        } else if (!pinnedTabClosed) {
+          primary = tabs.find((t) => t.substate === 'shared') || tabs[0] || null;
+          selectedTabId = primary ? primary.tabId : null;
+        }
         currentTab = primary;
-        selectedTabId = primary ? primary.tabId : null;
 
         renderTabStrip(tabs);
 
@@ -848,7 +859,11 @@ export function buildInlineMonitorHtml() {
             ? (isPaused
                 ? (IS_ZH ? '已暂停 · 人工接管期间实时画面流已停止' : 'Paused · Live stream stopped during manual control')
                 : (IS_ZH ? '正在同步当前标签页画面...' : 'Syncing frame for selected tab...'))
-            : L.idle;
+            : pinnedTabClosed
+              ? (tabs.length > 0
+                  ? (IS_ZH ? '原监控标签页已关闭或释放 · 请点击上方标签切换' : 'Watched tab was closed or released · Click a tab above to switch')
+                  : L.idle)
+              : L.idle;
           emptyEl.style.display = 'block';
         }
         reportSize();
@@ -898,7 +913,7 @@ export function buildInlineMonitorHtml() {
           const pollArgs = { action: 'poll', lastFrameTs };
           if (selectedTabId !== null) pollArgs.tabId = selectedTabId;
           const res = await sendRequest('tools/call', {
-            name: 'chrome_live_monitor',
+            name: 'chrome_live_ui_action',
             arguments: pollArgs
           });
           if (res && res.structuredContent) {
@@ -921,7 +936,7 @@ export function buildInlineMonitorHtml() {
         if (labelText) showStatus(labelText, 'info', false);
         try {
           const res = await sendRequest('tools/call', {
-            name: 'chrome_live_monitor',
+            name: 'chrome_live_ui_action',
             arguments: actionArgs
           });
           if (res && res.isError) {

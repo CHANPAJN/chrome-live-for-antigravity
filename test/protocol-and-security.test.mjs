@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
@@ -7,8 +8,10 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import vm from 'node:vm';
 import { computeChallengeHmac, createDaemonServer } from '../src/daemon.mjs';
-import { evaluateUploadFileSafety, evaluateUrlSafety } from '../src/guardrails.mjs';
+import { evaluateUploadFileSafety, evaluateUrlSafety, getDefaultUploadStagingDir } from '../src/guardrails.mjs';
+import { buildSignedHttpHeaders, verifySignedHttpResponse } from '../src/hmac-auth.mjs';
 import { learnFromPageVisit, learnInteractionSelector, lookupDomainPlaybook, sanitizeRouteUrl, setPlaybookEnabled } from '../src/playbook-store.mjs';
 import { computeWebSocketAccept, encodeWsFrame, NativeWsPeer } from '../src/ws-codec.mjs';
 
@@ -108,9 +111,20 @@ function connectTestWsClient(port, routePath, token, { authMode = 'challenge' } 
   });
 }
 
-function httpJson(port, method, routePath, headers = {}, bodyObj = null) {
+function httpJson(port, method, routePath, authOrHeaders = {}, bodyObj = null) {
   return new Promise((resolve, reject) => {
     const payload = bodyObj ? Buffer.from(JSON.stringify(bodyObj), 'utf8') : null;
+    const rawOpts = authOrHeaders && typeof authOrHeaders === 'object' ? { ...authOrHeaders } : {};
+    const hmacToken = typeof rawOpts.token === 'string' ? rawOpts.token : '';
+    delete rawOpts.token;
+
+    let signedMeta = null;
+    let computedHeaders = rawOpts;
+    if (hmacToken) {
+      signedMeta = buildSignedHttpHeaders(hmacToken, method, routePath, payload);
+      computedHeaders = { ...signedMeta.headers, ...rawOpts };
+    }
+
     const req = http.request(
       {
         host: '127.0.0.1',
@@ -125,19 +139,26 @@ function httpJson(port, method, routePath, headers = {}, bodyObj = null) {
                 'Content-Length': String(payload.length)
               }
             : {}),
-          ...headers
+          ...computedHeaders
         }
       },
       (res) => {
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
         res.on('end', () => {
+          if (signedMeta) {
+            assert.equal(
+              verifySignedHttpResponse(hmacToken, res.statusCode, res.headers, signedMeta.ts, signedMeta.nonce),
+              true,
+              `Expected valid X-Chrome-Live-Server-Sig on ${method} ${routePath}`
+            );
+          }
           const text = Buffer.concat(chunks).toString('utf8');
           let json = null;
           try {
             json = JSON.parse(text);
           } catch {}
-          resolve({ statusCode: res.statusCode, text, json });
+          resolve({ statusCode: res.statusCode, headers: res.headers, text, json });
         });
       }
     );
@@ -147,12 +168,11 @@ function httpJson(port, method, routePath, headers = {}, bodyObj = null) {
   });
 }
 
-test('Repository hygiene gate: zero external npm dependencies, zero prebuilt binaries, and zero leaked runtime secrets', () => {
+test('Repository hygiene gate: zero external npm dependencies, zero prebuilt binaries, and npm pack excludes pairing secrets', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8'));
   assert.equal(Object.keys(pkg.dependencies || {}).length, 0, 'Expected zero runtime npm dependencies');
 
   const forbiddenBinaryExts = new Set(['.exe', '.dll', '.so', '.dylib', '.wasm', '.bin', '.node']);
-  const ignoredRuntimeFiles = new Set(['extension/.local-runtime.json']);
   const allEntries = [];
   function walkAll(dir) {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -162,7 +182,6 @@ test('Repository hygiene gate: zero external npm dependencies, zero prebuilt bin
       if (entry.isDirectory()) {
         walkAll(full);
       } else if (entry.isFile()) {
-        if (ignoredRuntimeFiles.has(rel)) continue;
         allEntries.push({ full, rel });
       }
     }
@@ -172,8 +191,9 @@ test('Repository hygiene gate: zero external npm dependencies, zero prebuilt bin
 
   for (const { full, rel } of allEntries) {
     const ext = path.extname(rel).toLowerCase();
+    const base = path.basename(rel);
     assert.equal(forbiddenBinaryExts.has(ext), false, `Unexpected binary file in repository: ${rel}`);
-    assert.notEqual(path.basename(rel), 'auth.token', `Secret token file must never live inside repository: ${rel}`);
+    assert.notEqual(base, 'auth.token', `Secret token file must never live inside repository: ${rel}`);
     if (!['.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico'].includes(ext)) {
       const content = fs.readFileSync(full, 'utf8');
       assert.equal(
@@ -182,6 +202,57 @@ test('Repository hygiene gate: zero external npm dependencies, zero prebuilt bin
         `Hardcoded personal path found in ${rel}`
       );
     }
+  }
+
+  if (fs.existsSync(path.join(REPO_ROOT, '.git'))) {
+    const gitTracked = spawnSync('git', ['ls-files'], { cwd: REPO_ROOT, encoding: 'utf8' });
+    if (gitTracked.status === 0) {
+      const trackedList = gitTracked.stdout.split(/\r?\n/).filter(Boolean);
+      assert.equal(
+        trackedList.some((p) => p.endsWith('.local-runtime.json') || p.endsWith('.token')),
+        false,
+        'git must never track .local-runtime.json or .token files'
+      );
+    }
+  }
+
+  // Real npm pack dry-run verification from a paired checkout containing extension/.local-runtime.json
+  const runtimeBootstrapPath = path.join(REPO_ROOT, 'extension', '.local-runtime.json');
+  const hadExistingBootstrap = fs.existsSync(runtimeBootstrapPath);
+  const previousBootstrapRaw = hadExistingBootstrap ? fs.readFileSync(runtimeBootstrapPath, 'utf8') : null;
+  fs.writeFileSync(
+    runtimeBootstrapPath,
+    JSON.stringify({ host: '127.0.0.1', port: 28196, token: 'simulated_secret_token_never_pack_me' }),
+    'utf8'
+  );
+  try {
+    const packRun =
+      process.platform === 'win32'
+        ? spawnSync('cmd.exe', ['/d', '/s', '/c', 'npm pack --dry-run --json'], {
+            cwd: REPO_ROOT,
+            encoding: 'utf8'
+          })
+        : spawnSync('npm', ['pack', '--dry-run', '--json'], {
+            cwd: REPO_ROOT,
+            encoding: 'utf8'
+          });
+    assert.equal(packRun.status, 0, `npm pack --dry-run failed: ${packRun.stderr}`);
+    const parsedPack = JSON.parse(packRun.stdout);
+    const packedFiles = (parsedPack[0]?.files || []).map((f) => String(f.path || '').replace(/\\/g, '/'));
+    assert.ok(packedFiles.length >= 10, 'Expected non-empty npm pack manifest');
+    assert.equal(
+      packedFiles.some((p) => p.endsWith('.local-runtime.json') || p.endsWith('.token')),
+      false,
+      `npm pack leaked pairing secret file: ${packedFiles.join(', ')}`
+    );
+  } finally {
+    try {
+      if (hadExistingBootstrap && previousBootstrapRaw !== null) {
+        fs.writeFileSync(runtimeBootstrapPath, previousBootstrapRaw, 'utf8');
+      } else if (fs.existsSync(runtimeBootstrapPath)) {
+        fs.unlinkSync(runtimeBootstrapPath);
+      }
+    } catch {}
   }
 });
 
@@ -235,11 +306,11 @@ test('Daemon enforces Host header, blocks web Origins, validates Token, and rout
     const unauth = await httpJson(port, 'GET', '/api/health');
     assert.equal(unauth.statusCode, 401);
 
-    // 4. Valid Chrome extension Origin + valid token succeeds
+    // 4. Valid Chrome extension Origin + valid HMAC signature succeeds
     const extOrigin = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop';
     const okHealth = await httpJson(port, 'GET', '/api/health', {
       Origin: extOrigin,
-      'X-Chrome-Live-Token': testToken
+      token: testToken
     });
     assert.equal(okHealth.statusCode, 200);
     assert.equal(okHealth.json.extensionConnected, false);
@@ -278,7 +349,7 @@ test('Daemon enforces Host header, blocks web Origins, validates Token, and rout
         port,
         'POST',
         '/api/command',
-        { 'X-Chrome-Live-Token': testToken },
+        { token: testToken },
         { method: i % 2 === 0 ? 'snapshot' : 'scroll', params: { step: i } }
       );
       assert.equal(cmdRes.statusCode, 200);
@@ -291,7 +362,7 @@ test('Daemon enforces Host header, blocks web Origins, validates Token, and rout
       port,
       'POST',
       '/api/command',
-      { 'X-Chrome-Live-Token': testToken },
+      { token: testToken },
       { method: 'open', params: { url: 'https://checkout.stripe.com/pay/123' } }
     );
     assert.equal(blockedCmd.statusCode, 500);
@@ -301,7 +372,7 @@ test('Daemon enforces Host header, blocks web Origins, validates Token, and rout
       port,
       'POST',
       '/api/command',
-      { 'X-Chrome-Live-Token': testToken },
+      { token: testToken },
       {
         method: 'batch',
         params: {
@@ -319,7 +390,7 @@ test('Daemon enforces Host header, blocks web Origins, validates Token, and rout
       port,
       'POST',
       '/api/command',
-      { 'X-Chrome-Live-Token': testToken },
+      { token: testToken },
       {
         method: 'batch',
         params: {
@@ -355,7 +426,7 @@ test('Daemon enforces Host header, blocks web Origins, validates Token, and rout
     liveWs.socket.destroy();
     await new Promise((r) => setTimeout(r, 50));
     const afterReset = await httpJson(port, 'GET', '/api/health', {
-      'X-Chrome-Live-Token': testToken
+      token: testToken
     });
     assert.equal(afterReset.statusCode, 200);
   } finally {
@@ -382,7 +453,7 @@ test('Site Playbooks are strictly opt-in (false by default), strip sensitive que
 
     // 1. Default state MUST be disabled (opt-in privacy gate)
     const initialPb = await httpJson(port, 'GET', '/api/playbook', {
-      'X-Chrome-Live-Token': testToken
+      token: testToken
     });
     assert.equal(initialPb.statusCode, 200);
     assert.equal(initialPb.json.enabled, false);
@@ -410,11 +481,11 @@ test('Site Playbooks are strictly opt-in (false by default), strip sensitive que
       port,
       'POST',
       '/api/command',
-      { 'X-Chrome-Live-Token': testToken },
+      { token: testToken },
       { method: 'snapshot', params: {} }
     );
     const stillEmpty = await httpJson(port, 'GET', '/api/playbook', {
-      'X-Chrome-Live-Token': testToken
+      token: testToken
     });
     assert.equal(Object.keys(stillEmpty.json.sites).length, 0);
 
@@ -423,14 +494,14 @@ test('Site Playbooks are strictly opt-in (false by default), strip sensitive que
       port,
       'POST',
       '/api/playbook',
-      { 'X-Chrome-Live-Token': testToken },
+      { token: testToken },
       { action: 'set_enabled', enabled: true }
     );
     await httpJson(
       port,
       'POST',
       '/api/playbook',
-      { 'X-Chrome-Live-Token': testToken },
+      { token: testToken },
       {
         action: 'save',
         domain: 'seller.example.com',
@@ -443,7 +514,7 @@ test('Site Playbooks are strictly opt-in (false by default), strip sensitive que
       port,
       'POST',
       '/api/command',
-      { 'X-Chrome-Live-Token': testToken },
+      { token: testToken },
       { method: 'snapshot', params: {} }
     );
     const pb = snapWithPb.json.result.playbook;
@@ -457,7 +528,7 @@ test('Site Playbooks are strictly opt-in (false by default), strip sensitive que
       port,
       'POST',
       '/api/playbook',
-      { 'X-Chrome-Live-Token': testToken },
+      { token: testToken },
       {
         action: 'save',
         domain: 'seller.example.com',
@@ -472,7 +543,7 @@ test('Site Playbooks are strictly opt-in (false by default), strip sensitive que
       port,
       'POST',
       '/api/playbook',
-      { 'X-Chrome-Live-Token': testToken },
+      { token: testToken },
       { action: 'delete_item', domain: 'seller.example.com', kind: 'tip', index: 0 }
     );
     assert.equal(delTip.statusCode, 200);
@@ -483,7 +554,7 @@ test('Site Playbooks are strictly opt-in (false by default), strip sensitive que
       port,
       'POST',
       '/api/playbook',
-      { 'X-Chrome-Live-Token': testToken },
+      { token: testToken },
       { action: 'clear' }
     );
     assert.equal(cleared.json.siteCount, 0);
@@ -539,28 +610,46 @@ test('Edge-case regressions: SPA hash checkout guardrail, UTF-8 multibyte WS clo
   }
 });
 
-test('Upload guardrails block credential keys and resolve valid local image attachments', async () => {
-  for (const blockedPath of [
-    '/home/dev/.ssh/id_rsa',
-    '/Users/dev/.aws/credentials-demo/.env.production',
-    '/tmp/.chrome-live-antigravity/auth.token',
-    './.env'
-  ]) {
-    const res = evaluateUploadFileSafety(blockedPath);
-    assert.equal(res.allowed, false, `Expected sensitive file "${blockedPath}" to be blocked`);
-    assert.equal(res.code, 'SENSITIVE_FILE');
-  }
-
-  const iconFile = path.join(REPO_ROOT, 'extension', 'icons', 'icon48.png');
-  const safeRes = evaluateUploadFileSafety(iconFile);
-  assert.equal(safeRes.allowed, true);
-  assert.equal(safeRes.resolvedPath, iconFile);
+test('Upload guardrails block credential keys, restrict default uploads to staging dir, and resolve valid attachments', async () => {
+  const prevHome = process.env.CHROME_LIVE_HOME;
+  const prevUploadDir = process.env.CHROME_LIVE_UPLOAD_DIR;
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-upload-default-'));
+  process.env.CHROME_LIVE_HOME = tempHome;
+  delete process.env.CHROME_LIVE_UPLOAD_DIR;
 
   const testToken = crypto.randomBytes(32).toString('hex');
   const daemon = createDaemonServer({ host: '127.0.0.1', port: 0, token: testToken });
   const port = await daemon.listen();
 
   try {
+    for (const blockedPath of [
+      '/home/dev/.ssh/id_rsa',
+      '/Users/dev/.aws/credentials-demo/.env.production',
+      '/tmp/.chrome-live-antigravity/auth.token',
+      './.env'
+    ]) {
+      const res = evaluateUploadFileSafety(blockedPath);
+      assert.equal(res.allowed, false, `Expected sensitive file "${blockedPath}" to be blocked`);
+      assert.equal(res.code, 'SENSITIVE_FILE');
+    }
+
+    // Ordinary files outside ~/.chrome-live-antigravity/uploads (e.g. repo files, desktop spreadsheets/invoices)
+    // MUST be blocked by default unless explicitly staged or permitted via CHROME_LIVE_UPLOAD_DIR
+    const outsideIcon = path.join(REPO_ROOT, 'extension', 'icons', 'icon48.png');
+    const outsideRes = evaluateUploadFileSafety(outsideIcon);
+    assert.equal(outsideRes.allowed, false);
+    assert.equal(outsideRes.code, 'UPLOAD_DIR_RESTRICTED');
+
+    const stagingDir = getDefaultUploadStagingDir();
+    fs.mkdirSync(stagingDir, { recursive: true });
+    const stagedIcon = path.join(stagingDir, 'staged-icon48.png');
+    fs.copyFileSync(outsideIcon, stagedIcon);
+    const expectedRealIcon = fs.realpathSync(stagedIcon);
+
+    const safeRes = evaluateUploadFileSafety(stagedIcon);
+    assert.equal(safeRes.allowed, true);
+    assert.equal(safeRes.resolvedPath, expectedRealIcon);
+
     const extWs = await connectTestWsClient(port, '/ws/extension', testToken);
     extWs.sendMaskedJson({ type: 'hello', version: '1.0.0', tabs: [] });
 
@@ -584,31 +673,46 @@ test('Upload guardrails block credential keys and resolve valid local image atta
       port,
       'POST',
       '/api/command',
-      { 'X-Chrome-Live-Token': testToken },
+      { token: testToken },
       { method: 'upload', params: { target: 'auto', files: ['/home/dev/.ssh/id_ed25519'] } }
     );
     assert.equal(blockedResp.statusCode, 500);
     assert.match(blockedResp.json.error, /GUARDRAIL:SENSITIVE_FILE/);
 
+    const blockedOutsideResp = await httpJson(
+      port,
+      'POST',
+      '/api/command',
+      { token: testToken },
+      { method: 'upload', params: { target: 'auto', files: [outsideIcon] } }
+    );
+    assert.equal(blockedOutsideResp.statusCode, 500);
+    assert.match(blockedOutsideResp.json.error, /GUARDRAIL:UPLOAD_DIR_RESTRICTED/);
+
     const okResp = await httpJson(
       port,
       'POST',
       '/api/command',
-      { 'X-Chrome-Live-Token': testToken },
-      { method: 'upload', params: { target: 'auto', files: [iconFile] } }
+      { token: testToken },
+      { method: 'upload', params: { target: 'auto', files: [stagedIcon] } }
     );
     assert.equal(okResp.statusCode, 200);
-    assert.deepEqual(okResp.json.result.receivedFiles, [iconFile]);
+    assert.deepEqual(okResp.json.result.receivedFiles, [expectedRealIcon]);
     assert.equal(okResp.json.result.hasPasteFallback, true);
     assert.equal(okResp.json.result.fallbackMime, 'image/png');
 
     extWs.socket.destroy();
   } finally {
     await daemon.close();
+    if (prevHome === undefined) delete process.env.CHROME_LIVE_HOME;
+    else process.env.CHROME_LIVE_HOME = prevHome;
+    if (prevUploadDir === undefined) delete process.env.CHROME_LIVE_UPLOAD_DIR;
+    else process.env.CHROME_LIVE_UPLOAD_DIR = prevUploadDir;
+    fs.rmSync(tempHome, { recursive: true, force: true });
   }
 });
 
-test('MCP stdio server serves SEP-1865 inline live monitor resource and structuredContent frames', async () => {
+test('MCP stdio server isolates model-visible monitor from app-only UI actions, propagates release errors, and locks closed pinned tabs', async () => {
   const { spawn } = await import('node:child_process');
   const testToken = crypto.randomBytes(32).toString('hex');
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-mcp-ui-'));
@@ -618,24 +722,45 @@ test('MCP stdio server serves SEP-1865 inline live monitor resource and structur
   const port = await daemon.listen();
 
   let mcpProc = null;
+  let simulateReleaseError = false;
   try {
     const extWs = await connectTestWsClient(port, '/ws/extension', testToken);
     extWs.sendMaskedJson({
       type: 'hello',
       version: '1.0.0',
-      tabs: [{ tabId: 77, substate: 'shared', paused: false, title: 'Live Demo', url: 'https://example.com/' }]
+      tabs: [
+        { tabId: 77, substate: 'shared', paused: false, title: 'Live Demo', url: 'https://example.com/' },
+        { tabId: 88, substate: 'worker', paused: false, title: 'Second Store', url: 'https://store-b.example.com/' }
+      ]
     });
     extWs.sendMaskedJson({
       type: 'screencast_frame',
       tabId: 77,
       mimeType: 'image/jpeg',
-      data: Buffer.from('fake-jpeg-bytes').toString('base64'),
+      data: Buffer.from('fake-jpeg-bytes-77').toString('base64'),
       title: 'Live Demo',
       url: 'https://example.com/'
+    });
+    extWs.sendMaskedJson({
+      type: 'screencast_frame',
+      tabId: 88,
+      mimeType: 'image/jpeg',
+      data: Buffer.from('fake-jpeg-bytes-88').toString('base64'),
+      title: 'Second Store',
+      url: 'https://store-b.example.com/'
     });
     extWs.on('message', (raw) => {
       const msg = JSON.parse(raw.toString('utf8'));
       if (msg.type === 'rpc_request') {
+        if (msg.method === 'release_tab' && simulateReleaseError) {
+          extWs.sendMaskedJson({
+            type: 'rpc_response',
+            id: msg.id,
+            ok: false,
+            error: 'Simulated debugger detach failure'
+          });
+          return;
+        }
         if (msg.method === 'inspect_region') {
           extWs.sendMaskedJson({
             type: 'rpc_response',
@@ -651,7 +776,7 @@ test('MCP stdio server serves SEP-1865 inline live monitor resource and structur
             type: 'rpc_response',
             id: msg.id,
             ok: true,
-            result: { tabId: 77, method: msg.method }
+            result: { tabId: msg.params?.tabId ?? 77, method: msg.method }
           });
         }
       }
@@ -692,11 +817,25 @@ test('MCP stdio server serves SEP-1865 inline live monitor resource and structur
     assert.ok(initResp.result.capabilities.resources, 'Expected resources capability for MCP App');
 
     const toolsList = await rpc(20, 'tools/list');
+    const monitorTool = toolsList.result.tools.find((t) => t.name === 'chrome_live_monitor');
+    const uiActionTool = toolsList.result.tools.find((t) => t.name === 'chrome_live_ui_action');
     const wsTool = toolsList.result.tools.find((t) => t.name === 'chrome_live_workspace');
+    assert.ok(monitorTool, 'Expected chrome_live_monitor tool');
+    assert.deepEqual(monitorTool._meta?.ui?.visibility, ['model']);
+    assert.equal('action' in (monitorTool.inputSchema?.properties || {}), false, 'Model monitor schema must not expose UI actions');
+    assert.ok(uiActionTool, 'Expected app-only chrome_live_ui_action tool');
+    assert.deepEqual(uiActionTool._meta?.ui?.visibility, ['app']);
     assert.ok(wsTool, 'Expected chrome_live_workspace entrypoint tool');
     assert.equal(wsTool._meta?.ui?.resourceUri, 'ui://chrome-live/live-monitor.html');
     const epTypes = (wsTool._meta?.['com.google.antigravity/ui']?.entrypoints || []).map((e) => e.type);
     assert.deepEqual(epTypes.sort(), ['aux_pane', 'global']);
+
+    // Model attempting to sneak an action into chrome_live_monitor must be rejected
+    const forbiddenModelAction = await rpc(29, 'tools/call', {
+      name: 'chrome_live_monitor',
+      arguments: { tabId: 77, action: 'relay_merge' }
+    });
+    assert.equal(Boolean(forbiddenModelAction.error || forbiddenModelAction.result?.isError), true);
 
     const resList = await rpc(2, 'resources/list');
     assert.equal(resList.result.resources[0].uri, 'ui://chrome-live/live-monitor.html');
@@ -704,29 +843,55 @@ test('MCP stdio server serves SEP-1865 inline live monitor resource and structur
 
     const resRead = await rpc(3, 'resources/read', { uri: 'ui://chrome-live/live-monitor.html' });
     assert.match(resRead.result.contents[0].text, /ui\/initialize/);
-    assert.match(resRead.result.contents[0].text, /attachBtn/);
-    assert.match(resRead.result.contents[0].text, /updateModelContext/);
+    assert.match(resRead.result.contents[0].text, /chrome_live_ui_action/);
+    assert.match(resRead.result.contents[0].text, /pinnedTabClosed/);
 
-    const monitorCall = await rpc(4, 'tools/call', { name: 'chrome_live_monitor', arguments: {} });
+    const monitorCall = await rpc(4, 'tools/call', { name: 'chrome_live_monitor', arguments: { tabId: 77 } });
     assert.ok(monitorCall.result.structuredContent.frameDataUrl.startsWith('data:image/jpeg;base64,'));
-    assert.equal(monitorCall.result.structuredContent.tabs[0].title, 'Live Demo');
+    assert.equal(monitorCall.result.structuredContent.frameTabId, 77);
 
     // Entrypoint launches invoke chrome_live_workspace with empty {}
     const wsCall = await rpc(21, 'tools/call', { name: 'chrome_live_workspace', arguments: {} });
     assert.ok(wsCall.result.structuredContent.frameDataUrl.startsWith('data:image/jpeg;base64,'));
 
-    // Per-tab poll and region action route directly through chrome_live_monitor (enabled for both model & app)
+    // App-only UI actions route through chrome_live_ui_action
     const pollCall = await rpc(22, 'tools/call', {
-      name: 'chrome_live_monitor',
+      name: 'chrome_live_ui_action',
       arguments: { action: 'poll', lastFrameTs: 0, tabId: 77 }
     });
     assert.equal(pollCall.result.structuredContent.frameTabId, 77);
 
     const regionCall = await rpc(5, 'tools/call', {
-      name: 'chrome_live_monitor',
+      name: 'chrome_live_ui_action',
       arguments: { action: 'inspect_region', tabId: 77, rx1: 0.1, ry1: 0.1, rx2: 0.5, ry2: 0.5 }
     });
     assert.equal(regionCall.result.structuredContent.regionResult.elements[0].selector, '#confirm-btn');
+
+    // Release error MUST propagate instead of silently reporting success
+    simulateReleaseError = true;
+    const failedRelease = await rpc(25, 'tools/call', {
+      name: 'chrome_live_ui_action',
+      arguments: { action: 'release_tab', tabId: 77 }
+    });
+    assert.equal(Boolean(failedRelease.error || failedRelease.result?.isError), true);
+    const errText = JSON.stringify(failedRelease);
+    assert.match(errText, /Simulated debugger detach failure/);
+    simulateReleaseError = false;
+
+    // Closing pinned tab 88 must NOT silently fall back to capturing tab 77
+    extWs.sendMaskedJson({
+      type: 'status_sync',
+      tabs: [{ tabId: 77, substate: 'shared', paused: false, title: 'Live Demo', url: 'https://example.com/' }],
+      activeTabId: 77
+    });
+    await new Promise((r) => setTimeout(r, 40));
+
+    const closedTabPoll = await rpc(26, 'tools/call', {
+      name: 'chrome_live_ui_action',
+      arguments: { action: 'poll', lastFrameTs: 0, tabId: 88 }
+    });
+    assert.equal(closedTabPoll.result.structuredContent.requestedTabMissing, true);
+    assert.equal(closedTabPoll.result.structuredContent.frameDataUrl ?? null, null);
 
     extWs.socket.destroy();
   } finally {
@@ -785,15 +950,15 @@ test('Multi-tab concurrency & form-state regressions: per-tab frame isolation, A
     });
     await new Promise((r) => setTimeout(r, 40));
 
-    const f101 = await httpJson(port, 'GET', '/api/frame?tabId=101', { 'X-Chrome-Live-Token': testToken });
-    const f202 = await httpJson(port, 'GET', '/api/frame?tabId=202', { 'X-Chrome-Live-Token': testToken });
+    const f101 = await httpJson(port, 'GET', '/api/frame?tabId=101', { token: testToken });
+    const f202 = await httpJson(port, 'GET', '/api/frame?tabId=202', { token: testToken });
     assert.equal(f101.statusCode, 200);
     assert.equal(f101.text, 'frame-bytes-tab-101');
     assert.equal(f202.statusCode, 200);
     assert.equal(f202.text, 'frame-bytes-tab-202');
 
     const h101 = await httpJson(port, 'GET', '/api/health?includeFrame=1&tabId=101', {
-      'X-Chrome-Live-Token': testToken
+      token: testToken
     });
     assert.equal(h101.json.frameTabId, 101);
     assert.deepEqual(h101.json.cachedFrameTabIds.sort((a, b) => a - b), [101, 202]);
@@ -806,8 +971,8 @@ test('Multi-tab concurrency & form-state regressions: per-tab frame isolation, A
     });
     await new Promise((r) => setTimeout(r, 40));
 
-    const f101Gone = await httpJson(port, 'GET', '/api/frame?tabId=101', { 'X-Chrome-Live-Token': testToken });
-    const f202Still = await httpJson(port, 'GET', '/api/frame?tabId=202', { 'X-Chrome-Live-Token': testToken });
+    const f101Gone = await httpJson(port, 'GET', '/api/frame?tabId=101', { token: testToken });
+    const f202Still = await httpJson(port, 'GET', '/api/frame?tabId=202', { token: testToken });
     assert.equal(f101Gone.statusCode, 204);
     assert.equal(f202Still.statusCode, 200);
     assert.equal(f202Still.text, 'frame-bytes-tab-202');
@@ -845,7 +1010,7 @@ test('Multi-tab concurrency & form-state regressions: per-tab frame isolation, A
   assert.match(cliSource, /function formatAlertsBlock/);
 });
 
-test('Security audit hardening: paused remote_interact guard, extract daemon guardrail, first-frame WS auth, RFC 6455 masking, audit redaction & /pay /billing routes', async () => {
+test('Security audit hardening: mutual HTTP/WS HMAC, replay defense, runtime bootstrap shred, symlink assertion, password click redaction & paused relay lock', async () => {
   // 1. Standalone /pay and /billing routes are blocked without false positives on /payload or /billing-docs
   assert.equal(evaluateUrlSafety('https://shop.example.com/pay').allowed, false);
   assert.equal(evaluateUrlSafety('https://shop.example.com/pay?order=1').allowed, false);
@@ -863,13 +1028,55 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
   const port = await daemon.listen();
 
   try {
-    // 2a. Query-string ?token= must be rejected on both HTTP and WS
+    // 2a. Query-string ?token= and plaintext headers MUST be rejected on both HTTP and WS
     const httpQueryAuth = await httpJson(port, 'GET', `/api/health?token=${encodeURIComponent(testToken)}`);
     assert.equal(httpQueryAuth.statusCode, 401);
+    const httpPlainHeaderAuth = await httpJson(port, 'GET', '/api/health', {
+      'X-Chrome-Live-Token': testToken
+    });
+    assert.equal(httpPlainHeaderAuth.statusCode, 401);
+
     await assert.rejects(
       () => connectTestWsClient(port, `/ws/extension?token=${encodeURIComponent(testToken)}`, testToken, { authMode: 'none' }),
       /401/
     );
+    await assert.rejects(
+      () => connectTestWsClient(port, '/ws/extension', testToken, { authMode: 'header' }),
+      /401/
+    );
+
+    // 2a-replay. Replaying an identical HTTP HMAC signature + nonce MUST be rejected with 401
+    const replaySigned = buildSignedHttpHeaders(testToken, 'GET', '/api/health', null);
+    const firstSignedResp = await httpJson(port, 'GET', '/api/health', replaySigned.headers);
+    assert.equal(firstSignedResp.statusCode, 200);
+    assert.equal(
+      verifySignedHttpResponse(testToken, firstSignedResp.statusCode, firstSignedResp.headers, replaySigned.ts, replaySigned.nonce),
+      true
+    );
+    const secondReplayResp = await httpJson(port, 'GET', '/api/health', replaySigned.headers);
+    assert.equal(secondReplayResp.statusCode, 401);
+
+    // 2a-spoof. Unverified local HTTP listener (without the secret token) fails mutual response verification
+    const fakeServer = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'X-Chrome-Live-Server-Sig': 'f'.repeat(64)
+      });
+      res.end('{"ok":true}');
+    });
+    await new Promise((r) => fakeServer.listen(0, '127.0.0.1', r));
+    try {
+      const fakePort = fakeServer.address().port;
+      const probeMeta = buildSignedHttpHeaders(testToken, 'GET', '/api/health', null);
+      const fakeResp = await httpJson(fakePort, 'GET', '/api/health', probeMeta.headers);
+      assert.equal(
+        verifySignedHttpResponse(testToken, fakeResp.statusCode, fakeResp.headers, probeMeta.ts, probeMeta.nonce),
+        false,
+        'Client must reject forged X-Chrome-Live-Server-Sig from impostor local service'
+      );
+    } finally {
+      fakeServer.close();
+    }
 
     // 2b. WS rejects legacy plaintext auth and invalid HMAC clientProof without hijacking extensionPeer
     const badPlainWs = await connectTestWsClient(port, '/ws/extension', '', { authMode: 'none' });
@@ -892,15 +1099,29 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
     assert.equal(badProofWs.closed, true);
 
     // 2c. RFC 6455: Unmasked client WS frame must be rejected by server with protocol error close
-    const unmaskedWs = await connectTestWsClient(port, '/ws/extension', testToken, { authMode: 'header' });
+    const unmaskedWs = await connectTestWsClient(port, '/ws/extension', '', { authMode: 'none' });
     const unmaskedClosed = new Promise((resolve) => unmaskedWs.on('close', resolve));
-    unmaskedWs.socket.write(encodeWsFrame(0x01, Buffer.from('{"type":"hello"}', 'utf8'), false));
+    unmaskedWs.socket.write(encodeWsFrame(0x01, Buffer.from('{"type":"auth_init"}', 'utf8'), false));
     await unmaskedClosed;
     assert.equal(unmaskedWs.closed, true);
 
-    // 2d. Valid mutual HMAC-SHA256 challenge-response connects extensionPeer cleanly
-    const extWs = await connectTestWsClient(port, '/ws/extension', testToken, { authMode: 'challenge' });
-    await new Promise((r) => setTimeout(r, 40));
+    // 2d. Valid mutual HMAC-SHA256 challenge-response connects extensionPeer cleanly AND shreds .local-runtime.json
+    const runtimeBootstrapFile = path.join(REPO_ROOT, 'extension', '.local-runtime.json');
+    fs.writeFileSync(runtimeBootstrapFile, JSON.stringify({ host: '127.0.0.1', port, token: testToken }), 'utf8');
+    let extWs;
+    try {
+      extWs = await connectTestWsClient(port, '/ws/extension', testToken, { authMode: 'challenge' });
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(
+        fs.existsSync(runtimeBootstrapFile),
+        false,
+        'Daemon must consume and shred extension/.local-runtime.json upon first extension handshake'
+      );
+    } finally {
+      try {
+        if (fs.existsSync(runtimeBootstrapFile)) fs.unlinkSync(runtimeBootstrapFile);
+      } catch {}
+    }
 
     extWs.on('message', (txt) => {
       const msg = JSON.parse(txt);
@@ -914,7 +1135,7 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
       port,
       'POST',
       '/api/command',
-      { 'X-Chrome-Live-Token': testToken },
+      { token: testToken },
       {
         method: 'extract',
         params: { urls: ['https://example.com/article', 'https://checkout.stripe.com/c/pay/123'] }
@@ -927,7 +1148,7 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
       port,
       'POST',
       '/api/command',
-      { 'X-Chrome-Live-Token': testToken },
+      { token: testToken },
       {
         method: 'batch',
         params: { steps: [{ cmd: 'upload', files: [path.join(REPO_ROOT, 'extension', '.local-runtime.json')] }] }
@@ -936,7 +1157,7 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
     assert.equal(blockedBatchCmdUpload.statusCode, 500);
     assert.match(blockedBatchCmdUpload.json.error, /GUARDRAIL:SENSITIVE_FILE/);
 
-    // 2f. Upload guardrails: .local-runtime.json, .pem, symlinks, and CHROME_LIVE_UPLOAD_DIR allowlist
+    // 2f. Upload guardrails: .local-runtime.json, .pem, directory symlinks/junctions (unconditional assertion!), and allowlist
     assert.equal(evaluateUploadFileSafety(path.join(REPO_ROOT, 'extension', '.local-runtime.json')).allowed, false);
     assert.equal(evaluateUploadFileSafety('/tmp/server-private.pem').allowed, false);
 
@@ -944,10 +1165,10 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
     const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-outside-dir-'));
     try {
       const safeFile = path.join(sandboxDir, 'photo.png');
-      const outsideFile = path.join(outsideDir, 'other.png');
+      const outsideFile = path.join(outsideDir, 'invoice-2026.png');
       const secretFile = path.join(outsideDir, '.env');
       fs.writeFileSync(safeFile, 'ok');
-      fs.writeFileSync(outsideFile, 'outside');
+      fs.writeFileSync(outsideFile, 'outside-invoice');
       fs.writeFileSync(secretFile, 'SECRET=1');
 
       assert.equal(evaluateUploadFileSafety(safeFile, { allowedDirs: [sandboxDir] }).allowed, true);
@@ -955,14 +1176,19 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
       assert.equal(outsideCheck.allowed, false);
       assert.equal(outsideCheck.code, 'UPLOAD_DIR_RESTRICTED');
 
-      // Test symlink resolution when platform permits symlink creation
-      const linkPath = path.join(sandboxDir, 'innocent.png');
-      try {
-        fs.symlinkSync(secretFile, linkPath);
-        const symCheck = evaluateUploadFileSafety(linkPath, { allowedDirs: [sandboxDir] });
-        assert.equal(symCheck.allowed, false);
-        assert.equal(symCheck.code, 'SENSITIVE_FILE');
-      } catch {}
+      // Unconditional symlink / junction escape test (never wrapped in an empty catch!)
+      const linkDir = path.join(sandboxDir, 'linked-outside');
+      fs.symlinkSync(outsideDir, linkDir, process.platform === 'win32' ? 'junction' : 'dir');
+
+      const symSecretCheck = evaluateUploadFileSafety(path.join(linkDir, '.env'), { allowedDirs: [sandboxDir] });
+      assert.equal(symSecretCheck.allowed, false);
+      assert.equal(symSecretCheck.code, 'SENSITIVE_FILE');
+
+      const symEscapeCheck = evaluateUploadFileSafety(path.join(linkDir, 'invoice-2026.png'), {
+        allowedDirs: [sandboxDir]
+      });
+      assert.equal(symEscapeCheck.allowed, false);
+      assert.equal(symEscapeCheck.code, 'UPLOAD_DIR_RESTRICTED');
     } finally {
       fs.rmSync(sandboxDir, { recursive: true, force: true });
       fs.rmSync(outsideDir, { recursive: true, force: true });
@@ -973,11 +1199,11 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
       port,
       'POST',
       '/api/command',
-      { 'X-Chrome-Live-Token': testToken },
+      { token: testToken },
       { method: 'open', params: { url: 'https://example.com/cb?page=2&token=supersecret&code=oauth123' } }
     );
     assert.equal(okOpen.statusCode, 200);
-    const health = await httpJson(port, 'GET', '/api/health', { 'X-Chrome-Live-Token': testToken });
+    const health = await httpJson(port, 'GET', '/api/health', { token: testToken });
     const openAudit = health.json.recentAudit.find((a) => a.action === 'open');
     assert.ok(openAudit && typeof openAudit.detail.url === 'string');
     assert.ok(!openAudit.detail.url.includes('supersecret'), 'Audit log must redact token param');
@@ -989,7 +1215,7 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
       port,
       'POST',
       '/api/playbook',
-      { 'X-Chrome-Live-Token': testToken },
+      { token: testToken },
       { action: 'save', domain: 'example.com', tip: 'Should not persist while disabled' }
     );
     assert.equal(saveWhileOff.statusCode, 500);
@@ -1018,7 +1244,9 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
     fs.rmSync(tempHome, { recursive: true, force: true });
   }
 
-  // 3. Extension security gates: paused remote/inspect/screencast, detach order, banner cancel, no remote share_active, no plaintext input values
+  // 3. Extension runtime & VM behavioral verification:
+  //    - Clicking enabled or disabled password/OTP inputs NEVER returns el.value in 42/60-char receipts
+  //    - mergeRelayTabBack rejects non-popout paused tabs and preserves paused=true on external RPC merges
   const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
   assert.match(
     swSource,
@@ -1032,4 +1260,112 @@ test('Security audit hardening: paused remote_interact guard, extract daemon gua
   assert.match(swSource, /await stopCdpForTab\(tabId, entry\);\s*managedTabs\.delete\(tabId\);/);
   assert.match(swSource, /Sharing an existing signed-in tab requires explicit user confirmation/);
   assert.ok(!swSource.includes('/ws/extension?token='), 'Extension WS must not pass token in query string');
+
+  // Execute the exact click label snippet from service-worker.js inside a VM against mock filled password/OTP inputs
+  const clickLabelMatch = swSource.match(
+    /const elTagLower = el\.tagName\.toLowerCase\(\);[\s\S]*?if \(el\.disabled \|\| el\.getAttribute\('aria-disabled'\) === 'true'\) \{\s*const dLabel = safeElemLabel\(60\);\s*return \{ ok: false, error: `Element is disabled: \$\{dLabel\}` \};\s*\}/
+  );
+  assert.ok(clickLabelMatch, 'Expected safeElemLabel block in service-worker.js click handler');
+  const runClickLabelCheck = vm.runInNewContext(
+    `(function(el) { ${clickLabelMatch[0]} return { ok: true, label: safeElemLabel(42) }; })`
+  );
+
+  const secretValue = 'MyBankSecretPass#2026!';
+  const makeMockInput = ({ type = 'password', disabled = false, autocomplete = '' } = {}) => ({
+    tagName: 'INPUT',
+    type,
+    value: secretValue,
+    textContent: secretValue,
+    disabled,
+    isContentEditable: false,
+    id: '',
+    getAttribute(k) {
+      if (k === 'autocomplete') return autocomplete;
+      return null;
+    }
+  });
+
+  const enabledPwdRes = runClickLabelCheck(makeMockInput({ type: 'password', disabled: false }));
+  assert.equal(enabledPwdRes.ok, true);
+  assert.equal(enabledPwdRes.label, '(password)');
+  assert.equal(enabledPwdRes.label.includes(secretValue), false);
+
+  const disabledPwdRes = runClickLabelCheck(makeMockInput({ type: 'password', disabled: true }));
+  assert.equal(disabledPwdRes.ok, false);
+  assert.equal(disabledPwdRes.error, 'Element is disabled: (password)');
+  assert.equal(disabledPwdRes.error.includes(secretValue), false);
+
+  const otpTextRes = runClickLabelCheck(makeMockInput({ type: 'text', disabled: false, autocomplete: 'one-time-code' }));
+  assert.equal(otpTextRes.label, '(password)');
+  assert.equal(otpTextRes.label.includes(secretValue), false);
+
+  const plainFilledInputRes = runClickLabelCheck(makeMockInput({ type: 'text', disabled: false, autocomplete: '' }));
+  assert.equal(plainFilledInputRes.label, 'input');
+  assert.equal(plainFilledInputRes.label.includes(secretValue), false);
+
+  // Execute mergeRelayTabBack from service-worker.js inside a VM to verify pause cannot be lifted by external RPC
+  const mergeFnMatch = swSource.match(/async function mergeRelayTabBack\(entry[\s\S]*?\n\}/);
+  assert.ok(mergeFnMatch, 'Expected mergeRelayTabBack function in service-worker.js');
+  let capturedFrameCount = 0;
+  const runMergeHarness = vm.runInNewContext(
+    `(${mergeFnMatch[0]})`,
+    {
+      currentLang: 'en',
+      tr: () => ({ groupTitle: 'Live', groupPaused: 'Paused' }),
+      chrome: {
+        windows: {
+          get: async (id) => ({ id, type: 'normal' }),
+          getAll: async () => [{ id: 1, type: 'normal' }]
+        },
+        tabs: {
+          get: async (id) => ({ id, windowId: 99 }),
+          move: async () => {},
+          group: async () => {}
+        }
+      },
+      placeInBackgroundTabGroup: async () => {},
+      syncHud: async () => {},
+      syncLiveTabGroups: async () => {},
+      captureQuickFrame: async () => {
+        capturedFrameCount += 1;
+      },
+      pushLocalAudit: () => {},
+      notifyPanelAndDaemon: () => {}
+    }
+  );
+
+  // Ordinary paused tab (not popped out) MUST throw on relay_merge
+  const ordinaryPausedTab = { tabId: 5, paused: true, uiMode: 'paused', relayPopoutWinId: null };
+  await assert.rejects(() => runMergeHarness(ordinaryPausedTab), /not in a standalone relay popout/);
+  assert.equal(ordinaryPausedTab.paused, true);
+
+  // Popped-out relay tab merged via external RPC (default resumedByUserInBrowser=false) MUST stay paused & capture 0 frames!
+  const popoutRelayTabEntry = {
+    tabId: 6,
+    substate: 'shared',
+    paused: true,
+    uiMode: 'paused',
+    relayPopoutWinId: 99,
+    originWindowId: 1,
+    originIndex: 2
+  };
+  await runMergeHarness(popoutRelayTabEntry);
+  assert.equal(popoutRelayTabEntry.paused, true, 'External RPC relay_merge must NOT clear user pause');
+  assert.equal(popoutRelayTabEntry.uiMode, 'paused');
+  assert.equal(capturedFrameCount, 0, 'External RPC relay_merge must NOT capture frames while paused');
+
+  // Only browser-originated gesture (resumedByUserInBrowser: true) lifts pause
+  const browserGestureEntry = {
+    tabId: 7,
+    substate: 'shared',
+    paused: true,
+    uiMode: 'paused',
+    relayPopoutWinId: 99,
+    originWindowId: 1,
+    originIndex: 2
+  };
+  await runMergeHarness(browserGestureEntry, { resumedByUserInBrowser: true });
+  assert.equal(browserGestureEntry.paused, false);
+  assert.equal(browserGestureEntry.uiMode, 'working');
+  assert.equal(capturedFrameCount, 1);
 });

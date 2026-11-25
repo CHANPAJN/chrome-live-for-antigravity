@@ -260,22 +260,30 @@
             }
 
             const target = tabs[0] || null;
-            activeTabId = target ? target.tabId : s.latestFrameMeta?.tabId ?? null;
+            activeTabId = target ? target.tabId : null;
             focusBtn.disabled = activeTabId === null;
 
-            statusTitle.textContent =
-              target?.activity || s.latestFrameMeta?.activity || TXT.connectedIdle;
-            urlLabel.textContent =
-              target?.url || s.latestFrameMeta?.url || target?.title || '127.0.0.1:28196';
+            if (!target) {
+              lastCapturedAt = 0;
+              statusTitle.textContent = TXT.connectedIdle;
+              urlLabel.textContent = '127.0.0.1:28196';
+              liveImg.style.display = 'none';
+              emptyMsg.textContent = TXT.emptyHint;
+              emptyMsg.style.display = 'block';
+              return;
+            }
+
+            statusTitle.textContent = target.activity || TXT.connectedIdle;
+            urlLabel.textContent = target.url || target.title || '127.0.0.1:28196';
 
             const remoteTs = s.latestFrameMeta?.capturedAt || 0;
-            if (remoteTs && remoteTs !== lastCapturedAt) {
-              let dataUrl = s.frameDataUrl;
-              if (!dataUrl) {
-                const frameResp = await sidecarFetch('/api/live_state?includeFrame=1');
-                const frameJson = await frameResp.json();
-                dataUrl = frameJson?.frameDataUrl || '';
-              }
+            if (remoteTs && (remoteTs !== lastCapturedAt || forceFrame)) {
+              const frameResp = await sidecarFetch(
+                `/api/live_state?includeFrame=1&tabId=${encodeURIComponent(activeTabId)}`
+              );
+              const frameJson = await frameResp.json();
+              const dataUrl =
+                frameJson?.frameTabId === activeTabId ? frameJson?.frameDataUrl || '' : '';
               if (dataUrl) {
                 lastCapturedAt = remoteTs;
                 liveImg.src = dataUrl;
@@ -292,12 +300,25 @@
         }
 
         refreshBtn.addEventListener('click', async () => {
-          await sidecarFetch('/api/action?cmd=screenshot').catch(() => {});
-          await poll();
+          if (activeTabId === null) return;
+          const r = await sidecarFetch(`/api/action?cmd=screenshot&tabId=${encodeURIComponent(activeTabId)}`).catch(
+            () => null
+          );
+          const j = r ? await r.json().catch(() => null) : null;
+          if (!j || j.ok === false) {
+            statusTitle.textContent = j?.error || 'Refresh failed';
+            return;
+          }
+          await poll(true);
         });
 
         releaseBtn.addEventListener('click', async () => {
-          await sidecarFetch('/api/action?cmd=release_tab&all=1').catch(() => {});
+          const r = await sidecarFetch('/api/action?cmd=release_tab&all=1').catch(() => null);
+          const j = r ? await r.json().catch(() => null) : null;
+          if (!j || j.ok === false) {
+            statusTitle.textContent = j?.error || 'Release failed';
+            return;
+          }
           lastCapturedAt = 0;
           liveImg.style.display = 'none';
           emptyMsg.style.display = 'block';

@@ -139,6 +139,52 @@ function constantTimeHexEqual(a, b) {
   return diff === 0;
 }
 
+async function sha256HexWeb(text) {
+  const enc = new TextEncoder();
+  const digest = await crypto.subtle.digest('SHA-256', enc.encode(String(text ?? '')));
+  const bytes = new Uint8Array(digest);
+  let hex = '';
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, '0');
+  }
+  return hex;
+}
+
+async function signedDaemonFetch(routePath, method = 'GET', bodyObj = null) {
+  const m = String(method || 'GET').toUpperCase();
+  const bodyStr = bodyObj !== null && bodyObj !== undefined ? JSON.stringify(bodyObj) : '';
+  const ts = String(Date.now());
+  const nonce = generateRandomHex(16);
+  const bodyHash = await sha256HexWeb(bodyStr);
+  const sig = await hmacSha256Hex(
+    bridgeConfig.token,
+    `chrome-live:http-req:v1:${m}:${routePath}:${ts}:${nonce}:${bodyHash}`
+  );
+  const headers = {
+    'X-Chrome-Live-Ts': ts,
+    'X-Chrome-Live-Nonce': nonce,
+    'X-Chrome-Live-Sig': sig
+  };
+  if (bodyStr) {
+    headers['Content-Type'] = 'application/json';
+  }
+  const resp = await fetch(`http://${bridgeConfig.host}:${bridgeConfig.port}${routePath}`, {
+    method: m,
+    headers,
+    body: bodyStr || undefined,
+    cache: 'no-store'
+  });
+  const serverSig = resp.headers.get('x-chrome-live-server-sig') || '';
+  const expectedServerSig = await hmacSha256Hex(
+    bridgeConfig.token,
+    `chrome-live:http-res:v1:${resp.status}:${ts}:${nonce}`
+  );
+  if (!constantTimeHexEqual(serverSig, expectedServerSig)) {
+    throw new Error('Unverified local service response signature');
+  }
+  return resp;
+}
+
 // tabId -> { tabId, substate: 'shared'|'worker', uiMode: string, attachedCdp: boolean, screencastActive: boolean, paused: boolean, title: string, url: string, activity: string, idleTimer: any }
 const managedTabs = new Map();
 const hudSyncLocks = new Map();
@@ -272,31 +318,33 @@ async function loadBootstrapAndStorage() {
   if (Array.isArray(stored[STORAGE_GUARDRAILS_KEY])) {
     customBlockedDomains = stored[STORAGE_GUARDRAILS_KEY];
   }
-  if (stored[STORAGE_CONFIG_KEY] && stored[STORAGE_CONFIG_KEY].token) {
-    bridgeConfig = {
-      host: '127.0.0.1',
-      port: Number(stored[STORAGE_CONFIG_KEY].port) || 28196,
-      token: String(stored[STORAGE_CONFIG_KEY].token)
-    };
-    return;
-  }
-
-  // Fallback: check optional local runtime file created by `chrome-live setup`
+  // Priority 1: consume one-time `.local-runtime.json` bootstrap if `chrome-live setup` was just run
+  // (daemon automatically shreds this file upon successful mutual-HMAC handshake).
+  let loadedFromBootstrap = false;
   try {
-    const resp = await fetch(chrome.runtime.getURL('.local-runtime.json'));
+    const resp = await fetch(chrome.runtime.getURL('.local-runtime.json'), { cache: 'no-store' });
     if (resp.ok) {
       const json = await resp.json();
-      if (json && typeof json.token === 'string' && json.token.length >= 16) {
+      if (json && typeof json.token === 'string' && json.token.trim().length >= 16) {
         bridgeConfig = {
           host: '127.0.0.1',
           port: Number(json.port) || 28196,
           token: json.token.trim()
         };
         await chrome.storage.local.set({ [STORAGE_CONFIG_KEY]: bridgeConfig });
+        loadedFromBootstrap = true;
       }
     }
   } catch {
-    // .local-runtime.json not present yet; user can paste token in side panel or run `chrome-live setup`.
+    // .local-runtime.json already shredded or not created yet; fall back to chrome.storage.local
+  }
+
+  if (!loadedFromBootstrap && stored[STORAGE_CONFIG_KEY] && stored[STORAGE_CONFIG_KEY].token) {
+    bridgeConfig = {
+      host: '127.0.0.1',
+      port: Number(stored[STORAGE_CONFIG_KEY].port) || 28196,
+      token: String(stored[STORAGE_CONFIG_KEY].token)
+    };
   }
 }
 
@@ -942,7 +990,12 @@ async function popoutRelayTab(entry, focus = true) {
   return { tabId: entry.tabId, inRelayPopout: true, relayWindowId: entry.relayPopoutWinId };
 }
 
-async function mergeRelayTabBack(entry) {
+async function mergeRelayTabBack(entry, { resumedByUserInBrowser = false } = {}) {
+  if (!entry.relayPopoutWinId) {
+    throw new Error(
+      'Tab is not in a standalone relay popout window; paused tabs must be resumed by the user inside Chrome.'
+    );
+  }
   const prevOriginWinId = entry.originWindowId;
   const prevOriginIndex = entry.originIndex;
   const prevOriginGroupId = typeof entry.originGroupId === 'number' ? entry.originGroupId : -1;
@@ -965,6 +1018,9 @@ async function mergeRelayTabBack(entry) {
     if (otherWin) targetWindowId = otherWin.id;
   }
 
+  const groupColor = resumedByUserInBrowser ? 'cyan' : 'yellow';
+  const groupLabel = resumedByUserInBrowser ? tr().groupTitle : tr().groupPaused;
+
   if (targetWindowId !== null) {
     await chrome.tabs
       .move(entry.tabId, {
@@ -976,9 +1032,9 @@ async function mergeRelayTabBack(entry) {
       await placeInBackgroundTabGroup(
         entry.tabId,
         targetWindowId,
-        true,
-        'cyan',
-        tr().groupTitle
+        resumedByUserInBrowser,
+        groupColor,
+        groupLabel
       );
     } else if (prevOriginGroupId >= 0) {
       await chrome.tabs
@@ -987,20 +1043,41 @@ async function mergeRelayTabBack(entry) {
     }
   }
 
-  entry.paused = false;
-  entry.uiMode = 'working';
-  entry.activity = currentLang === 'zh' ? '已交还归队 · AI 恢复接管' : 'Merged back · AI resumed';
+  // Only browser-originated user gestures can lift `paused`; external RPCs merge the window while keeping it paused
+  if (resumedByUserInBrowser) {
+    entry.paused = false;
+    entry.uiMode = 'working';
+    entry.activity = currentLang === 'zh' ? '已交还归队 · AI 恢复接管' : 'Merged back · AI resumed';
+  } else {
+    entry.paused = true;
+    entry.uiMode = 'paused';
+    entry.activity =
+      currentLang === 'zh'
+        ? '已合回原窗口（仍暂停 · 点继续恢复 AI）'
+        : 'Merged to main window (Paused · Click Resume in Chrome)';
+  }
 
   await syncHud(entry.tabId, {
     visible: true,
-    mode: 'working',
+    mode: entry.uiMode,
     activity: entry.activity
   });
   await syncLiveTabGroups();
-  await captureQuickFrame(entry.tabId, entry);
-  pushLocalAudit('relay_merge', { tabId: entry.tabId, url: entry.url });
+  if (resumedByUserInBrowser) {
+    await captureQuickFrame(entry.tabId, entry);
+  }
+  pushLocalAudit('relay_merge', {
+    tabId: entry.tabId,
+    url: entry.url,
+    resumed: resumedByUserInBrowser
+  });
   notifyPanelAndDaemon();
-  return { tabId: entry.tabId, inRelayPopout: false, mergedToWindowId: targetWindowId };
+  return {
+    tabId: entry.tabId,
+    inRelayPopout: false,
+    paused: entry.paused,
+    mergedToWindowId: targetWindowId
+  };
 }
 
 function resolveTargetEntry(requestedTabId) {
@@ -1432,7 +1509,12 @@ async function executeBridgeRpc(method, params) {
         stepParams.tabId = currentTabId;
       }
 
-      if (action !== 'open' && currentTabId !== undefined && managedTabs.has(currentTabId)) {
+      if (
+        action !== 'open' &&
+        currentTabId !== undefined &&
+        managedTabs.has(currentTabId) &&
+        !managedTabs.get(currentTabId).paused
+      ) {
         const curEntry = managedTabs.get(currentTabId);
         curEntry.activity = `${tr().batchStep(i + 1, steps.length)} · ${action}`;
         await syncHud(currentTabId, {
@@ -1902,9 +1984,12 @@ async function executeBridgeRpc(method, params) {
               if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
               const rc = item.getBoundingClientRect();
               if (rc.width < 4 || rc.height < 4) continue;
+              const iTag = item.tagName.toLowerCase();
+              const iBtn = iTag === 'input' && /^(?:button|submit|reset)$/i.test(String(item.type || ''));
+              const iUserVal = (iTag === 'input' && !iBtn) || iTag === 'textarea' || iTag === 'select' || item.isContentEditable;
               const txt = (
-                item.textContent ||
-                item.value ||
+                (iUserVal ? '' : item.textContent) ||
+                (iBtn ? item.value : '') ||
                 item.getAttribute('aria-label') ||
                 item.getAttribute('title') ||
                 ''
@@ -1924,11 +2009,38 @@ async function executeBridgeRpc(method, params) {
           }
         }
         if (!el) return { ok: false, error: `Element not found for target: ${tgt}` };
-        if (el.disabled || el.getAttribute('aria-disabled') === 'true') {
-          const dLabel = (el.getAttribute('aria-label') || el.textContent || el.value || String(tgt))
+        const elTagLower = el.tagName.toLowerCase();
+        const elInputType = elTagLower === 'input' ? String(el.type || 'text').toLowerCase() : '';
+        const elAutoAttr = String(el.getAttribute('autocomplete') || '').toLowerCase();
+        const elIsSensitive =
+          elInputType === 'password' ||
+          /(?:password|one-time-code|cc-number|cc-csc|cc-exp)/i.test(elAutoAttr);
+        const elIsButtonInput =
+          elTagLower === 'input' && /^(?:button|submit|reset)$/i.test(elInputType);
+        const elIsUserValueField =
+          (elTagLower === 'input' && !elIsButtonInput) ||
+          elTagLower === 'textarea' ||
+          elTagLower === 'select' ||
+          el.isContentEditable;
+        // Never leak user-entered password/OTP/input values in disabled errors or click receipts
+        const safeElemLabel = (maxLen) =>
+          (
+            el.getAttribute('aria-label') ||
+            el.getAttribute('placeholder') ||
+            (elIsUserValueField ? '' : el.textContent) ||
+            (elIsButtonInput ? el.value : '') ||
+            el.getAttribute('title') ||
+            (elIsSensitive ? '(password)' : '') ||
+            el.getAttribute('name') ||
+            el.id ||
+            elTagLower
+          )
             .replace(/\s+/g, ' ')
             .trim()
-            .slice(0, 60);
+            .slice(0, maxLen);
+
+        if (el.disabled || el.getAttribute('aria-disabled') === 'true') {
+          const dLabel = safeElemLabel(60);
           return { ok: false, error: `Element is disabled: ${dLabel}` };
         }
         el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
@@ -1967,17 +2079,8 @@ async function executeBridgeRpc(method, params) {
           return '';
         }
 
-        const learnedSelector = deriveStableSelector(el);
-        const label = (
-          el.getAttribute('aria-label') ||
-          el.textContent ||
-          el.value ||
-          el.getAttribute('title') ||
-          ''
-        )
-          .replace(/\s+/g, ' ')
-          .trim()
-          .slice(0, 42);
+        const learnedSelector = elIsSensitive ? '' : deriveStableSelector(el);
+        const label = safeElemLabel(42);
 
         const isVisibleForeground = !document.hidden && rect.width >= 4 && rect.height >= 4;
         if (isVisibleForeground) {
@@ -2307,25 +2410,32 @@ async function executeBridgeRpc(method, params) {
           return '';
         }
 
-        const learnedSelector = deriveInputSelector(el);
+        const tInputType = String(el.getAttribute?.('type') || el.type || '').toLowerCase();
+        const tAutoAttr = String(el.getAttribute?.('autocomplete') || '').toLowerCase();
+        const isSensitiveTypeTarget =
+          tInputType === 'password' ||
+          /(?:password|one-time-code|cc-number|cc-csc|cc-exp)/i.test(tAutoAttr);
+        const learnedSelector = isSensitiveTypeTarget ? '' : deriveInputSelector(el);
         const idAndCls = `${el.id || ''} ${el.name || ''} ${el.className || ''}`;
         const isSearchField =
           /(?:search|query|^s$|^q$|^kw$)/i.test(el.name || '') ||
           /search/i.test(idAndCls) ||
-          String(el.getAttribute('type') || '').toLowerCase() === 'search';
-        const learnedName = isSearchField
-          ? '站内搜索框'
-          : (
-              el.getAttribute('aria-label') ||
-              el.labels?.[0]?.textContent ||
-              el.getAttribute('name') ||
-              el.id ||
-              el.getAttribute('placeholder') ||
-              '输入框'
-            )
-              .replace(/\s+/g, ' ')
-              .trim()
-              .slice(0, 32);
+          tInputType === 'search';
+        const learnedName = isSensitiveTypeTarget
+          ? ''
+          : isSearchField
+            ? '站内搜索框'
+            : (
+                el.getAttribute('aria-label') ||
+                el.labels?.[0]?.textContent ||
+                el.getAttribute('name') ||
+                el.id ||
+                el.getAttribute('placeholder') ||
+                '输入框'
+              )
+                .replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, 32);
         const inCodeMirror = Boolean(el.closest?.('.CodeMirror'));
         return { ok: true, x: cx, y: cy, learnedSelector, learnedName, inCodeMirror };
       },
@@ -3046,7 +3156,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           notifyPanelAndDaemon();
         } else if (msg.event === 'resume') {
           if (entry.relayPopoutWinId) {
-            await mergeRelayTabBack(entry);
+            await mergeRelayTabBack(entry, { resumedByUserInBrowser: true });
           } else {
             entry.paused = false;
             entry.uiMode = 'working';
@@ -3066,10 +3176,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       let playbook = { enabled: false, siteCount: 0 };
       if (bridgeConfig.token && ws && ws.readyState === WebSocket.OPEN && wsAuthed) {
         try {
-          const r = await fetch(`http://${bridgeConfig.host}:${bridgeConfig.port}/api/health`, {
-            headers: { 'X-Chrome-Live-Token': bridgeConfig.token },
-            cache: 'no-store'
-          });
+          const r = await signedDaemonFetch('/api/health', 'GET');
           if (r.ok) {
             const j = await r.json();
             if (j && j.playbook) playbook = j.playbook;
@@ -3124,10 +3231,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
       try {
-        const r = await fetch(`http://${bridgeConfig.host}:${bridgeConfig.port}/api/playbook`, {
-          headers: { 'X-Chrome-Live-Token': bridgeConfig.token },
-          cache: 'no-store'
-        });
+        const r = await signedDaemonFetch('/api/playbook', 'GET');
         const j = await r.json();
         sendResponse(j);
       } catch {
@@ -3141,14 +3245,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
       try {
-        const r = await fetch(`http://${bridgeConfig.host}:${bridgeConfig.port}/api/playbook`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Chrome-Live-Token': bridgeConfig.token
-          },
-          body: JSON.stringify(msg.body || {})
-        });
+        const r = await signedDaemonFetch('/api/playbook', 'POST', msg.body || {});
         const json = await r.json();
         sendResponse(json);
       } catch (err) {
@@ -3211,7 +3308,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (typeof msg.tabId === 'number' && managedTabs.has(msg.tabId)) {
         const entry = managedTabs.get(msg.tabId);
         if (entry.relayPopoutWinId) {
-          await mergeRelayTabBack(entry);
+          await mergeRelayTabBack(entry, { resumedByUserInBrowser: true });
         } else {
           await popoutRelayTab(entry, true);
         }

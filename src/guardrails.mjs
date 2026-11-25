@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { getStateDir } from './token-store.mjs';
 
 const BLOCKED_PROTOCOLS = new Set([
   'chrome:',
@@ -171,16 +172,31 @@ function resolveCanonicalPath(targetPath) {
 }
 
 function isPathInsideDir(candidatePath, dirPath) {
-  const rel = path.relative(dirPath, candidatePath);
+  const normCandidate = process.platform === 'win32' ? candidatePath.toLowerCase() : candidatePath;
+  const normDir = process.platform === 'win32' ? dirPath.toLowerCase() : dirPath;
+  const rel = path.relative(normDir, normCandidate);
   return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
+export function getDefaultUploadStagingDir() {
+  return path.join(getStateDir(), 'uploads');
+}
+
 function parseAllowedUploadDirs(explicitDirs) {
-  const rawList = Array.isArray(explicitDirs)
-    ? explicitDirs
-    : typeof process.env.CHROME_LIVE_UPLOAD_DIR === 'string' && process.env.CHROME_LIVE_UPLOAD_DIR.trim()
-      ? process.env.CHROME_LIVE_UPLOAD_DIR.split(path.delimiter)
-      : [];
+  let rawList;
+  if (Array.isArray(explicitDirs)) {
+    rawList = explicitDirs;
+  } else if (typeof process.env.CHROME_LIVE_UPLOAD_DIR === 'string' && process.env.CHROME_LIVE_UPLOAD_DIR.trim()) {
+    rawList = process.env.CHROME_LIVE_UPLOAD_DIR.split(path.delimiter);
+  } else {
+    // Secure-by-default: restrict uploads to the dedicated staging directory (~/.chrome-live-antigravity/uploads)
+    // so ordinary local documents, invoices, or spreadsheets cannot be selected accidentally.
+    const defaultDir = getDefaultUploadStagingDir();
+    try {
+      fs.mkdirSync(defaultDir, { recursive: true, mode: 0o700 });
+    } catch {}
+    rawList = [defaultDir];
+  }
   const dirs = [];
   for (const raw of rawList) {
     const trimmed = String(raw || '').trim();
@@ -197,30 +213,38 @@ export function evaluateUploadFileSafety(rawFilePath, options = {}) {
   }
   const resolvedPath = path.resolve(rawFilePath.trim());
   const realPath = resolveCanonicalPath(resolvedPath);
-  const candidates = realPath === resolvedPath ? [resolvedPath] : [resolvedPath, realPath];
 
-  for (const candidate of candidates) {
+  const allowedDirs = parseAllowedUploadDirs(options.allowedDirs);
+  // Check sensitive filename/directory patterns BEFORE and AFTER canonicalization,
+  // while exempting the dedicated uploads staging subdir inside ~/.chrome-live-antigravity/uploads
+  const defaultUploadsDir = resolveCanonicalPath(path.resolve(getDefaultUploadStagingDir()));
+  for (const candidate of realPath === resolvedPath ? [resolvedPath] : [resolvedPath, realPath]) {
     const normalized = candidate.replace(/\\/g, '/');
     const baseName = path.basename(candidate);
-    if (SENSITIVE_FILE_DIR_RX.test(normalized) || SENSITIVE_FILE_NAME_RX.test(baseName)) {
+    if (SENSITIVE_FILE_NAME_RX.test(baseName)) {
       return {
         allowed: false,
         code: 'SENSITIVE_FILE',
         reason: `Uploading sensitive credential or key file "${baseName}" is blocked by local guardrails`
       };
     }
+    const inDefaultStaging = isPathInsideDir(candidate, defaultUploadsDir);
+    if (!inDefaultStaging && SENSITIVE_FILE_DIR_RX.test(normalized)) {
+      return {
+        allowed: false,
+        code: 'SENSITIVE_FILE',
+        reason: `Uploading files from protected directory is blocked by local guardrails`
+      };
+    }
   }
 
-  const allowedDirs = parseAllowedUploadDirs(options.allowedDirs);
   if (allowedDirs.length > 0) {
-    const insideAllowed = allowedDirs.some(
-      (dir) => isPathInsideDir(realPath, dir) && isPathInsideDir(resolvedPath, dir)
-    );
+    const insideAllowed = allowedDirs.some((dir) => isPathInsideDir(realPath, dir));
     if (!insideAllowed) {
       return {
         allowed: false,
         code: 'UPLOAD_DIR_RESTRICTED',
-        reason: `Upload path is outside allowed CHROME_LIVE_UPLOAD_DIR boundary`
+        reason: `Upload path must reside inside the staging directory (${getDefaultUploadStagingDir()}) or CHROME_LIVE_UPLOAD_DIR`
       };
     }
   }

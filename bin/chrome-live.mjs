@@ -5,6 +5,8 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { getDefaultUploadStagingDir } from '../src/guardrails.mjs';
+import { buildSignedHttpHeaders, verifySignedHttpResponse } from '../src/hmac-auth.mjs';
 import { startMcpStdioServer } from '../src/mcp-server.mjs';
 import {
   DEFAULT_HOST,
@@ -24,9 +26,7 @@ function requestDaemon(method, routePath, bodyObj = null, timeoutMs = 30000) {
   const token = ensureAuthToken();
   return new Promise((resolve, reject) => {
     const payload = bodyObj ? Buffer.from(JSON.stringify(bodyObj), 'utf8') : null;
-    const headers = {
-      'X-Chrome-Live-Token': token
-    };
+    const { ts, nonce, headers } = buildSignedHttpHeaders(token, method, routePath, payload);
     if (payload) {
       headers['Content-Type'] = 'application/json; charset=utf-8';
       headers['Content-Length'] = String(payload.length);
@@ -45,13 +45,22 @@ function requestDaemon(method, routePath, bodyObj = null, timeoutMs = 30000) {
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
         res.on('end', () => {
+          const statusCode = res.statusCode || 500;
+          if (!verifySignedHttpResponse(token, statusCode, res.headers, ts, nonce)) {
+            reject(
+              new Error(
+                `Unverified local service on ${DEFAULT_HOST}:${DEFAULT_PORT} (missing or invalid daemon HMAC signature)`
+              )
+            );
+            return;
+          }
           const rawBuf = Buffer.concat(chunks);
           const ct = res.headers['content-type'] || '';
           if (ct.includes('application/json')) {
             try {
               const parsed = JSON.parse(rawBuf.toString('utf8'));
-              if ((res.statusCode || 500) >= 400 || parsed.ok === false) {
-                reject(new Error(parsed.error || parsed.message || `HTTP ${res.statusCode}`));
+              if (statusCode >= 400 || parsed.ok === false) {
+                reject(new Error(parsed.error || parsed.message || `HTTP ${statusCode}`));
               } else {
                 resolve(parsed);
               }
@@ -59,7 +68,7 @@ function requestDaemon(method, routePath, bodyObj = null, timeoutMs = 30000) {
               reject(new Error(`Malformed JSON from daemon: ${e.message}`));
             }
           } else {
-            resolve({ statusCode: res.statusCode || 200, buffer: rawBuf, contentType: ct });
+            resolve({ statusCode, buffer: rawBuf, contentType: ct });
           }
         });
       }
@@ -136,6 +145,7 @@ function parseFlags(args) {
 }
 
 function writeExtensionLocalRuntimeConfig(token) {
+  fs.mkdirSync(getDefaultUploadStagingDir(), { recursive: true, mode: 0o700 });
   const runtimeFile = path.join(REPO_ROOT, 'extension', '.local-runtime.json');
   const data = {
     host: DEFAULT_HOST,

@@ -11,10 +11,17 @@
     "chrome-live": "./bin/chrome-live.mjs"
   },
   "files": [
-    "bin/",
-    "src/",
-    "extension/",
-    "plugin-template/",
+    "bin/chrome-live.mjs",
+    "src/*.mjs",
+    "extension/manifest.json",
+    "extension/service-worker.js",
+    "extension/hud.js",
+    "extension/icons/*.png",
+    "extension/panel/index.html",
+    "extension/panel/panel.css",
+    "extension/panel/panel.js",
+    "plugin-template/**",
+    "AI_INSTALL.md",
     "README.md",
     "README.zh-CN.md",
     "LICENSE"
