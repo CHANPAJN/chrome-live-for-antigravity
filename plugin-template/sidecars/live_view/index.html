@@ -300,8 +300,11 @@
               return;
             }
 
-            const remoteTs = s.latestFrameMeta?.capturedAt || 0;
-            if (remoteTs && (remoteTs !== lastCapturedAt || forceFrame)) {
+            const perTabMap = s.frameTimestampsByTab && typeof s.frameTimestampsByTab === 'object' ? s.frameTimestampsByTab : null;
+            const remoteTs =
+              (activeTabId !== null && perTabMap && Number(perTabMap[activeTabId])) ||
+              (s.latestFrameMeta?.tabId === activeTabId ? s.latestFrameMeta?.capturedAt || 0 : 0);
+            if ((remoteTs && remoteTs !== lastCapturedAt) || forceFrame) {
               const frameResp = await sidecarFetch(
                 `/api/live_state?includeFrame=1&tabId=${encodeURIComponent(activeTabId)}`
               );
@@ -309,7 +312,7 @@
               const dataUrl =
                 frameJson?.frameTabId === activeTabId ? frameJson?.frameDataUrl || '' : '';
               if (dataUrl) {
-                lastCapturedAt = remoteTs;
+                lastCapturedAt = Number(frameJson?.frameCapturedAt) || remoteTs || Date.now();
                 liveImg.src = dataUrl;
                 liveImg.style.display = 'block';
                 emptyMsg.style.display = 'none';

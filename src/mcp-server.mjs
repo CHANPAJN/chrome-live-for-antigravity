@@ -2,9 +2,9 @@ import crypto from 'node:crypto';
 import { buildInlineMonitorHtml, INLINE_MONITOR_URI } from './inline-monitor-ui.mjs';
 import { timingSafeEqualToken } from './token-store.mjs';
 
-// Ephemeral 256-bit capability token delivered ONLY inside `CallToolResult.structuredContent.uiSecret`
+// Ephemeral 256-bit capability token delivered ONLY inside `CallToolResult._meta.uiSecret`
 // (which MCP hosts route exclusively to the sandboxed `ui://` iframe via `ui/notifications/tool-result`,
-// never exposing it in `content` or in `resources/read` HTML).
+// never exposing it in `content`, `structuredContent`, or `resources/read` HTML).
 const UI_CAPABILITY_SECRET = crypto.randomBytes(32).toString('hex');
 
 const SERVER_INFO = {
@@ -481,15 +481,12 @@ export function startMcpStdioServer({ callDaemon }) {
           lockedFramingMode = 'line';
           framingMode = 'line';
         } else {
-          const probeAscii = rawBuffer.subarray(0, Math.min(rawBuffer.length, 32)).toString('ascii');
+          const probeAscii = rawBuffer.subarray(0, Math.min(rawBuffer.length, 64)).toString('ascii');
           if (/^(?:content-length|content-type)\s*:/i.test(probeAscii)) {
             lockedFramingMode = 'header';
             framingMode = 'header';
-          } else if (
-            rawBuffer.length < 16 &&
-            ('content-length:'.startsWith(probeAscii.toLowerCase()) ||
-              'content-type:'.startsWith(probeAscii.toLowerCase()))
-          ) {
+          } else if (rawBuffer.indexOf(0x0a) === -1 && rawBuffer.length < 64) {
+            // Wait until first header line arrives (handles split whitespace before colon like "Content-Length : 45")
             return;
           } else {
             // Malformed leading garbage in unlocked stream: skip up to next LF without locking into 'header' deadlock
@@ -514,7 +511,7 @@ export function startMcpStdioServer({ callDaemon }) {
           return;
         }
         const headerStr = rawBuffer.subarray(0, sepIdx).toString('utf8');
-        const m = headerStr.match(/(?:^|\r\n)Content-Length:\s*(\d+)/i);
+        const m = headerStr.match(/(?:^|\r\n)Content-Length\s*:\s*(\d+)/i);
         if (!m) {
           rawBuffer = rawBuffer.subarray(sepIdx + 4);
           continue;
@@ -527,11 +524,16 @@ export function startMcpStdioServer({ callDaemon }) {
         }
         const totalNeeded = sepIdx + 4 + contentLen;
         if (rawBuffer.length < totalNeeded) return;
-        const bodyStr = rawBuffer.subarray(sepIdx + 4, totalNeeded).toString('utf8');
+        const bodyStr = rawBuffer.subarray(sepIdx + 4, totalNeeded).toString('utf8').replace(/^\uFEFF/, '');
         rawBuffer = rawBuffer.subarray(totalNeeded);
+        let parsedMsg;
         try {
-          handleRpc(JSON.parse(bodyStr));
-        } catch {}
+          parsedMsg = JSON.parse(bodyStr);
+        } catch {
+          writeMessage({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
+          continue;
+        }
+        handleRpc(parsedMsg);
       } else {
         const nlIdx = rawBuffer.indexOf(0x0a);
         if (nlIdx === -1) {
@@ -543,9 +545,14 @@ export function startMcpStdioServer({ callDaemon }) {
         const line = rawBuffer.subarray(0, nlIdx).toString('utf8').replace(/^\uFEFF/, '').trim();
         rawBuffer = rawBuffer.subarray(nlIdx + 1);
         if (!line) continue;
+        let parsedLine;
         try {
-          handleRpc(JSON.parse(line));
-        } catch {}
+          parsedLine = JSON.parse(line);
+        } catch {
+          writeMessage({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
+          continue;
+        }
+        handleRpc(parsedLine);
       }
     }
   });
@@ -570,13 +577,19 @@ async function buildMonitorStructuredState(callDaemon, lastFrameTs = 0, targetTa
   }
 
   const tabQuery = hasTab ? `&tabId=${encodeURIComponent(String(effectiveTabId))}` : '';
-  const serverFrameTs = baseState?.latestFrameMeta?.capturedAt || 0;
+  const perTabTsMap =
+    baseState?.frameTimestampsByTab && typeof baseState.frameTimestampsByTab === 'object'
+      ? baseState.frameTimestampsByTab
+      : {};
+  const targetServerTs = hasTab
+    ? Number(perTabTsMap[effectiveTabId]) || 0
+    : baseState?.latestFrameMeta?.capturedAt || 0;
   const cachedIds = Array.isArray(baseState?.cachedFrameTabIds) ? baseState.cachedFrameTabIds : [];
   let fullState = baseState;
   if (hasExplicitTab && !resolvedPrimary) {
     fullState = { ...baseState, requestedTabId: targetTabId, requestedTabMissing: true };
   } else if (hasTab && !resolvedPrimary?.paused && cachedIds.includes(effectiveTabId)) {
-    if (lastFrameTs === 0 || serverFrameTs !== lastFrameTs || baseState?.latestFrameMeta?.tabId !== effectiveTabId) {
+    if (lastFrameTs === 0 || targetServerTs !== lastFrameTs) {
       fullState = await callDaemon('GET', `/api/state?includeFrame=1${tabQuery}`);
     }
   } else if (hasTab && !resolvedPrimary?.paused && lastFrameTs === 0) {
@@ -585,7 +598,7 @@ async function buildMonitorStructuredState(callDaemon, lastFrameTs = 0, targetTa
       params: { tabId: effectiveTabId }
     }).catch(() => {});
     fullState = await callDaemon('GET', `/api/state?includeFrame=1${tabQuery}`);
-  } else if (!hasExplicitTab && !hasTab && serverFrameTs && serverFrameTs !== lastFrameTs) {
+  } else if (!hasExplicitTab && !hasTab && targetServerTs && targetServerTs !== lastFrameTs) {
     fullState = await callDaemon('GET', '/api/state?includeFrame=1');
   }
   if (hasExplicitTab && fullState && typeof fullState === 'object') {

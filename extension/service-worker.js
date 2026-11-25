@@ -89,8 +89,25 @@ const BUILTIN_PROTECTED_DOMAINS = [
 const CHECKOUT_SEGMENT_RX =
   /(?:^|\/)(?:checkout|pay|payment|payments|cashier|billing|wallet\/transfer)(?:\/|\?|$|#|;|\.[a-z0-9]{1,8}(?:\/|\?|$|#|;))/i;
 
+const CHECKOUT_SUBDOMAIN_RX = /(?:^|\.)(?:checkout|pay|payment|payments|cashier|billing)\./i;
+
+function isHighEntropyPathSegment(segment) {
+  if (!segment || segment.length < 32) return false;
+  if (/^eyJ[A-Za-z0-9._~+/=-]{10,}$/.test(segment)) return true;
+  if (/^[0-9a-f]{32,}$/i.test(segment)) return true;
+  if (segment.length >= 40 && /^[A-Za-z0-9._~+-]+$/.test(segment)) {
+    const hasDigit = /\d/.test(segment);
+    const hasUpper = /[A-Z]/.test(segment);
+    const hasLower = /[a-z]/.test(segment);
+    if ((hasDigit && (hasUpper || hasLower)) || (hasUpper && hasLower && !segment.includes('-'))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function canonicalizeRouteForGuardrail(rawSegment) {
-  if (!rawSegment) return { ok: true, path: '/' };
+  if (!rawSegment) return { ok: true, rawPath: '/', path: '/' };
   let decoded = String(rawSegment);
   for (let i = 0; i < 3; i++) {
     if (!decoded.includes('%')) break;
@@ -99,37 +116,71 @@ function canonicalizeRouteForGuardrail(rawSegment) {
       if (next === decoded) break;
       decoded = next;
     } catch {
-      return { ok: false, path: '' };
+      return { ok: false, rawPath: '', path: '' };
     }
   }
   const normalized = decoded.replace(/\\/g, '/');
   const qIdx = normalized.indexOf('?');
   const pathPart = qIdx === -1 ? normalized : normalized.slice(0, qIdx);
   const queryPart = qIdx === -1 ? '' : normalized.slice(qIdx);
+  const rawPieces = [];
   const stack = [];
   for (const seg of pathPart.split('/')) {
     const cleanSeg = seg.split(';')[0];
     if (!cleanSeg || cleanSeg === '.') continue;
+    rawPieces.push(cleanSeg);
     if (cleanSeg === '..') {
       stack.pop();
       continue;
     }
     stack.push(cleanSeg);
   }
-  return { ok: true, path: `/${stack.join('/')}${queryPart}` };
+  return {
+    ok: true,
+    rawPath: `/${rawPieces.join('/')}${queryPart}`,
+    path: `/${stack.join('/')}${queryPart}`
+  };
 }
+
+const SAFE_ATTR_SELECTOR_ALLOWLIST_RX =
+  /^(?:id|class|name|type|role|placeholder|aria-(?:label|expanded|selected|checked|controls|current|disabled)|title|for|disabled|checked|selected|readonly|required|multiple|contenteditable|tabindex|data-(?:testid|test|cy|qa|clive-idx|index|id|action|role|tab|state)|target|alt)$/i;
 
 function assertSafeModelSelector(rawSelector) {
   if (typeof rawSelector !== 'string') return;
   const s = rawSelector.trim();
   if (!s) return;
-  if (
-    /\[\s*(?:value|content|data-token|data-secret|data-csrf|csrf)\b/i.test(s) ||
-    /\[\s*[^\]=*^$~|]+\s*[*^$]=/.test(s)
-  ) {
-    throw new Error(
-      '[GUARDRAIL] CSS attribute-value or substring probing selectors ([value...], [content...], [^=], [$=], [*=]) are blocked'
-    );
+  // Block CSS backslash escapes and unclosed comments used to evade attribute inspection
+  if (s.includes('\\')) {
+    throw new Error('[GUARDRAIL] CSS escape sequences are blocked in automation selectors');
+  }
+  if (s.includes('/*') && !/\*\/[\s\S]*$/.test(s)) {
+    throw new Error('[GUARDRAIL] Unclosed CSS comment in selector');
+  }
+  const stripped = s.replace(/\/\*[\s\S]*?\*\//g, ' ');
+  if (stripped.includes('/*')) {
+    throw new Error('[GUARDRAIL] Malformed CSS comment in selector');
+  }
+  // Block :has() relational pseudo-class (prevents boolean oracle probing of hidden elements/attributes)
+  if (/:has\s*\(/i.test(stripped)) {
+    throw new Error('[GUARDRAIL] Relational :has() selectors are blocked to prevent hidden-DOM probing');
+  }
+  // Strict allowlist on all [...] attribute selectors (blocks [|value^="a"], [content=...], [data-csrf=...], substring ops)
+  const attrBlocks = stripped.match(/\[[^\]]*\]/g);
+  if (attrBlocks) {
+    for (const block of attrBlocks) {
+      const inner = block.slice(1, -1).trim();
+      if (!inner) {
+        throw new Error('[GUARDRAIL] Empty CSS attribute selector is blocked');
+      }
+      if (/[*^$~|]=/.test(inner)) {
+        throw new Error('[GUARDRAIL] CSS attribute substring/prefix/suffix operators (*=, ^=, $=, ~=, |=) are blocked');
+      }
+      const eqIdx = inner.indexOf('=');
+      const rawAttr = (eqIdx === -1 ? inner : inner.slice(0, eqIdx)).trim().replace(/^\*?\|/, '').trim();
+      if (!SAFE_ATTR_SELECTOR_ALLOWLIST_RX.test(rawAttr)) {
+        throw new Error(`[GUARDRAIL] CSS attribute selector on "${rawAttr}" is restricted for credential safety`);
+      }
+    }
   }
 }
 
@@ -261,6 +312,20 @@ function redactAuditUrl(rawUrl) {
       parsed.password = '';
       changed = true;
     }
+    if (parsed.pathname && parsed.pathname.length >= 32) {
+      const parts = parsed.pathname.split('/');
+      let pathChanged = false;
+      for (let i = 0; i < parts.length; i++) {
+        if (isHighEntropyPathSegment(parts[i])) {
+          parts[i] = 'REDACTED';
+          pathChanged = true;
+        }
+      }
+      if (pathChanged) {
+        parsed.pathname = parts.join('/');
+        changed = true;
+      }
+    }
     if (parsed.search) {
       for (const [k] of parsed.searchParams.entries()) {
         if (LOCAL_AUDIT_SENSITIVE_PARAM_RX.test(k)) {
@@ -320,16 +385,24 @@ function checkTabUrlAllowed(rawUrl) {
       return { allowed: false, reason: `Protected financial/security domain (${clean})` };
     }
   }
+  if (CHECKOUT_SUBDOMAIN_RX.test(host)) {
+    return { allowed: false, reason: `Protected payment/cashier subdomain (${host})` };
+  }
   const canonPath = canonicalizeRouteForGuardrail(parsed.pathname);
   if (!canonPath.ok) {
     return { allowed: false, reason: 'Malformed percent-encoding in URL pathname' };
   }
   const rawHash = parsed.hash ? parsed.hash.replace(/^#+/, '') : '';
-  const canonHash = rawHash ? canonicalizeRouteForGuardrail(rawHash) : { ok: true, path: '' };
+  const canonHash = rawHash ? canonicalizeRouteForGuardrail(rawHash) : { ok: true, rawPath: '', path: '' };
   if (!canonHash.ok) {
     return { allowed: false, reason: 'Malformed percent-encoding in URL fragment' };
   }
-  if (CHECKOUT_SEGMENT_RX.test(canonPath.path) || (canonHash.path && CHECKOUT_SEGMENT_RX.test(canonHash.path))) {
+  if (
+    CHECKOUT_SEGMENT_RX.test(canonPath.rawPath) ||
+    CHECKOUT_SEGMENT_RX.test(canonPath.path) ||
+    (canonHash.rawPath && CHECKOUT_SEGMENT_RX.test(canonHash.rawPath)) ||
+    (canonHash.path && CHECKOUT_SEGMENT_RX.test(canonHash.path))
+  ) {
     return { allowed: false, reason: `Protected checkout/payment route (${parsed.pathname}${parsed.hash})` };
   }
   return { allowed: true, reason: '' };
@@ -1445,15 +1518,22 @@ async function executeBridgeRpc(method, params) {
           const px = Math.round(normX * vw);
           const py = Math.round(normY * vh);
           const ctrl = window.__chromeLiveHudController__;
-          if (ctrl?.shieldEl) ctrl.shieldEl.style.pointerEvents = 'none';
-          if (ctrl && typeof ctrl.moveCursor === 'function') {
+          if (!ctrl || !ctrl._state?.visible || ctrl._state?.mode !== 'working') {
+            return { aborted: true };
+          }
+          if (ctrl.shieldEl) ctrl.shieldEl.style.pointerEvents = 'none';
+          if (typeof ctrl.moveCursor === 'function') {
             ctrl.moveCursor({ x: px, y: py, kind: 'click', press: true });
           }
-          return { px, py, hidden: document.hidden };
+          return { aborted: false, px, py, hidden: document.hidden };
         },
         args: [rx, ry]
       });
-      const vp = vpRes?.[0]?.result || { px: 640, py: 400, hidden: false };
+      const vp = vpRes?.[0]?.result || { aborted: false, px: 640, py: 400, hidden: false };
+      if (vp.aborted) {
+        await verifyEntryStillControllable(entry);
+        throw new Error('Aborted: tab automation was paused or released by user');
+      }
       const restoreRemoteShield = async () => {
         await chrome.scripting
           .executeScript({
@@ -1580,19 +1660,37 @@ async function executeBridgeRpc(method, params) {
           const st = window.getComputedStyle(el);
           const tSec = String(st.webkitTextSecurity || st.getPropertyValue('-webkit-text-security') || '').toLowerCase();
           const autoAttr = String(el.getAttribute?.('autocomplete') || '').toLowerCase();
-          const metaStr = [
+          const labelParts = [];
+          if (el.labels) {
+            for (const lb of Array.from(el.labels)) labelParts.push(lb.textContent || '');
+          }
+          const wrapLb = el.closest?.('label');
+          if (wrapLb) labelParts.push(wrapLb.textContent || '');
+          const labelledBy = el.getAttribute?.('aria-labelledby') || '';
+          for (const lid of labelledBy.split(/\s+/).filter(Boolean)) {
+            const lNode = document.getElementById(lid);
+            if (lNode) labelParts.push(lNode.textContent || '');
+          }
+          const rawMeta = [
             el.getAttribute?.('name'),
             el.id,
             el.getAttribute?.('placeholder'),
-            el.getAttribute?.('aria-label')
+            el.getAttribute?.('aria-label'),
+            el.getAttribute?.('title'),
+            ...labelParts
           ]
             .filter(Boolean)
             .join(' ');
+          const decamelMeta = rawMeta
+            .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+            .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2');
           if (
             (el instanceof HTMLInputElement && String(el.type).toLowerCase() === 'password') ||
             (tSec && tSec !== 'none') ||
             /(?:password|one-time-code|cc-number|cc-csc|cc-exp)/i.test(autoAttr) ||
-            /\b(?:password|passwd|otp|cvv|cvc)\b|密码|支付密码|动态码|短信验证码/i.test(metaStr)
+            /(?:passw(?:or)?d|passcode|one[-_\s]?time|verif(?:y|ication)\s*code|security\s*code|auth(?:entication)?\s*code|sms[-_\s]*code|login[-_\s]*code|dynamic[-_\s]*code|card[-_\s]*(?:number|num|no)|(?:^|[^a-zA-Z])(?:otp|totp|2fa|mfa|cvv|cvc|csc|pwd|pin)(?:$|[^a-zA-Z])|密码|口令|验证码|动态码|安全码|校验码|密钥)/i.test(
+              decamelMeta
+            )
           ) {
             return {
               ok: false,
@@ -2042,7 +2140,33 @@ async function executeBridgeRpc(method, params) {
               },
               args: [scrollSteps]
             });
-            return injected?.[0]?.result || { url: targetUrl, text: '', images: [] };
+            const extractedItem = injected?.[0]?.result || { url: targetUrl, text: '', images: [] };
+            // Re-verify post-scroll final URL & sub-frames against late SPA/JS redirects into checkout/payment routes!
+            const afterScrollTab = await chrome.tabs.get(workerTab.id).catch(() => null);
+            const lateUrlCheck = checkTabUrlAllowed(afterScrollTab?.url || extractedItem.finalUrl || '');
+            if (!lateUrlCheck.allowed) {
+              return { url: targetUrl, error: `[GUARDRAIL] ${lateUrlCheck.reason}` };
+            }
+            if (extractedItem.finalUrl) {
+              const resUrlCheck = checkTabUrlAllowed(extractedItem.finalUrl);
+              if (!resUrlCheck.allowed) {
+                return { url: targetUrl, error: `[GUARDRAIL] ${resUrlCheck.reason}` };
+              }
+            }
+            if (chrome.webNavigation?.getAllFrames) {
+              const subFrames = await chrome.webNavigation.getAllFrames({ tabId: workerTab.id }).catch(() => null);
+              if (Array.isArray(subFrames)) {
+                for (const sf of subFrames) {
+                  if (sf?.url && sf.url !== 'about:blank' && !sf.errorOccurred) {
+                    const sfCheck = checkTabUrlAllowed(sf.url);
+                    if (!sfCheck.allowed) {
+                      return { url: targetUrl, error: `[GUARDRAIL] Embedded protected frame: ${sfCheck.reason}` };
+                    }
+                  }
+                }
+              }
+            }
+            return extractedItem;
           } finally {
             if (workerTab && typeof workerTab.id === 'number') {
               await chrome.tabs.remove(workerTab.id).catch(() => {});
@@ -2861,19 +2985,37 @@ async function executeBridgeRpc(method, params) {
         const elStyle = window.getComputedStyle(el);
         const elTextSec = String(elStyle.webkitTextSecurity || elStyle.getPropertyValue('-webkit-text-security') || '').toLowerCase();
         const elAuto = String(el.getAttribute?.('autocomplete') || '').toLowerCase();
-        const elMetaHints = [
+        const elLabelParts = [];
+        if (el.labels) {
+          for (const lb of Array.from(el.labels)) elLabelParts.push(lb.textContent || '');
+        }
+        const wrapLabel = el.closest?.('label');
+        if (wrapLabel) elLabelParts.push(wrapLabel.textContent || '');
+        const ariaLabelledBy = el.getAttribute?.('aria-labelledby') || '';
+        for (const lid of ariaLabelledBy.split(/\s+/).filter(Boolean)) {
+          const lNode = document.getElementById(lid);
+          if (lNode) elLabelParts.push(lNode.textContent || '');
+        }
+        const rawMetaHints = [
           el.getAttribute?.('name'),
           el.id,
           el.getAttribute?.('placeholder'),
-          el.getAttribute?.('aria-label')
+          el.getAttribute?.('aria-label'),
+          el.getAttribute?.('title'),
+          ...elLabelParts
         ]
           .filter(Boolean)
           .join(' ');
+        const decamelMetaHints = rawMetaHints
+          .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+          .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2');
         if (
           (el instanceof HTMLInputElement && String(el.type || '').toLowerCase() === 'password') ||
           (elTextSec && elTextSec !== 'none') ||
           /(?:password|one-time-code|cc-number|cc-csc|cc-exp)/i.test(elAuto) ||
-          /\b(?:password|passwd|otp|cvv|cvc)\b|密码|支付密码|动态口令|短信验证码/i.test(elMetaHints)
+          /(?:passw(?:or)?d|passcode|one[-_\s]?time|verif(?:y|ication)\s*code|security\s*code|auth(?:entication)?\s*code|sms[-_\s]*code|login[-_\s]*code|dynamic[-_\s]*code|card[-_\s]*(?:number|num|no)|(?:^|[^a-zA-Z])(?:otp|totp|2fa|mfa|cvv|cvc|csc|pwd|pin)(?:$|[^a-zA-Z])|密码|口令|验证码|动态码|安全码|校验码|密钥)/i.test(
+            decamelMetaHints
+          )
         ) {
           return {
             ok: false,
@@ -3061,8 +3203,13 @@ async function executeBridgeRpc(method, params) {
                 .replace(/\s+/g, ' ')
                 .trim()
                 .slice(0, 32);
-        const inCodeMirror = Boolean(el.closest?.('.CodeMirror'));
-        return { ok: true, x: cx, y: cy, learnedSelector, learnedName, inCodeMirror };
+        const cmHost = el.closest?.('.CodeMirror') || null;
+        let cmTargetToken = '';
+        if (cmHost) {
+          cmTargetToken = `cm-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+          cmHost.setAttribute('data-clive-cm-target', cmTargetToken);
+        }
+        return { ok: true, x: cx, y: cy, learnedSelector, learnedName, cmTargetToken };
       },
       args: [target, String(text ?? ''), Boolean(submit)]
     });
@@ -3070,21 +3217,36 @@ async function executeBridgeRpc(method, params) {
     const out = execRes?.[0]?.result;
     if (!out || !out.ok) throw new Error(out?.error || 'Type failed');
     await verifyEntryStillControllable(entry);
-    if (out.inCodeMirror) {
-      await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
+    if (out.cmTargetToken) {
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: entry.tabId },
+          injectImmediately: true,
           world: 'MAIN',
-          func: (v) => {
-            const ctrl = window.__chromeLiveHudController__;
-            if (ctrl && (!ctrl._state?.visible || ctrl._state?.mode === 'paused')) return;
-            const cm = document.querySelector('.CodeMirror')?.CodeMirror;
+          func: (v, tok) => {
+            const host = document.querySelector(`[data-clive-cm-target="${tok}"]`);
+            if (!host) return;
+            host.removeAttribute('data-clive-cm-target');
+            const cm = host.CodeMirror;
             if (cm && typeof cm.setValue === 'function') {
               cm.setValue(v);
               cm.save?.();
             }
           },
-          args: [String(text ?? '')]
-        })
-        .catch(() => {});
+          args: [String(text ?? ''), out.cmTargetToken]
+        });
+      } catch {
+        await chrome.scripting
+          .executeScript({
+            target: { tabId: entry.tabId },
+            injectImmediately: true,
+            func: (tok) => {
+              document.querySelector(`[data-clive-cm-target="${tok}"]`)?.removeAttribute('data-clive-cm-target');
+            },
+            args: [out.cmTargetToken]
+          })
+          .catch(() => {});
+      }
     }
     await new Promise((r) => setTimeout(r, 220));
     await verifyEntryStillControllable(entry);
@@ -3357,6 +3519,9 @@ async function executeBridgeRpc(method, params) {
 
           const rect = editor.getBoundingClientRect();
           const ctrl = window.__chromeLiveHudController__;
+          if (ctrl && (!ctrl._state?.visible || ctrl._state?.mode === 'paused')) {
+            return { ok: false, error: 'Aborted: tab automation was paused or released by user' };
+          }
           if (ctrl && typeof ctrl.moveCursor === 'function') {
             ctrl.moveCursor({
               x: rect.left + Math.max(20, rect.width / 2),
@@ -3364,6 +3529,9 @@ async function executeBridgeRpc(method, params) {
               kind: 'upload',
               press: true
             });
+          }
+          if (ctrl && (!ctrl._state?.visible || ctrl._state?.mode === 'paused')) {
+            return { ok: false, error: 'Aborted: tab automation was paused or released by user' };
           }
 
           editor.focus?.();
@@ -3410,10 +3578,15 @@ async function executeBridgeRpc(method, params) {
     const amount = Number(params.amount) || 600;
     entry.activity = tr().scrolling(direction);
     await syncHud(entry.tabId, { visible: true, mode: 'working', activity: entry.activity });
+    await verifyEntryStillControllable(entry);
 
     const execRes = await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
       func: async (dir, px) => {
         const ctrl = window.__chromeLiveHudController__;
+        const isAborted = () => Boolean(ctrl && (!ctrl._state?.visible || ctrl._state?.mode === 'paused'));
+        if (isAborted()) {
+          return { ok: false, error: 'Aborted: tab automation was paused or released by user' };
+        }
         if (ctrl && typeof ctrl.moveCursor === 'function') {
           ctrl.moveCursor({
             x: Math.round((window.innerWidth || 1200) * (0.48 + Math.random() * 0.08)),
@@ -3438,19 +3611,27 @@ async function executeBridgeRpc(method, params) {
           } else {
             const slices = [0.42, 0.35, 0.23];
             for (const ratio of slices) {
+              if (isAborted()) {
+                return { ok: false, error: 'Aborted mid-scroll: tab automation was paused or released by user' };
+              }
               window.scrollBy({ top: Math.round(totalDelta * ratio), behavior: 'smooth' });
               await new Promise((r) => setTimeout(r, 65 + Math.floor(Math.random() * 25)));
             }
           }
         }
-        return { scrollY: Math.round(window.scrollY), innerHeight: window.innerHeight };
+        return { ok: true, scrollY: Math.round(window.scrollY), innerHeight: window.innerHeight };
       },
       args: [direction, amount]
     });
 
+    const sOut = execRes?.[0]?.result;
+    if (sOut && sOut.ok === false) {
+      throw new Error(sOut.error || 'Scroll aborted');
+    }
     await new Promise((r) => setTimeout(r, 180));
+    await verifyEntryStillControllable(entry);
     await captureQuickFrame(entry.tabId, entry);
-    return { tabId: entry.tabId, ...(execRes?.[0]?.result || {}) };
+    return { tabId: entry.tabId, ...(sOut || {}) };
   }
 
   if (method === 'navigate') {

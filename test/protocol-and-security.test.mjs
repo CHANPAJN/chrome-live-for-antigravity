@@ -2187,3 +2187,254 @@ test('Blind-audit round-2 runtime regressions: percent-encoded/matrix/suffix pay
     fs.rmSync(tempHome, { recursive: true, force: true });
   }
 });
+
+test('Blind-audit round-3 regressions: matrix/encoded dot-segment checkout bypasses, payment subdomains, CSS escape/comment/namespace/:has block, camelCase/label OTP typing block, WS 0-byte fragment cap & fatal UTF-8, token-rotation state wipe & title URL scrubbing', async () => {
+  const { spawn } = await import('node:child_process');
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+
+  // 1. Matrix-param dot-segments (/checkout/..;x=1), encoded slash dot-segments (/cashier%2f..), and payment subdomains
+  const r3BlockedUrls = [
+    'https://shop.example.com/checkout/..;x=1',
+    'https://shop.example.com/pay/..;order=99',
+    'https://shop.example.com/#/checkout/..;step=confirm',
+    'https://shop.example.com/cashier%2f..',
+    'https://pay.taobao.com/order/confirm',
+    'https://pay.jd.com/',
+    'https://cashier.youzan.com/pay-order',
+    'https://checkout.shopify.com/'
+  ];
+  const r3AllowedUrls = [
+    'https://display.example.com/docs',
+    'https://shop.example.com/catalog/items'
+  ];
+
+  const extGuardMatch = swSource.match(
+    /const CHECKOUT_SEGMENT_RX =[\s\S]*?function assertSafeModelSelector[\s\S]*?\n\}/
+  );
+  const extCheckTabMatch = swSource.match(/function checkTabUrlAllowed\(rawUrl\)[\s\S]*?\n\}/);
+  assert.ok(extGuardMatch && extCheckTabMatch, 'Expected updated extension guardrail block');
+  const extVm = vm.createContext({
+    URL,
+    decodeURIComponent,
+    BUILTIN_PROTECTED_DOMAINS: ['checkout.stripe.com'],
+    customBlockedDomains: [],
+    bridgeConfig: { port: 28196 }
+  });
+  vm.runInContext(`${extGuardMatch[0]}\n${extCheckTabMatch[0]}`, extVm);
+
+  for (const bad of r3BlockedUrls) {
+    assert.equal(evaluateUrlSafety(bad).allowed, false, `Daemon must block ${bad}`);
+    assert.equal(extVm.checkTabUrlAllowed(bad).allowed, false, `Extension must block ${bad}`);
+  }
+  for (const ok of r3AllowedUrls) {
+    assert.equal(evaluateUrlSafety(ok).allowed, true, `Daemon must allow ${ok}`);
+    assert.equal(extVm.checkTabUrlAllowed(ok).allowed, true, `Extension must allow ${ok}`);
+  }
+
+  // 2. CSS selector bypass vectors: [|value^="sk-"], [*|value*="s"], [/**/value^="a"], [v\alue="1"], :has(...)
+  for (const evilCss of [
+    'input[|value^="sk-"]',
+    'input[*|value*="secret"]',
+    'input[/**/value^="a"]',
+    'meta[/**/content^="eyJ"]',
+    'input[v\\alue="123456"]',
+    'div[d\\ata-csrf="abc"]',
+    ':root:has(input[type="hidden"]) button',
+    'a[href="https://example.com"]'
+  ]) {
+    assert.throws(() => extVm.assertSafeModelSelector(evilCss), /\[GUARDRAIL\]/, `Must reject selector: ${evilCss}`);
+  }
+  extVm.assertSafeModelSelector('button[type="submit"]');
+  extVm.assertSafeModelSelector('[data-testid="confirm"][aria-expanded="false"]');
+
+  // 3. CamelCase, underscore, Chinese & <label>-associated OTP/password typing block
+  const typeGuardMatch = swSource.match(
+    /if \(!el\) return \{ ok: false, error: `Input element not found: \$\{tgt\}` \};\s*(const elStyle = window\.getComputedStyle\(el\);[\s\S]*?return \{\s*ok: false,\s*error:\s*'\[GUARDRAIL\] Automated typing into password[\s\S]*?\};\s*\})/
+  );
+  assert.ok(typeGuardMatch, 'Expected type field security guard block');
+  const checkTypeField = vm.runInNewContext(
+    `(function(el, document, window, HTMLInputElement) { ${typeGuardMatch[1]} return { ok: true }; })`
+  );
+  class MockInput {}
+  const evalMockField = ({ type = 'text', name = '', id = '', placeholder = '', labelText = '', ariaLabel = '' }) => {
+    const inst = Object.assign(new MockInput(), {
+      type,
+      id,
+      labels: labelText ? [{ textContent: labelText }] : [],
+      closest: () => null,
+      getAttribute(k) {
+        const m = { name, placeholder, 'aria-label': ariaLabel, autocomplete: '', 'aria-labelledby': '', title: '' };
+        return m[k] || '';
+      }
+    });
+    return checkTypeField(
+      inst,
+      { getElementById: () => null },
+      { getComputedStyle: () => ({ webkitTextSecurity: 'none', getPropertyValue: () => 'none' }) },
+      MockInput
+    );
+  };
+
+  assert.equal(evalMockField({ name: 'otpCode' }).ok, false);
+  assert.equal(evalMockField({ id: 'user_password' }).ok, false);
+  assert.equal(evalMockField({ placeholder: '请输入验证码' }).ok, false);
+  assert.equal(evalMockField({ ariaLabel: 'Verification code' }).ok, false);
+  assert.equal(evalMockField({ id: 'c1', type: 'tel', labelText: '短信验证码' }).ok, false);
+  assert.equal(evalMockField({ name: 'payPin' }).ok, false);
+  // Benign fields must NOT false-positive
+  assert.equal(evalMockField({ name: 'pinnedItem', placeholder: '搜索商品名称' }).ok, true);
+  assert.equal(evalMockField({ name: 'spinnerCount' }).ok, true);
+
+  // 4. High-entropy path token redaction, snapshot title/label URL scrubbing, token-rotation state wipe, WS fragment cap & fatal UTF-8
+  const habrTokenUrl =
+    'https://account.example.com/ident/9f8e7d6c5b4a32109f8e7d6c5b4a3210abcdef123456/login?prefill=' + 'x'.repeat(150);
+  const redactedHabr = redactUrlForAudit(habrTokenUrl);
+  assert.match(redactedHabr, /\/ident\/REDACTED\/login/);
+
+  const tempStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-r3-daemon-'));
+  let tok = crypto.randomBytes(32).toString('hex');
+  const daemon = createDaemonServer({
+    host: '127.0.0.1',
+    port: 0,
+    stateDir: tempStateDir,
+    token: () => tok
+  });
+  const port = await daemon.listen();
+  let extWs = null;
+  let mcpProc = null;
+  try {
+    setPlaybookEnabled(true, tempStateDir);
+    extWs = await connectTestWsClient(port, '/ws/extension', tok);
+    extWs.sendMaskedJson({
+      type: 'hello',
+      version: '1.0.0',
+      tabs: [{ tabId: 11, substate: 'shared', paused: false, title: 'https://sso.example.com/cb?token=TOP_SECRET_TITLE', url: 'https://sso.example.com/cb?token=TOP_SECRET_URL' }]
+    });
+    extWs.sendMaskedJson({
+      type: 'screencast_frame',
+      tabId: 11,
+      mimeType: 'image/jpeg',
+      data: Buffer.from('sensitive-frame-bytes').toString('base64'),
+      title: 'https://sso.example.com/cb?token=TOP_SECRET_TITLE',
+      url: 'https://sso.example.com/cb?token=TOP_SECRET_URL'
+    });
+    extWs.on('message', (raw) => {
+      const msg = JSON.parse(raw.toString('utf8'));
+      if (msg.type === 'rpc_request' && msg.method === 'snapshot') {
+        extWs.sendMaskedJson({
+          type: 'rpc_response',
+          id: msg.id,
+          ok: true,
+          result: {
+            url: 'https://sso.example.com/cb?token=TOP_SECRET_URL',
+            title: 'https://sso.example.com/cb?token=TOP_SECRET_TITLE',
+            elements: [
+              {
+                tag: 'a',
+                label: 'https://sso.example.com/magic?token=TOP_SECRET_LABEL',
+                href: 'https://sso.example.com/magic?token=TOP_SECRET_HREF'
+              }
+            ]
+          }
+        });
+      }
+    });
+    await new Promise((r) => setTimeout(r, 30));
+
+    const snapResp = await httpJson(port, 'POST', '/api/command', { token: tok }, { method: 'snapshot', params: { tabId: 11 } });
+    assert.equal(snapResp.statusCode, 200);
+    const snapText = JSON.stringify(snapResp.json);
+    assert.equal(snapText.includes('TOP_SECRET_TITLE'), false, 'Snapshot title URL token must be redacted');
+    assert.equal(snapText.includes('TOP_SECRET_LABEL'), false, 'Element label URL token must be redacted');
+    assert.equal(snapText.includes('TOP_SECRET_HREF'), false);
+    assert.equal(lookupDomainPlaybook('sso.example.com', [], tempStateDir), null, 'Untitled OAuth callback URL must never auto-save to playbook');
+
+    // Rotate token -> old tabs & cached frames MUST be wiped from daemon memory!
+    tok = crypto.randomBytes(32).toString('hex');
+    const stateAfterRot = await httpJson(port, 'GET', '/api/state?includeFrame=1', { token: tok });
+    assert.equal(stateAfterRot.statusCode, 200);
+    assert.deepEqual(stateAfterRot.json.tabs, [], 'Token rotation must purge stale session tabs');
+    assert.equal(stateAfterRot.json.frameDataUrl, undefined, 'Token rotation must purge stale cached frames');
+    const frameAfterRot = await httpJson(port, 'GET', '/api/frame?tabId=11', { token: tok });
+    assert.equal(frameAfterRot.statusCode, 204);
+
+    // WS pre-auth 0-byte fragment flood (>16 fragments) MUST close with 1009
+    const floodPeer = await connectTestWsClient(port, '/ws/live', null, { authMode: 'none' });
+    const floodClosePromise = new Promise((resolve) => floodPeer.on('close', (code) => resolve(code)));
+    const makeMaskedEmptyFrag = (fin, opcode) => {
+      const m = crypto.randomBytes(4);
+      const b = Buffer.allocUnsafe(6);
+      b[0] = (fin ? 0x80 : 0x00) | opcode;
+      b[1] = 0x80;
+      m.copy(b, 2);
+      return b;
+    };
+    floodPeer.socket.write(makeMaskedEmptyFrag(false, 0x01));
+    for (let i = 0; i < 20; i++) {
+      floodPeer.socket.write(makeMaskedEmptyFrag(false, 0x00));
+    }
+    assert.equal(await floodClosePromise, 1009, '0-byte pre-auth fragment flood must close with 1009');
+
+    // WS invalid UTF-8 text frame MUST close with 1007 per RFC 6455 §8.1
+    const badUtfPeer = await connectTestWsClient(port, '/ws/live', tok);
+    const badUtfClosePromise = new Promise((resolve) => badUtfPeer.on('close', (code) => resolve(code)));
+    badUtfPeer.socket.write(encodeWsFrame(0x01, Buffer.from([0xff, 0xfe, 0xfd]), true));
+    assert.equal(await badUtfClosePromise, 1007, 'Invalid UTF-8 text frame must close with 1007');
+
+    // MCP Content-Length with space before colon ("Content-Length : ...") + UTF-8 BOM body
+    const prevH = process.env.CHROME_LIVE_HOME;
+    process.env.CHROME_LIVE_HOME = tempStateDir;
+    fs.writeFileSync(path.join(tempStateDir, 'auth.token'), `${tok}\n`, 'utf8');
+    try {
+      const cliPath = path.join(REPO_ROOT, 'bin', 'chrome-live.mjs');
+      mcpProc = spawn(process.execPath, [cliPath, 'mcp'], {
+        env: { ...process.env, CHROME_LIVE_PORT: String(port), CHROME_LIVE_HOME: tempStateDir },
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+      const replyPromise = new Promise((resolve, reject) => {
+        let out = Buffer.alloc(0);
+        const timer = setTimeout(() => reject(new Error('Split "Content-Length :" + BOM body deadlocked')), 2500);
+        mcpProc.stdout.on('data', (c) => {
+          out = Buffer.concat([out, c]);
+          const idx = out.indexOf('\r\n\r\n');
+          if (idx !== -1) {
+            const m = out.subarray(0, idx).toString('ascii').match(/Content-Length:\s*(\d+)/i);
+            const len = Number(m[1]);
+            if (out.length >= idx + 4 + len) {
+              clearTimeout(timer);
+              resolve(JSON.parse(out.subarray(idx + 4, idx + 4 + len).toString('utf8')));
+            }
+          }
+        });
+      });
+      const bomBody = Buffer.concat([
+        Buffer.from([0xef, 0xbb, 0xbf]),
+        Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: 909, method: 'initialize', params: {} }), 'utf8')
+      ]);
+      mcpProc.stdin.write('Content-Length '); // Split right at whitespace before colon!
+      await new Promise((r) => setTimeout(r, 15));
+      mcpProc.stdin.write(`: ${bomBody.length}\r\n\r\n`);
+      mcpProc.stdin.write(bomBody);
+      const r = await replyPromise;
+      assert.equal(r.id, 909);
+      assert.ok(r.result?.serverInfo);
+    } finally {
+      if (prevH === undefined) delete process.env.CHROME_LIVE_HOME;
+      else process.env.CHROME_LIVE_HOME = prevH;
+    }
+  } finally {
+    try {
+      extWs?.socket?.destroy();
+    } catch {}
+    if (mcpProc) {
+      try {
+        mcpProc.stdin?.destroy();
+        mcpProc.stdout?.destroy();
+        mcpProc.stderr?.destroy();
+      } catch {}
+      mcpProc.kill();
+    }
+    await daemon.close();
+    fs.rmSync(tempStateDir, { recursive: true, force: true });
+  }
+});

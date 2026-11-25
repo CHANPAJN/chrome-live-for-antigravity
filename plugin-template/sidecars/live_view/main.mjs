@@ -198,9 +198,13 @@ app.api(
 
 app.api(
   '/api/live_frame',
-  async () => {
+  async (data) => {
     try {
-      const r = await callDaemon('GET', '/api/frame', null, 3500);
+      const tabQuery =
+        data && data.tabId !== undefined && data.tabId !== ''
+          ? `?tabId=${encodeURIComponent(String(data.tabId))}`
+          : '';
+      const r = await callDaemon('GET', `/api/frame${tabQuery}`, null, 3500);
       if (r.status !== 200 || !r.buffer.length) {
         return new Response('no frame', { status: 404 });
       }

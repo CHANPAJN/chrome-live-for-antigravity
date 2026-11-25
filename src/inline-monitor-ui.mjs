@@ -457,7 +457,7 @@ export function buildInlineMonitorHtml() {
     </div>
 
     <div id="remoteBar" class="bottom-drawer">
-      <input id="remoteInput" type="text" class="remote-input" placeholder="Type text or verification code to send to the active field..." />
+      <input id="remoteInput" type="text" class="remote-input" placeholder="Type text into active field (use Popout for passwords/OTP)..." />
       <button id="sendTypeBtn" class="action-btn" type="button">Type</button>
       <button id="sendSubmitBtn" class="action-btn" type="button">Type &amp; Enter</button>
     </div>
@@ -495,7 +495,7 @@ export function buildInlineMonitorHtml() {
             relayTitle: '弹出独立副屏窗口人工操作，完成后一键归队',
             snapTitle: '立即抓取当前最新画面',
             releaseTitle: '解除 AI 接管并保留该网页',
-            remotePlaceholder: '输入验证码或文字发往网页当前输入框...',
+            remotePlaceholder: '向当前普通输入框发送文字（密码/验证码请点副屏在浏览器内输入）...',
             sendType: '填入',
             sendSubmit: '填入并回车',
             regionHint: '在下方画面单击或拖拽框选任意区域，自动提取内部元素',
@@ -526,7 +526,7 @@ export function buildInlineMonitorHtml() {
             relayTitle: 'Pop out into a standalone window for manual login/2FA, then merge back',
             snapTitle: 'Capture a fresh frame now',
             releaseTitle: 'Release AI control while keeping this tab open',
-            remotePlaceholder: 'Type text or verification code to send to the active field...',
+            remotePlaceholder: 'Type text into active field (use Popout for passwords/OTP)...',
             sendType: 'Type',
             sendSubmit: 'Type & Enter',
             regionHint: 'Click or drag anywhere on the stream to extract DOM selectors',
@@ -849,10 +849,12 @@ export function buildInlineMonitorHtml() {
         }
 
         const frameTabId = data.frameTabId ?? (data.latestFrameMeta && data.latestFrameMeta.tabId) ?? null;
+        const perTabMap = data.frameTimestampsByTab && typeof data.frameTimestampsByTab === 'object' ? data.frameTimestampsByTab : null;
         const ts =
-          data.latestFrameMeta && data.latestFrameMeta.capturedAt
-            ? data.latestFrameMeta.capturedAt
-            : 0;
+          (primary && perTabMap && Number(perTabMap[primary.tabId])) ||
+          Number(data.frameCapturedAt) ||
+          (data.latestFrameMeta && data.latestFrameMeta.tabId === (primary && primary.tabId) && data.latestFrameMeta.capturedAt) ||
+          0;
         const frameMatchesPrimary = Boolean(primary && !isPaused && frameTabId === primary.tabId);
         if (isPaused) {
           lastFrameTs = 0;

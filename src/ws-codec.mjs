@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 
 const WS_MAGIC_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+const utf8FatalDecoder = new TextDecoder('utf-8', { fatal: true });
 
 export function computeWebSocketAccept(secWebSocketKey) {
   return crypto
@@ -65,13 +66,18 @@ function truncateUtf8Bytes(input, maxBytes) {
 }
 
 export class NativeWsPeer extends EventEmitter {
-  constructor(socket, { maxPayloadBytes = 16 * 1024 * 1024, requireMask = false } = {}) {
+  constructor(
+    socket,
+    { maxPayloadBytes = 16 * 1024 * 1024, maxFragments = 512, requireMask = false } = {}
+  ) {
     super();
     this.socket = socket;
     this.maxPayloadBytes = maxPayloadBytes;
+    this.maxFragments = maxFragments;
     this.requireMask = Boolean(requireMask);
     this.closed = false;
-    this._buffer = Buffer.alloc(0);
+    this._chunks = [];
+    this._bufferedBytes = 0;
     this._fragments = [];
     this._fragmentOpcode = 0;
     this._fragmentBytes = 0;
@@ -115,7 +121,8 @@ export class NativeWsPeer extends EventEmitter {
   close(code = 1000, reason = '', emitCode = code, emitReason = reason) {
     if (this.closed) return;
     this.closed = true;
-    this._buffer = Buffer.alloc(0);
+    this._chunks = [];
+    this._bufferedBytes = 0;
     this._fragments = [];
     this._fragmentBytes = 0;
     try {
@@ -125,6 +132,12 @@ export class NativeWsPeer extends EventEmitter {
       body.writeUInt16BE(code, 0);
       reasonBuf.copy(body, 2);
       this.socket.end(encodeWsFrame(0x08, body, false));
+      const destroyTimer = setTimeout(() => {
+        try {
+          if (!this.socket.destroyed) this.socket.destroy();
+        } catch {}
+      }, 1500);
+      destroyTimer.unref?.();
     } catch {
       try {
         this.socket.destroy();
@@ -136,18 +149,52 @@ export class NativeWsPeer extends EventEmitter {
   _markClosed() {
     if (this.closed) return;
     this.closed = true;
-    this._buffer = Buffer.alloc(0);
+    this._chunks = [];
+    this._bufferedBytes = 0;
     this._fragments = [];
+    this._fragmentBytes = 0;
     this.emit('close', 1006, '');
   }
 
-  _onData(chunk) {
-    if (this.closed) return;
-    this._buffer = this._buffer.length === 0 ? chunk : Buffer.concat([this._buffer, chunk]);
+  _ensureLinearPrefix(minBytes) {
+    if (this._chunks.length === 0) return Buffer.alloc(0);
+    if (this._chunks[0].length >= minBytes || this._chunks.length === 1) {
+      return this._chunks[0];
+    }
+    const merged = Buffer.concat(this._chunks, this._bufferedBytes);
+    this._chunks = [merged];
+    return merged;
+  }
 
-    while (this._buffer.length >= 2) {
-      const first = this._buffer[0];
-      const second = this._buffer[1];
+  _consumeBytes(count) {
+    const head = this._ensureLinearPrefix(count);
+    const taken = head.subarray(0, count);
+    const rem = head.subarray(count);
+    this._bufferedBytes -= count;
+    if (rem.length === 0) {
+      this._chunks = [];
+    } else {
+      // Avoid retaining multi-KB slabs when only a tiny tail remains
+      this._chunks = [rem.buffer.byteLength > 65536 && rem.length < 4096 ? Buffer.from(rem) : rem];
+    }
+    return taken;
+  }
+
+  _onData(chunk) {
+    if (this.closed || !chunk || chunk.length === 0) return;
+    this._chunks.push(chunk);
+    this._bufferedBytes += chunk.length;
+
+    // Hard cap on buffered unparsed bytes to prevent pre-frame OOM
+    if (this._bufferedBytes > this.maxPayloadBytes + 16384) {
+      this.close(1009, 'Buffered frame exceeds maxPayloadBytes');
+      return;
+    }
+
+    while (this._bufferedBytes >= 2) {
+      const hdr = this._ensureLinearPrefix(Math.min(this._bufferedBytes, 14));
+      const first = hdr[0];
+      const second = hdr[1];
       if ((first & 0x70) !== 0) {
         this.close(1002, 'RSV bits must be 0 per RFC 6455');
         return;
@@ -163,12 +210,12 @@ export class NativeWsPeer extends EventEmitter {
       let offset = 2;
 
       if (payloadLen === 126) {
-        if (this._buffer.length < 4) return;
-        payloadLen = this._buffer.readUInt16BE(2);
+        if (this._bufferedBytes < 4) return;
+        payloadLen = hdr.readUInt16BE(2);
         offset = 4;
       } else if (payloadLen === 127) {
-        if (this._buffer.length < 10) return;
-        const bigLen = this._buffer.readBigUInt64BE(2);
+        if (this._bufferedBytes < 10) return;
+        const bigLen = hdr.readBigUInt64BE(2);
         if (bigLen > BigInt(this.maxPayloadBytes)) {
           this.close(1009, 'Frame exceeds maxPayloadBytes');
           return;
@@ -184,11 +231,12 @@ export class NativeWsPeer extends EventEmitter {
 
       const maskBytes = masked ? 4 : 0;
       const totalFrameLen = offset + maskBytes + payloadLen;
-      if (this._buffer.length < totalFrameLen) return;
+      if (this._bufferedBytes < totalFrameLen) return;
 
-      let payload = this._buffer.subarray(offset + maskBytes, totalFrameLen);
+      const rawFrame = this._consumeBytes(totalFrameLen);
+      let payload = rawFrame.subarray(offset + maskBytes, totalFrameLen);
       if (masked) {
-        const maskKey = this._buffer.subarray(offset, offset + 4);
+        const maskKey = rawFrame.subarray(offset, offset + 4);
         const unmasked = Buffer.allocUnsafe(payloadLen);
         for (let i = 0; i < payloadLen; i++) {
           unmasked[i] = payload[i] ^ maskKey[i & 3];
@@ -198,9 +246,6 @@ export class NativeWsPeer extends EventEmitter {
         payload = Buffer.from(payload);
       }
 
-      // Copy remaining unread bytes if underlying slab is large to prevent retaining multi-KB buffers
-      const rem = this._buffer.subarray(totalFrameLen);
-      this._buffer = rem.length === 0 ? Buffer.alloc(0) : rem.buffer.byteLength > 65536 ? Buffer.from(rem) : rem;
       this._handleFrame(fin, opcode, payload);
       if (this.closed) return;
     }
@@ -233,7 +278,7 @@ export class NativeWsPeer extends EventEmitter {
         }
         if (payload.length > 2) {
           try {
-            peerReason = new TextDecoder('utf-8', { fatal: true }).decode(payload.subarray(2));
+            peerReason = utf8FatalDecoder.decode(payload.subarray(2));
           } catch {
             this.close(1007, 'Invalid UTF-8 in close reason');
             return;
@@ -264,6 +309,10 @@ export class NativeWsPeer extends EventEmitter {
         this.close(1002, 'Unexpected continuation frame');
         return;
       }
+      if (this._fragments.length >= this.maxFragments) {
+        this.close(1009, 'Too many WebSocket fragments');
+        return;
+      }
       this._fragmentBytes += payload.length;
       if (this._fragmentBytes > this.maxPayloadBytes) {
         this.close(1009, 'Fragmented message too large');
@@ -271,7 +320,7 @@ export class NativeWsPeer extends EventEmitter {
       }
       this._fragments.push(payload);
       if (fin) {
-        const full = Buffer.concat(this._fragments);
+        const full = Buffer.concat(this._fragments, this._fragmentBytes);
         const origOpcode = this._fragmentOpcode;
         this._fragments = [];
         this._fragmentOpcode = 0;
@@ -301,7 +350,14 @@ export class NativeWsPeer extends EventEmitter {
 
   _emitMessage(opcode, fullBuffer) {
     if (opcode === 0x01) {
-      this.emit('message', fullBuffer.toString('utf8'));
+      let decodedText;
+      try {
+        decodedText = utf8FatalDecoder.decode(fullBuffer);
+      } catch {
+        this.close(1007, 'Invalid UTF-8 in text frame per RFC 6455 §8.1');
+        return;
+      }
+      this.emit('message', decodedText);
     } else if (opcode === 0x02) {
       this.emit('binary', fullBuffer);
     }
@@ -312,7 +368,7 @@ export function upgradeHttpToWebSocket(
   req,
   socket,
   head,
-  { requireMask = true, maxPayloadBytes = 16 * 1024 * 1024 } = {}
+  { requireMask = true, maxPayloadBytes = 16 * 1024 * 1024, maxFragments = 512 } = {}
 ) {
   const method = String(req.method || '').toUpperCase();
   const upgradeHdr = String(req.headers.upgrade || '').toLowerCase();
@@ -341,7 +397,7 @@ export function upgradeHttpToWebSocket(
   ].join('\r\n');
 
   socket.write(responseHeaders);
-  const peer = new NativeWsPeer(socket, { requireMask, maxPayloadBytes });
+  const peer = new NativeWsPeer(socket, { requireMask, maxPayloadBytes, maxFragments });
   if (head && head.length > 0) {
     peer._onData(head);
   }

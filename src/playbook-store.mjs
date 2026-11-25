@@ -1,7 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { AUDIT_SENSITIVE_PARAM_RX, evaluateUrlSafety } from './guardrails.mjs';
-import { getStateDir } from './token-store.mjs';
+import {
+  AUDIT_SENSITIVE_PARAM_RX,
+  evaluateUrlSafety,
+  isHighEntropyPathToken,
+  redactUrlForAudit,
+  redactUrlsInText
+} from './guardrails.mjs';
+import { ensureSecureDirSync, getStateDir } from './token-store.mjs';
 
 const MAX_SITES = 120;
 const MAX_ROUTES_PER_SITE = 18;
@@ -72,8 +78,9 @@ let memoryCache = null;
 let memoryMtimeMs = -1;
 let memoryFilePath = '';
 
-export function getPlaybookFilePath() {
-  return path.join(getStateDir(), 'site-playbooks.json');
+export function getPlaybookFilePath(stateDirOverride = '') {
+  const baseDir = stateDirOverride ? path.resolve(stateDirOverride) : getStateDir();
+  return path.join(baseDir, 'site-playbooks.json');
 }
 
 function defaultStore() {
@@ -86,8 +93,8 @@ function defaultStore() {
   };
 }
 
-function loadStore() {
-  const filePath = getPlaybookFilePath();
+function loadStore(stateDirOverride = '') {
+  const filePath = getPlaybookFilePath(stateDirOverride);
   if (memoryFilePath !== filePath) {
     memoryCache = null;
     memoryMtimeMs = -1;
@@ -135,10 +142,9 @@ function loadStore() {
   return memoryCache;
 }
 
-function persistStore(store) {
-  const dir = getStateDir();
-  const filePath = getPlaybookFilePath();
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+function persistStore(store, stateDirOverride = '') {
+  const dir = ensureSecureDirSync(stateDirOverride ? path.resolve(stateDirOverride) : getStateDir());
+  const filePath = getPlaybookFilePath(stateDirOverride);
   store.updatedAt = Date.now();
   fs.writeFileSync(filePath, `${JSON.stringify(store, null, 2)}\n`, {
     encoding: 'utf8',
@@ -195,6 +201,15 @@ export function sanitizeRouteUrl(rawUrl, customBlockedDomains = []) {
       u.searchParams.delete(key);
     }
   }
+  if (u.pathname && u.pathname.length >= 32) {
+    const parts = u.pathname.split('/');
+    for (let i = 0; i < parts.length; i++) {
+      if (isHighEntropyPathToken(parts[i])) {
+        parts[i] = 'REDACTED';
+      }
+    }
+    u.pathname = parts.join('/');
+  }
   return u.toString();
 }
 
@@ -203,6 +218,11 @@ function shouldAutoLearnUrl(cleanUrl) {
     const u = new URL(cleanUrl);
     const host = u.hostname.toLowerCase();
     if (SKIP_AUTO_HOSTS.has(host)) return false;
+    // Never auto-learn one-time auth/magic-link paths containing redacted path tokens or oversized draft queries
+    if (u.pathname.includes('/REDACTED') || u.search.length > 120) return false;
+    for (const seg of u.pathname.split('/')) {
+      if (isHighEntropyPathToken(seg)) return false;
+    }
     for (const rx of SKIP_AUTO_PATH_PATTERNS) {
       if (rx.test(u.pathname)) return false;
     }
@@ -240,8 +260,8 @@ function ensureSiteBucket(store, domain) {
   return store.sites[domain];
 }
 
-export function getPlaybookSummary() {
-  const store = loadStore();
+export function getPlaybookSummary(stateDirOverride = '') {
+  const store = loadStore(stateDirOverride);
   const domains = Object.keys(store.sites);
   return {
     enabled: store.enabled,
@@ -251,15 +271,15 @@ export function getPlaybookSummary() {
   };
 }
 
-export function setPlaybookEnabled(enabled) {
-  const store = loadStore();
+export function setPlaybookEnabled(enabled, stateDirOverride = '') {
+  const store = loadStore(stateDirOverride);
   store.enabled = Boolean(enabled);
-  persistStore(store);
-  return getPlaybookSummary();
+  persistStore(store, stateDirOverride);
+  return getPlaybookSummary(stateDirOverride);
 }
 
-export function lookupDomainPlaybook(urlOrDomain, customBlockedDomains = []) {
-  const store = loadStore();
+export function lookupDomainPlaybook(urlOrDomain, customBlockedDomains = [], stateDirOverride = '') {
+  const store = loadStore(stateDirOverride);
   if (!store.enabled) return null;
   const domain = normalizeDomain(urlOrDomain);
   if (!domain) return null;
@@ -281,21 +301,21 @@ export function lookupDomainPlaybook(urlOrDomain, customBlockedDomains = []) {
   };
 }
 
-export function learnFromPageVisit({ url, title, elements = [], customBlockedDomains = [] } = {}) {
-  const store = loadStore();
+export function learnFromPageVisit({ url, title, elements = [], customBlockedDomains = [], stateDir = '' } = {}) {
+  const store = loadStore(stateDir);
   if (!store.enabled) return false;
 
   const cleanUrl = sanitizeRouteUrl(url, customBlockedDomains);
-  if (!cleanUrl || !shouldAutoLearnUrl(cleanUrl)) return false;
+  if (!cleanUrl || !shouldAutoLearnUrl(cleanUrl, url)) return false;
 
   const domain = normalizeDomain(cleanUrl);
   if (!domain) return false;
 
-  const cleanTitle = String(title || '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 64);
-  if (!isSafeDictKey(cleanTitle)) return false;
+  const rawTitle = String(title || '').replace(/\s+/g, ' ').trim();
+  // Skip bare URL fallback titles (e.g. untitled OAuth callbacks where document.title === location.href)
+  if (/^https?:\/\//i.test(rawTitle)) return false;
+  const cleanTitle = redactUrlsInText(rawTitle).slice(0, 64);
+  if (!isSafeDictKey(cleanTitle) || cleanTitle.includes('REDACTED')) return false;
 
   const bucket = ensureSiteBucket(store, domain);
   let changed = false;
@@ -327,13 +347,13 @@ export function learnFromPageVisit({ url, title, elements = [], customBlockedDom
 
   if (changed) {
     bucket.updatedAt = Date.now();
-    persistStore(store);
+    persistStore(store, stateDir);
   }
   return changed;
 }
 
-export function learnInteractionSelector({ url, label, selector, customBlockedDomains = [] } = {}) {
-  const store = loadStore();
+export function learnInteractionSelector({ url, label, selector, customBlockedDomains = [], stateDir = '' } = {}) {
+  const store = loadStore(stateDir);
   if (!store.enabled) return false;
   if (!url || !label || !selector) return false;
   if (!evaluateUrlSafety(url, customBlockedDomains).allowed) return false;
@@ -341,9 +361,9 @@ export function learnInteractionSelector({ url, label, selector, customBlockedDo
   const domain = normalizeDomain(url);
   if (!domain || SKIP_AUTO_HOSTS.has(domain)) return false;
 
-  const cleanKey = String(label).replace(/\s+/g, ' ').trim().slice(0, 42);
+  const cleanKey = redactUrlsInText(String(label)).replace(/\s+/g, ' ').trim().slice(0, 42);
   const cleanCss = String(selector).trim().slice(0, 140);
-  if (!isSafeDictKey(cleanKey) || !cleanCss) return false;
+  if (!isSafeDictKey(cleanKey) || !cleanCss || cleanKey.includes('REDACTED')) return false;
   if (SENSITIVE_SELECTOR_RX.test(`${cleanKey} ${cleanCss}`)) {
     return false;
   }
@@ -357,12 +377,12 @@ export function learnInteractionSelector({ url, label, selector, customBlockedDo
   }
   bucket.selectors[cleanKey] = cleanCss;
   bucket.updatedAt = Date.now();
-  persistStore(store);
+  persistStore(store, stateDir);
   return true;
 }
 
-export function saveManualPlaybook({ domain: rawDomain, route, tip, tipIndex, selector, customBlockedDomains = [] } = {}) {
-  const store = loadStore();
+export function saveManualPlaybook({ domain: rawDomain, route, tip, tipIndex, selector, customBlockedDomains = [], stateDir = '' } = {}) {
+  const store = loadStore(stateDir);
   if (!store.enabled) {
     throw new Error('Site Playbooks are disabled; enable them before saving entries');
   }
@@ -430,7 +450,7 @@ export function saveManualPlaybook({ domain: rawDomain, route, tip, tipIndex, se
   }
 
   bucket.updatedAt = Date.now();
-  persistStore(store);
+  persistStore(store, stateDir);
   return {
     enabled: store.enabled,
     domain,
@@ -438,16 +458,16 @@ export function saveManualPlaybook({ domain: rawDomain, route, tip, tipIndex, se
   };
 }
 
-export function deletePlaybookItem({ domain: rawDomain, kind, key, index } = {}) {
-  const store = loadStore();
+export function deletePlaybookItem({ domain: rawDomain, kind, key, index, stateDir = '' } = {}) {
+  const store = loadStore(stateDir);
   const domain = normalizeDomain(rawDomain);
-  if (!domain || !store.sites[domain]) {
-    return getPlaybookSummary();
+  if (!domain || !Object.hasOwn(store.sites, domain)) {
+    return getPlaybookSummary(stateDir);
   }
   const bucket = store.sites[domain];
-  if (kind === 'route' && typeof key === 'string') {
+  if (kind === 'route' && typeof key === 'string' && Object.hasOwn(bucket.routes, key)) {
     delete bucket.routes[key];
-  } else if (kind === 'selector' && typeof key === 'string') {
+  } else if (kind === 'selector' && typeof key === 'string' && Object.hasOwn(bucket.selectors, key)) {
     delete bucket.selectors[key];
   } else if (kind === 'tip') {
     if (typeof index === 'number' && index >= 0 && index < bucket.tips.length) {
@@ -466,22 +486,22 @@ export function deletePlaybookItem({ domain: rawDomain, kind, key, index } = {})
   } else {
     bucket.updatedAt = Date.now();
   }
-  persistStore(store);
+  persistStore(store, stateDir);
   return {
-    ...getPlaybookSummary(),
+    ...getPlaybookSummary(stateDir),
     domain,
-    entry: store.sites[domain] || null
+    entry: Object.hasOwn(store.sites, domain) ? store.sites[domain] : null
   };
 }
 
-export function listPlaybooks(rawDomain = '') {
-  const store = loadStore();
+export function listPlaybooks(rawDomain = '', stateDir = '') {
+  const store = loadStore(stateDir);
   if (rawDomain) {
     const d = normalizeDomain(rawDomain);
     return {
       enabled: store.enabled,
       domain: d,
-      entry: store.sites[d] || null
+      entry: d && Object.hasOwn(store.sites, d) ? store.sites[d] : null
     };
   }
   return {
@@ -490,14 +510,14 @@ export function listPlaybooks(rawDomain = '') {
   };
 }
 
-export function clearPlaybooks(rawDomain = '') {
-  const store = loadStore();
+export function clearPlaybooks(rawDomain = '', stateDir = '') {
+  const store = loadStore(stateDir);
   if (rawDomain) {
     const d = normalizeDomain(rawDomain);
-    if (d) delete store.sites[d];
+    if (d && Object.hasOwn(store.sites, d)) delete store.sites[d];
   } else {
     store.sites = Object.create(null);
   }
-  persistStore(store);
-  return getPlaybookSummary();
+  persistStore(store, stateDir);
+  return getPlaybookSummary(stateDir);
 }

@@ -76,7 +76,16 @@ function parseValidExtensionOrigin(originHeader) {
 
 const URL_FIELD_KEYS = new Set(['url', 'pageUrl', 'finalUrl', 'href', 'targetUrl']);
 const URL_ARRAY_KEYS = new Set(['urls', 'images']);
-const TEXT_URL_SCRUB_KEYS = new Set(['error', 'excerpt', 'text', 'summary']);
+const TEXT_URL_SCRUB_KEYS = new Set([
+  'error',
+  'excerpt',
+  'text',
+  'summary',
+  'title',
+  'label',
+  'clicked',
+  'learnedLabel'
+]);
 
 function redactPayloadUrls(node, depth = 0) {
   if (!node || typeof node !== 'object' || depth > 10) return node;
@@ -96,7 +105,8 @@ function redactPayloadUrls(node, depth = 0) {
     } else if (k === 'routes' && v && typeof v === 'object' && !Array.isArray(v)) {
       const cleanRoutes = {};
       for (const [rk, rv] of Object.entries(v)) {
-        cleanRoutes[rk] = typeof rv === 'string' ? redactUrlForAudit(rv) : rv;
+        const cleanKey = redactUrlsInText(String(rk));
+        cleanRoutes[cleanKey] = typeof rv === 'string' ? redactUrlForAudit(rv) : rv;
       }
       out[k] = cleanRoutes;
     } else if (v && typeof v === 'object' && !Buffer.isBuffer(v)) {
@@ -140,6 +150,8 @@ function parseJsonBuffer(rawBuf) {
 export function createDaemonServer(options = {}) {
   const host = options.host || DEFAULT_HOST;
   const requestedPort = options.port ?? DEFAULT_PORT;
+  const resolveInstanceStateDir = () =>
+    options.stateDir ? path.resolve(String(options.stateDir)) : getStateDir();
   const resolveAuthToken = () =>
     typeof options.token === 'function'
       ? String(options.token() || '').trim()
@@ -147,9 +159,19 @@ export function createDaemonServer(options = {}) {
         ? String(options.token)
         : ensureAuthToken();
 
+  // Sweep any orphan `.upload-snapshots` left behind by an abruptly terminated prior daemon process
+  try {
+    const staleSnapRoot = path.join(resolveInstanceStateDir(), '.upload-snapshots');
+    if (fs.existsSync(staleSnapRoot)) {
+      fs.rmSync(staleSnapRoot, { recursive: true, force: true });
+    }
+  } catch {}
+
   let extensionPeer = null;
   let activeExtensionOrigin = null;
+  let lastKnownTokenDigest = sha256Hex(resolveAuthToken());
   const liveViewPeers = new Set();
+  const unauthedWsPeers = new Set();
   const upgradeSockets = new Set();
   const pendingRpc = new Map();
   const auditLog = [];
@@ -159,20 +181,6 @@ export function createDaemonServer(options = {}) {
     if (!parsedOrigin || !activeExtensionOrigin) return null;
     if (parsedOrigin !== activeExtensionOrigin) return null;
     return String(originHeader).trim();
-  }
-
-  function evictStaleTokenPeers() {
-    const currentDigest = sha256Hex(resolveAuthToken());
-    if (extensionPeer && !extensionPeer.closed && extensionPeer._tokenDigest !== currentDigest) {
-      activeExtensionOrigin = null;
-      extensionPeer.close(4001, 'Auth token rotated');
-    }
-    for (const peer of Array.from(liveViewPeers)) {
-      if (!peer.closed && peer._tokenDigest !== currentDigest) {
-        liveViewPeers.delete(peer);
-        peer.close(4001, 'Auth token rotated');
-      }
-    }
   }
 
   const MAX_TAB_FRAMES = 6;
@@ -188,6 +196,34 @@ export function createDaemonServer(options = {}) {
     latestFrame: null, // { tabId, mimeType, buffer, title, url, activity, capturedAt }
     framesByTab: new Map() // tabId -> frame
   };
+
+  function resetExtensionSessionState() {
+    activeExtensionOrigin = null;
+    state.extensionConnected = false;
+    state.activeTabId = null;
+    state.tabs = [];
+    state.latestFrame = null;
+    state.framesByTab.clear();
+    state.updatedAt = Date.now();
+  }
+
+  function evictStaleTokenPeers() {
+    const currentDigest = sha256Hex(resolveAuthToken());
+    if (currentDigest !== lastKnownTokenDigest) {
+      lastKnownTokenDigest = currentDigest;
+      resetExtensionSessionState();
+    }
+    if (extensionPeer && !extensionPeer.closed && extensionPeer._tokenDigest !== currentDigest) {
+      resetExtensionSessionState();
+      extensionPeer.close(4001, 'Auth token rotated');
+    }
+    for (const peer of Array.from(liveViewPeers)) {
+      if (!peer.closed && peer._tokenDigest !== currentDigest) {
+        liveViewPeers.delete(peer);
+        peer.close(4001, 'Auth token rotated');
+      }
+    }
+  }
 
   function resolveFrame(tabIdParam) {
     if (tabIdParam !== null && tabIdParam !== undefined && tabIdParam !== '') {
@@ -260,6 +296,12 @@ export function createDaemonServer(options = {}) {
   }
 
   function buildPublicSnapshot() {
+    const frameTimestampsByTab = {};
+    for (const [tid, frm] of state.framesByTab.entries()) {
+      if (frm && typeof frm.capturedAt === 'number') {
+        frameTimestampsByTab[tid] = frm.capturedAt;
+      }
+    }
     return {
       ok: true,
       daemonPid: process.pid,
@@ -271,22 +313,28 @@ export function createDaemonServer(options = {}) {
       activeTabId: state.activeTabId,
       tabs: Array.isArray(state.tabs)
         ? state.tabs.map((t) =>
-            t && typeof t === 'object' && typeof t.url === 'string'
-              ? { ...t, url: redactUrlForAudit(t.url) }
+            t && typeof t === 'object'
+              ? {
+                  ...t,
+                  ...(typeof t.url === 'string' ? { url: redactUrlForAudit(t.url) } : {}),
+                  ...(typeof t.title === 'string' ? { title: redactUrlsInText(t.title) } : {})
+                }
               : t
           )
         : [],
       hasFrame: Boolean(state.latestFrame),
+      cachedFrameTabIds: Array.from(state.framesByTab.keys()),
+      frameTimestampsByTab,
       latestFrameMeta: state.latestFrame
         ? {
             tabId: state.latestFrame.tabId,
-            title: state.latestFrame.title,
+            title: redactUrlsInText(String(state.latestFrame.title || '')),
             url: redactUrlForAudit(state.latestFrame.url),
             activity: state.latestFrame.activity,
             capturedAt: state.latestFrame.capturedAt
           }
         : null,
-      playbook: getPlaybookSummary(),
+      playbook: getPlaybookSummary(resolveInstanceStateDir()),
       recentAudit: auditLog.slice(0, 20)
     };
   }
@@ -367,7 +415,10 @@ export function createDaemonServer(options = {}) {
     return map[ext] || 'application/octet-stream';
   }
 
-  function prepareUploadParams(stepParams, cleanupDirs = []) {
+  const MAX_FILES_PER_REQUEST = 16;
+  const MAX_UPLOAD_SNAPSHOT_BYTES = 64 * 1024 * 1024;
+
+  function prepareUploadParams(stepParams, cleanupDirs = [], budget = { count: 0, bytes: 0 }) {
     const rawList = Array.isArray(stepParams.files)
       ? stepParams.files
       : typeof stepParams.file === 'string' && stepParams.file.trim()
@@ -376,15 +427,17 @@ export function createDaemonServer(options = {}) {
     if (rawList.length === 0) {
       throw new Error('upload requires at least one local file path');
     }
+    if (budget.count + rawList.length > MAX_FILES_PER_REQUEST) {
+      throw new Error(`Upload exceeds maximum ${MAX_FILES_PER_REQUEST} files per request`);
+    }
 
-    const snapshotsRoot = ensureSecureDirSync(path.join(getStateDir(), '.upload-snapshots'));
+    const snapshotsRoot = ensureSecureDirSync(path.join(resolveInstanceStateDir(), '.upload-snapshots'));
     const batchSnapDir = ensureSecureDirSync(path.join(snapshotsRoot, crypto.randomUUID()));
     cleanupDirs.push(batchSnapDir);
 
     const resolvedFiles = [];
     let totalBytes = 0;
     const filePayloads = [];
-    const MAX_UPLOAD_SNAPSHOT_BYTES = 64 * 1024 * 1024;
     const openFlags = fs.constants.O_RDONLY | (typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0);
 
     for (let idx = 0; idx < rawList.length; idx++) {
@@ -409,9 +462,11 @@ export function createDaemonServer(options = {}) {
           recordAudit('upload', { file: String(item || ''), code: 'HARDLINK_BLOCKED' }, 'blocked');
           throw new Error('[GUARDRAIL:HARDLINK_BLOCKED] Uploading hard-linked files (nlink > 1) is blocked by local guardrails');
         }
-        if (st.size > MAX_UPLOAD_SNAPSHOT_BYTES) {
-          throw new Error(`Upload file exceeds ${MAX_UPLOAD_SNAPSHOT_BYTES} byte limit`);
+        if (st.size > MAX_UPLOAD_SNAPSHOT_BYTES || budget.bytes + st.size > MAX_UPLOAD_SNAPSHOT_BYTES) {
+          throw new Error(`Upload total size exceeds ${MAX_UPLOAD_SNAPSHOT_BYTES} byte limit`);
         }
+        budget.count += 1;
+        budget.bytes += st.size;
 
         // Freeze an immutable private copy directly from the verified fd so subsequent symlink swaps
         // (e.g. during multi-step batch waits before Chrome calls DOM.setFileInputFiles) cannot cause TOCTOU escape!
@@ -473,6 +528,7 @@ export function createDaemonServer(options = {}) {
       }
 
       const uploadCleanupDirs = [];
+      const uploadBudget = { count: 0, bytes: 0 };
       const purgeUploadSnapshots = () => {
         for (const d of uploadCleanupDirs) {
           try {
@@ -484,7 +540,7 @@ export function createDaemonServer(options = {}) {
 
       try {
         if (method === 'upload') {
-          prepareUploadParams(params, uploadCleanupDirs);
+          prepareUploadParams(params, uploadCleanupDirs, uploadBudget);
         } else if (method === 'extract' && Array.isArray(params.urls)) {
           for (const rawUrl of params.urls) {
             const urlStr = String(rawUrl || '');
@@ -521,7 +577,7 @@ export function createDaemonServer(options = {}) {
               }
             }
             if (stepAction === 'upload') {
-              prepareUploadParams(step, uploadCleanupDirs);
+              prepareUploadParams(step, uploadCleanupDirs, uploadBudget);
             }
           }
         }
@@ -665,12 +721,12 @@ export function createDaemonServer(options = {}) {
     try {
       if (req.method === 'GET' && (pathname === '/api/health' || pathname === '/api/state')) {
         const snap = buildPublicSnapshot();
-        snap.cachedFrameTabIds = Array.from(state.framesByTab.keys());
         if (parsedUrl.searchParams.get('includeFrame') === '1') {
           const targetFrame = resolveFrame(parsedUrl.searchParams.get('tabId'));
           if (targetFrame?.buffer) {
             snap.frameDataUrl = `data:${targetFrame.mimeType || 'image/jpeg'};base64,${targetFrame.buffer.toString('base64')}`;
             snap.frameTabId = targetFrame.tabId ?? null;
+            snap.frameCapturedAt = targetFrame.capturedAt ?? 0;
           }
         }
         sendJson(req, res, 200, snap);
@@ -684,33 +740,38 @@ export function createDaemonServer(options = {}) {
 
       if (req.method === 'GET' && pathname === '/api/playbook') {
         const domain = parsedUrl.searchParams.get('domain') || '';
-        sendJson(req, res, 200, { ok: true, ...listPlaybooks(domain) });
+        sendJson(req, res, 200, { ok: true, ...listPlaybooks(domain, resolveInstanceStateDir()) });
         return;
       }
 
       if (req.method === 'POST' && pathname === '/api/playbook') {
         const body = parseJsonBuffer(rawBody);
         const action = String(body.action || '').trim();
+        const instanceDir = resolveInstanceStateDir();
         if (action === 'set_enabled') {
-          const summary = setPlaybookEnabled(Boolean(body.enabled));
+          const summary = setPlaybookEnabled(Boolean(body.enabled), instanceDir);
           recordAudit('playbook_toggle', { enabled: summary.enabled });
           sendJson(req, res, 200, { ok: true, ...summary });
           return;
         }
         if (action === 'save') {
-          const saved = saveManualPlaybook({ ...body, customBlockedDomains: state.customBlockedDomains });
+          const saved = saveManualPlaybook({
+            ...body,
+            customBlockedDomains: state.customBlockedDomains,
+            stateDir: instanceDir
+          });
           recordAudit('playbook_save', { domain: saved.domain });
           sendJson(req, res, 200, { ok: true, ...saved });
           return;
         }
         if (action === 'delete_item') {
-          const updated = deletePlaybookItem(body);
+          const updated = deletePlaybookItem({ ...body, stateDir: instanceDir });
           recordAudit('playbook_delete_item', { domain: body.domain || '', kind: body.kind || '' });
           sendJson(req, res, 200, { ok: true, ...updated });
           return;
         }
         if (action === 'clear') {
-          const summary = clearPlaybooks(body.domain || '');
+          const summary = clearPlaybooks(body.domain || '', instanceDir);
           recordAudit('playbook_clear', { domain: body.domain || '*' });
           sendJson(req, res, 200, { ok: true, ...summary });
           return;
@@ -747,13 +808,15 @@ export function createDaemonServer(options = {}) {
         const method = String(body.method || body.cmd || '').trim();
         const params = body.params && typeof body.params === 'object' ? body.params : {};
         const defaultTimeoutMs = method === 'batch' || method === 'extract' ? 90000 : 28000;
-        const timeoutMs = Number(body.timeoutMs) > 0 ? Number(body.timeoutMs) : defaultTimeoutMs;
+        const timeoutMs =
+          Number(body.timeoutMs) > 0 ? Math.min(120000, Math.max(1000, Number(body.timeoutMs))) : defaultTimeoutMs;
 
         if (!method) {
           sendJson(req, res, 400, { ok: false, error: 'Missing command method' });
           return;
         }
 
+        const instanceDir = resolveInstanceStateDir();
         const result = await dispatchExtensionRpc(method, params, timeoutMs);
         if (result && typeof result === 'object') {
           if (result.learnedSelector && result.pageUrl) {
@@ -761,7 +824,8 @@ export function createDaemonServer(options = {}) {
               url: result.pageUrl,
               label: result.learnedLabel,
               selector: result.learnedSelector,
-              customBlockedDomains: state.customBlockedDomains
+              customBlockedDomains: state.customBlockedDomains,
+              stateDir: instanceDir
             });
           }
           if (method === 'batch' && Array.isArray(result.stepResults)) {
@@ -772,7 +836,8 @@ export function createDaemonServer(options = {}) {
                   url: r.pageUrl,
                   label: r.learnedLabel,
                   selector: r.learnedSelector,
-                  customBlockedDomains: state.customBlockedDomains
+                  customBlockedDomains: state.customBlockedDomains,
+                  stateDir: instanceDir
                 });
               }
             }
@@ -783,9 +848,10 @@ export function createDaemonServer(options = {}) {
               url: snapTarget.url,
               title: snapTarget.title,
               elements: snapTarget.elements,
-              customBlockedDomains: state.customBlockedDomains
+              customBlockedDomains: state.customBlockedDomains,
+              stateDir: instanceDir
             });
-            const pb = lookupDomainPlaybook(snapTarget.url, state.customBlockedDomains);
+            const pb = lookupDomainPlaybook(snapTarget.url, state.customBlockedDomains, instanceDir);
             if (pb) {
               result.playbook = pb;
               if (method === 'batch' && result.finalSnapshot) {
@@ -860,17 +926,28 @@ export function createDaemonServer(options = {}) {
       return;
     }
 
-    // Cap pre-authentication WS payload at 4KB; expand to 16MB only after mutual HMAC handshake succeeds
+    if (unauthedWsPeers.size >= 24) {
+      socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    // Cap pre-authentication WS payload at 4KB and <=16 fragments; expand only after mutual HMAC handshake succeeds
     const peer = upgradeHttpToWebSocket(req, socket, head, {
       requireMask: true,
-      maxPayloadBytes: 4096
+      maxPayloadBytes: 4096,
+      maxFragments: 16
     });
     if (!peer) return;
+    unauthedWsPeers.add(peer);
+    peer.on('close', () => unauthedWsPeers.delete(peer));
     peer.on('error', () => {});
 
     const attachAuthenticatedPeer = (authPayload = null, verifiedToken = '') => {
+      unauthedWsPeers.delete(peer);
       peer._tokenDigest = sha256Hex(verifiedToken);
       peer.maxPayloadBytes = 16 * 1024 * 1024;
+      peer.maxFragments = 512;
       if (pathname === '/ws/extension') {
         const verifiedOrigin = parseValidExtensionOrigin(req.headers.origin);
         if (verifiedOrigin) {
@@ -896,8 +973,7 @@ export function createDaemonServer(options = {}) {
         peer.on('close', () => {
           if (extensionPeer === peer) {
             extensionPeer = null;
-            state.extensionConnected = false;
-            state.updatedAt = Date.now();
+            resetExtensionSessionState();
             for (const [id, entry] of pendingRpc.entries()) {
               clearTimeout(entry.timer);
               entry.reject(new Error('Extension WebSocket disconnected during RPC'));
@@ -1043,11 +1119,12 @@ export function createDaemonServer(options = {}) {
       const mimeType = msg.mimeType === 'image/png' ? 'image/png' : 'image/jpeg';
       const buffer = Buffer.from(msg.data, 'base64');
       const cleanFrameUrl = redactUrlForAudit(String(msg.url || ''));
+      const cleanFrameTitle = redactUrlsInText(String(msg.title || ''));
       const frame = {
         tabId: msg.tabId ?? null,
         mimeType,
         buffer,
-        title: String(msg.title || ''),
+        title: cleanFrameTitle,
         url: cleanFrameUrl,
         activity: String(msg.activity || ''),
         capturedAt: Date.now()

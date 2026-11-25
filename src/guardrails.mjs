@@ -67,14 +67,31 @@ export const DEFAULT_BLOCKED_DOMAINS = Object.freeze([
 const CHECKOUT_SEGMENT_RX =
   /(?:^|\/)(?:checkout|pay|payment|payments|cashier|billing|wallet\/transfer)(?:\/|\?|$|#|;|\.[a-z0-9]{1,8}(?:\/|\?|$|#|;))/i;
 
+const CHECKOUT_SUBDOMAIN_RX = /(?:^|\.)(?:checkout|pay|payment|payments|cashier|billing)\./i;
+
 export const AUDIT_SENSITIVE_PARAM_RX =
   /(?:token|secret|passw|pwd|apikey|api[-_]?key|access[-_]?key|private[-_]?key|auth|code|state|sig|jwt|bearer|ticket|session|sid|csrf|xsrf|otp|credential|hmac|(?:^|[-_.])(?:key|pass|pin|hash)(?:$|[-_.]))/i;
 
 const HASH_SENSITIVE_PAIR_RX =
   /([#?&])([^=&#]*(?:token|secret|passw|pwd|apikey|api[-_]?key|access[-_]?key|private[-_]?key|auth|code|state|sig|jwt|bearer|ticket|session|sid|csrf|xsrf|otp|credential|hmac|(?:^|[-_.])(?:key|pass|pin|hash)(?:$|[-_.]))[^=&#]*)=([^&#]*)/gi;
 
+export function isHighEntropyPathToken(segment) {
+  if (!segment || segment.length < 32) return false;
+  if (/^eyJ[A-Za-z0-9._~+/=-]{10,}$/.test(segment)) return true;
+  if (/^[0-9a-f]{32,}$/i.test(segment)) return true;
+  if (segment.length >= 40 && /^[A-Za-z0-9._~+-]+$/.test(segment)) {
+    const hasDigit = /\d/.test(segment);
+    const hasUpper = /[A-Z]/.test(segment);
+    const hasLower = /[a-z]/.test(segment);
+    if ((hasDigit && (hasUpper || hasLower)) || (hasUpper && hasLower && !segment.includes('-'))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function canonicalizePathForGuardrail(rawSegment) {
-  if (!rawSegment) return { ok: true, path: '/' };
+  if (!rawSegment) return { ok: true, rawPath: '/', path: '/' };
   let decoded = String(rawSegment);
   for (let i = 0; i < 3; i++) {
     if (!decoded.includes('%')) break;
@@ -83,7 +100,7 @@ function canonicalizePathForGuardrail(rawSegment) {
       if (next === decoded) break;
       decoded = next;
     } catch {
-      return { ok: false, path: '' };
+      return { ok: false, rawPath: '', path: '' };
     }
   }
   const normalizedSlashes = decoded.replace(/\\/g, '/');
@@ -91,17 +108,23 @@ function canonicalizePathForGuardrail(rawSegment) {
   const pathPart = qIdx === -1 ? normalizedSlashes : normalizedSlashes.slice(0, qIdx);
   const queryPart = qIdx === -1 ? '' : normalizedSlashes.slice(qIdx);
 
+  const rawPieces = [];
   const stack = [];
   for (const rawPiece of pathPart.split('/')) {
     const cleanPiece = rawPiece.split(';')[0];
     if (!cleanPiece || cleanPiece === '.') continue;
+    rawPieces.push(cleanPiece);
     if (cleanPiece === '..') {
       stack.pop();
       continue;
     }
     stack.push(cleanPiece);
   }
-  return { ok: true, path: `/${stack.join('/')}${queryPart}` };
+  return {
+    ok: true,
+    rawPath: `/${rawPieces.join('/')}${queryPart}`,
+    path: `/${stack.join('/')}${queryPart}`
+  };
 }
 
 export function redactUrlForAudit(rawUrl) {
@@ -113,6 +136,20 @@ export function redactUrlForAudit(rawUrl) {
       parsed.username = '';
       parsed.password = '';
       mutated = true;
+    }
+    if (parsed.pathname && parsed.pathname.length >= 32) {
+      const parts = parsed.pathname.split('/');
+      let pathChanged = false;
+      for (let i = 0; i < parts.length; i++) {
+        if (isHighEntropyPathToken(parts[i])) {
+          parts[i] = 'REDACTED';
+          pathChanged = true;
+        }
+      }
+      if (pathChanged) {
+        parsed.pathname = parts.join('/');
+        mutated = true;
+      }
     }
     if (parsed.search) {
       for (const [k] of parsed.searchParams.entries()) {
@@ -197,19 +234,31 @@ export function evaluateUrlSafety(rawUrl, customBlockedDomains = []) {
       };
     }
   }
+  if (CHECKOUT_SUBDOMAIN_RX.test(host)) {
+    return {
+      allowed: false,
+      code: 'SENSITIVE_DOMAIN',
+      reason: `Subdomain "${host}" matches protected payment/cashier subdomain guardrail`
+    };
+  }
 
   const canonPath = canonicalizePathForGuardrail(parsed.pathname);
   if (!canonPath.ok) {
     return { allowed: false, code: 'MALFORMED_URL', reason: 'Malformed percent-encoding in URL pathname' };
   }
   const rawHashBody = parsed.hash ? parsed.hash.replace(/^#+/, '') : '';
-  const canonHash = rawHashBody ? canonicalizePathForGuardrail(rawHashBody) : { ok: true, path: '' };
+  const canonHash = rawHashBody ? canonicalizePathForGuardrail(rawHashBody) : { ok: true, rawPath: '', path: '' };
   if (!canonHash.ok) {
     return { allowed: false, code: 'MALFORMED_URL', reason: 'Malformed percent-encoding in URL fragment' };
   }
 
-  // Inspect canonicalized pathname and SPA hash route (defeating %63heckout, %2fcheckout, ;jsessionid, /cashier.htm)
-  if (CHECKOUT_SEGMENT_RX.test(canonPath.path) || (canonHash.path && CHECKOUT_SEGMENT_RX.test(canonHash.path))) {
+  // Inspect BOTH uncollapsed and dot-collapsed routes so `/checkout/..;x=1` and `/cashier%2f..` cannot pop sensitive segments!
+  if (
+    CHECKOUT_SEGMENT_RX.test(canonPath.rawPath) ||
+    CHECKOUT_SEGMENT_RX.test(canonPath.path) ||
+    (canonHash.rawPath && CHECKOUT_SEGMENT_RX.test(canonHash.rawPath)) ||
+    (canonHash.path && CHECKOUT_SEGMENT_RX.test(canonHash.path))
+  ) {
     return {
       allowed: false,
       code: 'PAYMENT_PATH',
