@@ -1,0 +1,39 @@
+name: Cross-Platform CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    name: Test & Daemon Smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run unit, protocol & guardrail tests
+        run: npm test
+
+      - name: CLI setup, daemon start/health/stop smoke test
+        shell: bash
+        env:
+          CHROME_LIVE_PORT: "28496"
+          CHROME_LIVE_HOME: ${{ runner.temp }}/chrome-live-ci-home
+        run: |
+          node ./bin/chrome-live.mjs token > /dev/null
+          node ./bin/chrome-live.mjs start
+          node ./bin/chrome-live.mjs health
+          node ./bin/chrome-live.mjs playbook status
+          node ./bin/chrome-live.mjs stop

@@ -1,12 +1,16 @@
 # Chrome Live (for Antigravity)
 
-[中文文档](./README.zh-CN.md) · **License: GPL-3.0-only** · **Zero External Dependencies**
+[![Cross-Platform CI](https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml/badge.svg)](https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml) · [中文文档](./README.zh-CN.md) · **License: GPL-3.0-only** · **Zero External Dependencies**
 
 > **Disclaimer:** Independent community project built for the Google Antigravity developer ecosystem. Not affiliated with, endorsed by, or sponsored by Google LLC or Meta Platforms, Inc.
 
 **Chrome Live (for Antigravity)** connects Antigravity (and any CLI / MCP-capable coding agent) directly to **your own everyday Chrome or Edge profile** over a strictly local zero-dependency Node.js bridge (`127.0.0.1:28196`).
 
-Instead of launching a blank, logged-out sandboxed browser that triggers anti-bot captchas or forces repeated logins, you can either **share a single signed-in tab on demand** (`Alt+Shift+L`) or let your agent work quietly inside **collapsed background tab groups** while watching a live preview stream in Antigravity's right-hand side pane.
+Instead of launching a blank, logged-out sandboxed browser that triggers anti-bot captchas or forces repeated logins, you can either **share a single signed-in tab on demand** (`Alt+Shift+L` / `Option+Shift+L` on macOS) or let your agent work quietly inside **collapsed background tab groups** while interacting through the built-in **Antigravity MCP App (SEP-1865)** inline in chat, docked in the side pane, or full-page from the sidebar.
+
+<p align="center">
+  <img src="./docs/demo.gif" alt="Chrome Live for Antigravity live demo: single-roundtrip batch, inline MCP App visual pick & relay, and local financial guardrails" width="880" />
+</p>
 
 ---
 

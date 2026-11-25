@@ -1,12 +1,16 @@
 # Chrome Live (for Antigravity)
 
-[English Documentation](./README.md) · **开源协议：GPL-3.0-only** · **纯 Node.js 标准库零外部依赖**
+[![Cross-Platform CI](https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml/badge.svg)](https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml) · [English Documentation](./README.md) · **开源协议：GPL-3.0-only** · **纯 Node.js 标准库零外部依赖**
 
 > **独立社区项目声明：** 本项目为面向 Google Antigravity 开发者社区的独立开源工具，与 Google LLC 或 Meta Platforms, Inc. 无任何隶属、官方背书或赞助关系。
 
 **Chrome Live (for Antigravity)** 通过纯本地、零第三方依赖的 Node.js 桥接服务（`127.0.0.1:28196`），让 Antigravity（以及 Claude Code、Codex、OpenCode 等任意支持 CLI 或 MCP 的智能体）直接复用**你日常已登录的主力 Chrome / Edge 浏览器**。
 
-无需再忍受空白无 Cookie 的沙箱浏览器反复弹验证码或每次弹远程调试 `Allow` 授权框：你可以随时按 `Alt+Shift+L` **将当前已登录标签页一键接管给 Agent 操作**，也可以让它在**当前窗口折叠的后台彩色标签组**里静默查资料，同时在 Antigravity 右侧分栏实时观看网页画面流。
+无需再忍受空白无 Cookie 的沙箱浏览器反复弹验证码或每次弹远程调试 `Allow` 授权框：你可以随时按 `Alt+Shift+L`（macOS 为 `Option+Shift+L`）**将当前已登录标签页一键接管给 Agent 操作**，也可以让它在**当前窗口折叠的后台彩色标签组**里静默查资料，同时直接在内置 **Antigravity MCP App（SEP-1865）** 的聊天流内联画框、右侧分屏或左侧全局栏里同屏观看与接力操控。
+
+<p align="center">
+  <img src="./docs/demo.gif" alt="Chrome Live for Antigravity 实操演示：单轮 batch 连招、内联 MCP App 圈选与副屏接力、本地金融护栏" width="880" />
+</p>
 
 ---
 
