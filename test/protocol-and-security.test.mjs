@@ -2447,6 +2447,26 @@ test('Blind-audit round-3 regressions: matrix/encoded dot-segment checkout bypas
   }
 });
 
+test('Sub-frame guardrail allows passive 0x0 Stripe anti-fraud beacons on community forums while blocking real payment Elements & Checkout iframes', () => {
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+  const fnMatch = swSource.match(/function isPassiveTelemetrySubframeUrl\(rawUrl\)[\s\S]*?\n\}/);
+  assert.ok(fnMatch, 'Expected isPassiveTelemetrySubframeUrl in service-worker.js');
+  const isPassive = vm.runInNewContext(`(${fnMatch[0]})`, { URL });
+
+  // Passive Discourse / forum background SDK beacons MUST be exempted on sub-frames
+  assert.equal(isPassive('https://js.stripe.com/v3/m-outer-3437aaddcdf6922d623e172c2d6f9278.html'), true);
+  assert.equal(isPassive('https://js.stripe.com/v3/controller-abc123def456.html'), true);
+  assert.equal(isPassive('https://m.stripe.network/inner.html'), true);
+
+  // Real interactive payment Elements, 3DS hooks, and Checkout frames MUST NEVER be exempted
+  assert.equal(isPassive('https://js.stripe.com/v3/elements-inner-card-19066928f2ed1ba3ffada645e45f5b50.html'), false);
+  assert.equal(isPassive('https://js.stripe.com/v3/elements-inner-payment-abc123.html'), false);
+  assert.equal(isPassive('https://js.stripe.com/v3/authorize-with-url-inner.html'), false);
+  assert.equal(isPassive('https://checkout.stripe.com/c/pay/cs_live_123'), false);
+  assert.equal(isPassive('https://hooks.stripe.com/three_d_secure_2_hosted'), false);
+  assert.equal(isPassive('http://m.stripe.network/inner.html'), false, 'Plain HTTP must never be exempted');
+});
+
 test('Blind-audit round-4 regressions: quote-aware CSS comment/pseudo lexer, batch privileged-action allowlist, Shadow DOM Web Component OTP host-chain block, single-tab post-release late frame drop, released-tab syncHudNow guard, SPA hash/base64 token redaction & CORP/Sec-Fetch-Site isolation', async () => {
   const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
 
@@ -2656,6 +2676,26 @@ test('Blind-audit round-4 regressions: quote-aware CSS comment/pseudo lexer, bat
     await daemon.close();
     fs.rmSync(tempStateDir, { recursive: true, force: true });
   }
+});
+
+test('Sub-frame guardrail allows passive 0x0 Stripe anti-fraud beacons on community forums while blocking real payment Elements & Checkout iframes', () => {
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+  const fnMatch = swSource.match(/function isPassiveTelemetrySubframeUrl\(rawUrl\)[\s\S]*?\n\}/);
+  assert.ok(fnMatch, 'Expected isPassiveTelemetrySubframeUrl in service-worker.js');
+  const isPassive = vm.runInNewContext(`(${fnMatch[0]})`, { URL });
+
+  // Passive Discourse / forum background SDK beacons MUST be exempted on sub-frames
+  assert.equal(isPassive('https://js.stripe.com/v3/m-outer-3437aaddcdf6922d623e172c2d6f9278.html'), true);
+  assert.equal(isPassive('https://js.stripe.com/v3/controller-abc123def456.html'), true);
+  assert.equal(isPassive('https://m.stripe.network/inner.html'), true);
+
+  // Real interactive payment Elements, 3DS hooks, and Checkout frames MUST NEVER be exempted
+  assert.equal(isPassive('https://js.stripe.com/v3/elements-inner-card-19066928f2ed1ba3ffada645e45f5b50.html'), false);
+  assert.equal(isPassive('https://js.stripe.com/v3/elements-inner-payment-abc123.html'), false);
+  assert.equal(isPassive('https://js.stripe.com/v3/authorize-with-url-inner.html'), false);
+  assert.equal(isPassive('https://checkout.stripe.com/c/pay/cs_live_123'), false);
+  assert.equal(isPassive('https://hooks.stripe.com/three_d_secure_2_hosted'), false);
+  assert.equal(isPassive('http://m.stripe.network/inner.html'), false, 'Plain HTTP must never be exempted');
 });
 
 test('Blind-audit round-5 regressions: MCP batch screenshot & playbook opt-in lock, shareTab/captureQuickFrame embedded frame guardrails, AntD sibling/split-OTP/token typing block, literal %25 vs 4x-encoding, query-value/punctuation URL redaction, inline UI sole-tab release unlock, audit wipe on rotation & pre-buffer HTTP sig check', async () => {
@@ -3130,4 +3170,24 @@ test('Blind-audit round-5 regressions: MCP batch screenshot & playbook opt-in lo
     await daemon.close();
     fs.rmSync(tempStateDir, { recursive: true, force: true });
   }
+});
+
+test('Sub-frame guardrail allows passive 0x0 Stripe anti-fraud beacons on community forums while blocking real payment Elements & Checkout iframes', () => {
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+  const fnMatch = swSource.match(/function isPassiveTelemetrySubframeUrl\(rawUrl\)[\s\S]*?\n\}/);
+  assert.ok(fnMatch, 'Expected isPassiveTelemetrySubframeUrl in service-worker.js');
+  const isPassive = vm.runInNewContext(`(${fnMatch[0]})`, { URL });
+
+  // Passive Discourse / forum background SDK beacons MUST be exempted on sub-frames
+  assert.equal(isPassive('https://js.stripe.com/v3/m-outer-3437aaddcdf6922d623e172c2d6f9278.html'), true);
+  assert.equal(isPassive('https://js.stripe.com/v3/controller-abc123def456.html'), true);
+  assert.equal(isPassive('https://m.stripe.network/inner.html'), true);
+
+  // Real interactive payment Elements, 3DS hooks, and Checkout frames MUST NEVER be exempted
+  assert.equal(isPassive('https://js.stripe.com/v3/elements-inner-card-19066928f2ed1ba3ffada645e45f5b50.html'), false);
+  assert.equal(isPassive('https://js.stripe.com/v3/elements-inner-payment-abc123.html'), false);
+  assert.equal(isPassive('https://js.stripe.com/v3/authorize-with-url-inner.html'), false);
+  assert.equal(isPassive('https://checkout.stripe.com/c/pay/cs_live_123'), false);
+  assert.equal(isPassive('https://hooks.stripe.com/three_d_secure_2_hosted'), false);
+  assert.equal(isPassive('http://m.stripe.network/inner.html'), false, 'Plain HTTP must never be exempted');
 });

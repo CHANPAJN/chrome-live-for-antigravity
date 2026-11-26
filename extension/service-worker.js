@@ -1608,12 +1608,40 @@ function assertStillActiveAndUnpaused(entry) {
   }
 }
 
+// Passive 0x0 SDK anti-fraud/telemetry beacons loaded globally on non-payment community sites (e.g. Discourse / linux.do).
+// Only applied to non-top-level sub-frames (frameId !== 0); interactive payment inputs (elements-inner-*, checkout.*, hooks.*) remain strictly blocked.
+function isPassiveTelemetrySubframeUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return false;
+  let parsed;
+  try {
+    parsed = new URL(rawUrl.trim());
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:') return false;
+  const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
+  const p = parsed.pathname || '';
+  if ((host === 'm.stripe.network' || host === 'm.stripe.com') && /^\/(?:inner\.html)?$/i.test(p)) {
+    return true;
+  }
+  if (
+    host === 'js.stripe.com' &&
+    /^\/v[23]\/(?:m-outer-[A-Za-z0-9._-]+\.html|controller-[A-Za-z0-9._-]+\.html|hcaptcha-invisible-[A-Za-z0-9._-]+\.html|fingerprinted\/)/i.test(
+      p
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
 async function inspectEmbeddedFramesSafety(tabId) {
   if (chrome.webNavigation?.getAllFrames) {
     const navFrames = await chrome.webNavigation.getAllFrames({ tabId }).catch(() => null);
     if (Array.isArray(navFrames)) {
       for (const nf of navFrames) {
         if (!nf || !nf.url || nf.url === 'about:blank' || nf.errorOccurred) continue;
+        if (nf.frameId !== 0 && isPassiveTelemetrySubframeUrl(nf.url)) continue;
         const nfSafety = checkTabUrlAllowed(nf.url);
         if (!nfSafety.allowed) {
           return {
@@ -2558,6 +2586,7 @@ async function executeBridgeRpc(method, params) {
               if (Array.isArray(subFrames)) {
                 for (const sf of subFrames) {
                   if (sf?.url && sf.url !== 'about:blank' && !sf.errorOccurred) {
+                    if (sf.frameId !== 0 && isPassiveTelemetrySubframeUrl(sf.url)) continue;
                     const sfCheck = checkTabUrlAllowed(sf.url);
                     if (!sfCheck.allowed) {
                       return { url: targetUrl, error: `[GUARDRAIL] Embedded protected frame: ${sfCheck.reason}` };
@@ -4263,6 +4292,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 async function handleWebNavGuardrail(details) {
   if (!details || typeof details.tabId !== 'number' || !managedTabs.has(details.tabId)) return;
   if (!details.url || details.url === 'about:blank') return;
+  if (details.frameId !== 0 && isPassiveTelemetrySubframeUrl(details.url)) return;
   const safety = checkTabUrlAllowed(details.url);
   if (!safety.allowed) {
     const reason =
