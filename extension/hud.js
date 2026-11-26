@@ -4,7 +4,7 @@
   if (window.top !== window) return;
 
   const REGISTRY_SYMBOL = '__chromeLiveHudController__';
-  const CURRENT_HUD_REV = 16;
+  const CURRENT_HUD_REV = 17;
   const HOST_Z_MARKER = '2147483647';
 
   function isExtensionContextValid() {
@@ -54,6 +54,7 @@
   const HOLD_UNLOCK_MS = 3000;
   const FOREGROUND_AUTO_COLLAPSE_MS = 10000; // Wait full 10s in foreground before gently tucking left
   const DEFAULT_BOTTOM_OFFSET_PX = 84; // Clear of inline screencast bottom-left `LIVE · 0 Token` chip
+  const ORBIT_DURATION_CSS = '3.6s'; // Medium balanced 360-degree orbit speed
   const RING_CIRCUMFERENCE = 2 * Math.PI * 20; // r = 20 -> ~125.66
   // Original rounded collaboration dart silhouette (zero overlap with classic OS arrow paths)
   const COLLAB_DART_PATH =
@@ -200,51 +201,49 @@
       color: #1d4ed8;
     }
 
-    /* Top 3px Solid Director Line (Zero 4-side blur glow) */
-    .director-topline {
+    /* Scheme B: 3.5px Dual-Beam Symmetric 360-Degree Full-Perimeter Orbit */
+    .perimeter-orbit {
       position: fixed;
-      top: 0;
-      left: 0;
-      right: 0;
-      height: 3px;
-      pointer-events: none;
-      overflow: hidden;
-      opacity: 0;
-      background: rgba(37, 99, 235, 0.20);
-      transition: opacity 180ms ease, background-color 200ms ease;
-    }
-    .director-topline-runner {
-      width: 36%;
+      inset: 0;
+      width: 100%;
       height: 100%;
-      background: #2563eb;
-      transform: translateX(-100%);
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 200ms ease;
     }
-    .director-topline[data-state="working"] {
+    .perimeter-orbit[data-state="working"],
+    .perimeter-orbit[data-state="shared"],
+    .perimeter-orbit[data-state="paused"] {
       opacity: 1;
-      background: rgba(37, 99, 235, 0.22);
     }
-    .director-topline[data-state="working"] .director-topline-runner {
-      background: #2563eb;
-      animation: cliveDirectorSlide 1.95s cubic-bezier(0.4, 0, 0.2, 1) infinite;
-    }
-    .director-topline[data-state="shared"] {
-      opacity: 1;
-      height: 2.5px;
-      background: #059669;
-    }
-    .director-topline[data-state="shared"] .director-topline-runner {
+    .orbit-working-group,
+    .orbit-shared-rect,
+    .orbit-paused-rect {
       display: none;
     }
-    .director-topline[data-state="paused"] {
-      opacity: 1;
-      background: #d97706;
+    .perimeter-orbit[data-state="working"] .orbit-working-group {
+      display: inline;
     }
-    .director-topline[data-state="paused"] .director-topline-runner {
-      display: none;
+    .perimeter-orbit[data-state="shared"] .orbit-shared-rect {
+      display: inline;
     }
-    @keyframes cliveDirectorSlide {
-      0% { transform: translateX(-105%); }
-      100% { transform: translateX(285%); }
+    .perimeter-orbit[data-state="paused"] .orbit-paused-rect {
+      display: inline;
+    }
+    .orbit-beam-anim {
+      animation: clivePerimeterOrbit ${ORBIT_DURATION_CSS} linear infinite;
+    }
+    @keyframes clivePerimeterOrbit {
+      from { stroke-dashoffset: 1000; }
+      to { stroke-dashoffset: 0; }
+    }
+    @keyframes cliveLockRingSpin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+    .lock-ring-spin {
+      transform-origin: 12px 12px;
+      animation: cliveLockRingSpin ${ORBIT_DURATION_CSS} linear infinite;
     }
 
     /* 54px Left-Edge Tally Dock Above Screencast Chip (bottom: 84px) */
@@ -570,10 +569,9 @@
         --collapse-slow: 220ms ease;
         --spring-pop: 140ms ease;
       }
-      .director-topline[data-state="working"] .director-topline-runner {
+      .orbit-beam-anim,
+      .lock-ring-spin {
         animation: none;
-        width: 100%;
-        transform: none;
       }
     }
 
@@ -584,17 +582,32 @@
     }
   `;
 
-  function buildLockIconNodes(svgNs, isOpen) {
-    // Precision 24x24 Circle-Padlock: crisp outer ring + solid rounded lock body + shackle + central keyhole dot
+  function buildLockIconNodes(svgNs, isOpen, isSpinning) {
+    // Precision 24x24 Circle-Padlock with synced 360-degree rotating outer arc when actively working
     const frag = document.createDocumentFragment();
 
-    const outerRing = document.createElementNS(svgNs, 'circle');
-    outerRing.setAttribute('cx', '12');
-    outerRing.setAttribute('cy', '12');
-    outerRing.setAttribute('r', '10.2');
-    outerRing.setAttribute('fill', 'rgba(255, 255, 255, 0.14)');
-    outerRing.setAttribute('stroke', 'currentColor');
-    outerRing.setAttribute('stroke-width', '1.9');
+    const baseRing = document.createElementNS(svgNs, 'circle');
+    baseRing.setAttribute('cx', '12');
+    baseRing.setAttribute('cy', '12');
+    baseRing.setAttribute('r', '10.2');
+    baseRing.setAttribute('fill', 'rgba(255, 255, 255, 0.14)');
+    baseRing.setAttribute('stroke', isSpinning ? 'rgba(255, 255, 255, 0.34)' : 'currentColor');
+    baseRing.setAttribute('stroke-width', '1.9');
+    baseRing.setAttribute('data-base-ring', 'true');
+
+    const spinArc = document.createElementNS(svgNs, 'circle');
+    spinArc.setAttribute('cx', '12');
+    spinArc.setAttribute('cy', '12');
+    spinArc.setAttribute('r', '10.2');
+    spinArc.setAttribute('fill', 'none');
+    spinArc.setAttribute('stroke', 'currentColor');
+    spinArc.setAttribute('stroke-width', '2.15');
+    spinArc.setAttribute('stroke-linecap', 'round');
+    spinArc.setAttribute('stroke-dasharray', isSpinning ? '28 36' : '0 66');
+    if (isSpinning) {
+      spinArc.setAttribute('class', 'lock-ring-spin');
+    }
+    spinArc.setAttribute('data-spin-arc', 'true');
 
     const shackle = document.createElementNS(svgNs, 'path');
     shackle.setAttribute(
@@ -623,7 +636,7 @@
     keyhole.setAttribute('fill', isOpen ? '#d97706' : '#2563eb');
     keyhole.setAttribute('data-keyhole', 'true');
 
-    frag.append(outerRing, shackle, bodyRect, keyhole);
+    frag.append(baseRing, spinArc, shackle, bodyRect, keyhole);
     return frag;
   }
 
@@ -736,12 +749,84 @@
       this.shieldEl = document.createElement('div');
       this.shieldEl.className = 'lock-shield';
 
-      // Top 3px Solid Director Line
-      this.borderEl = document.createElement('div');
-      this.borderEl.className = 'director-topline';
-      const runnerEl = document.createElement('div');
-      runnerEl.className = 'director-topline-runner';
-      this.borderEl.appendChild(runnerEl);
+      // Full-Perimeter 3.5px Dual-Beam 360-Degree Orbit SVG Overlay (stroke-width 7 on edge = exact 3.5px inside viewport)
+      this.borderEl = document.createElementNS(svgNs, 'svg');
+      this.borderEl.setAttribute('class', 'perimeter-orbit');
+      this.borderEl.setAttribute('preserveAspectRatio', 'none');
+
+      const workingGroup = document.createElementNS(svgNs, 'g');
+      workingGroup.setAttribute('class', 'orbit-working-group');
+
+      const baseTrack = document.createElementNS(svgNs, 'rect');
+      baseTrack.setAttribute('x', '0');
+      baseTrack.setAttribute('y', '0');
+      baseTrack.setAttribute('width', '100%');
+      baseTrack.setAttribute('height', '100%');
+      baseTrack.setAttribute('fill', 'none');
+      baseTrack.setAttribute('stroke', 'rgba(37, 99, 235, 0.22)');
+      baseTrack.setAttribute('stroke-width', '7');
+
+      const softHalo = document.createElementNS(svgNs, 'rect');
+      softHalo.setAttribute('x', '0');
+      softHalo.setAttribute('y', '0');
+      softHalo.setAttribute('width', '100%');
+      softHalo.setAttribute('height', '100%');
+      softHalo.setAttribute('pathLength', '1000');
+      softHalo.setAttribute('fill', 'none');
+      softHalo.setAttribute('stroke', 'rgba(59, 130, 246, 0.36)');
+      softHalo.setAttribute('stroke-width', '9.5');
+      softHalo.setAttribute('stroke-dasharray', '230 270 230 270');
+      softHalo.setAttribute('class', 'orbit-beam-anim');
+
+      const primaryBeam = document.createElementNS(svgNs, 'rect');
+      primaryBeam.setAttribute('x', '0');
+      primaryBeam.setAttribute('y', '0');
+      primaryBeam.setAttribute('width', '100%');
+      primaryBeam.setAttribute('height', '100%');
+      primaryBeam.setAttribute('pathLength', '1000');
+      primaryBeam.setAttribute('fill', 'none');
+      primaryBeam.setAttribute('stroke', '#2563eb');
+      primaryBeam.setAttribute('stroke-width', '7');
+      primaryBeam.setAttribute('stroke-linecap', 'round');
+      primaryBeam.setAttribute('stroke-dasharray', '150 350 150 350');
+      primaryBeam.setAttribute('class', 'orbit-beam-anim');
+
+      const brightCore = document.createElementNS(svgNs, 'rect');
+      brightCore.setAttribute('x', '0');
+      brightCore.setAttribute('y', '0');
+      brightCore.setAttribute('width', '100%');
+      brightCore.setAttribute('height', '100%');
+      brightCore.setAttribute('pathLength', '1000');
+      brightCore.setAttribute('fill', 'none');
+      brightCore.setAttribute('stroke', '#60a5fa');
+      brightCore.setAttribute('stroke-width', '5');
+      brightCore.setAttribute('stroke-linecap', 'round');
+      brightCore.setAttribute('stroke-dasharray', '45 455 45 455');
+      brightCore.setAttribute('class', 'orbit-beam-anim');
+
+      workingGroup.append(baseTrack, softHalo, primaryBeam, brightCore);
+
+      const sharedRect = document.createElementNS(svgNs, 'rect');
+      sharedRect.setAttribute('x', '0');
+      sharedRect.setAttribute('y', '0');
+      sharedRect.setAttribute('width', '100%');
+      sharedRect.setAttribute('height', '100%');
+      sharedRect.setAttribute('fill', 'none');
+      sharedRect.setAttribute('stroke', 'rgba(5, 150, 105, 0.62)');
+      sharedRect.setAttribute('stroke-width', '6');
+      sharedRect.setAttribute('class', 'orbit-shared-rect');
+
+      const pausedRect = document.createElementNS(svgNs, 'rect');
+      pausedRect.setAttribute('x', '0');
+      pausedRect.setAttribute('y', '0');
+      pausedRect.setAttribute('width', '100%');
+      pausedRect.setAttribute('height', '100%');
+      pausedRect.setAttribute('fill', 'none');
+      pausedRect.setAttribute('stroke', '#d97706');
+      pausedRect.setAttribute('stroke-width', '7');
+      pausedRect.setAttribute('class', 'orbit-paused-rect');
+
+      this.borderEl.append(workingGroup, sharedRect, pausedRect);
 
       this.rippleLayer = document.createElement('div');
       this.rippleLayer.className = 'ripple-layer';
@@ -810,8 +895,8 @@
       this.lockSvgEl = document.createElementNS(svgNs, 'svg');
       this.lockSvgEl.setAttribute('viewBox', '0 0 24 24');
       this.lockSvgEl.setAttribute('class', 'tally-lock-svg');
-      this.lockSvgEl.appendChild(buildLockIconNodes(svgNs, false));
-      this._lastRenderedLockOpen = false;
+      this.lockSvgEl.appendChild(buildLockIconNodes(svgNs, false, true));
+      this._lastRenderedLockKey = 'false:true';
       this._lastRenderedLockBg = '#2563eb';
 
       this.tallyTextSpan = document.createElement('span');
@@ -1457,7 +1542,7 @@
       });
     }
 
-    _syncLockIconGraphic(isOpen, effectiveMode) {
+    _syncLockIconGraphic(isOpen, isSpinning, effectiveMode) {
       const keyholeColor =
         effectiveMode === 'confirm'
           ? '#dc2626'
@@ -1466,9 +1551,10 @@
             : effectiveMode === 'shared'
               ? '#059669'
               : '#2563eb';
-      if (this._lastRenderedLockOpen !== isOpen) {
-        this.lockSvgEl.replaceChildren(buildLockIconNodes(this._svgNs, isOpen));
-        this._lastRenderedLockOpen = isOpen;
+      const stateKey = `${isOpen}:${isSpinning}`;
+      if (this._lastRenderedLockKey !== stateKey) {
+        this.lockSvgEl.replaceChildren(buildLockIconNodes(this._svgNs, isOpen, isSpinning));
+        this._lastRenderedLockKey = stateKey;
         this._lastRenderedLockBg = '';
       }
       if (this._lastRenderedLockBg !== keyholeColor) {
@@ -1514,7 +1600,7 @@
       const side = this._state.dock === 'right' ? 'right' : 'left';
       this.capsuleEl.dataset.side = side;
       this.capsuleEl.style.bottom = `${this._state.bottomPx}px`;
-      this.borderEl.dataset.state = this._state.mode;
+      this.borderEl.setAttribute('data-state', this._state.mode);
 
       const effectiveMode = this._state.confirmingDisconnect ? 'confirm' : this._state.mode;
       this.tallyTextSpan.textContent = isPaused
@@ -1522,7 +1608,7 @@
         : this._state.mode === 'shared'
           ? t.badgeShared
           : t.badgeLive;
-      this._syncLockIconGraphic(isPaused, effectiveMode);
+      this._syncLockIconGraphic(isPaused, isLockedWorking, effectiveMode);
       this.pauseBtn.title = isPaused ? t.resumeTip : t.pauseTip;
       this.pauseBtn.dataset.mode = effectiveMode;
 

@@ -4530,7 +4530,8 @@ test('27. Top-50 security & real-world forum hardening: cloud metadata/0.0.0.0 S
   assert.equal(hudSource.includes('island-shell'), false, 'Dynamic-island black pill must be removed');
   assert.match(hudSource, /edge-tally-dock/);
   assert.match(hudSource, /drawer-grid/, 'CSS Grid 1fr<->0fr must be used so long text never truncates buttons');
-  assert.match(hudSource, /director-topline/);
+  assert.match(hudSource, /perimeter-orbit/, 'Full-perimeter 3.5px dual-beam 360-degree orbit SVG must be present');
+  assert.match(hudSource, /lock-ring-spin/, 'Lock outer ring must rotate in sync during active working mode');
   assert.match(hudSource, /const HOLD_UNLOCK_MS = 3000;/, 'Original 3s hold-to-unlock duration must be preserved');
   assert.match(hudSource, /const FOREGROUND_AUTO_COLLAPSE_MS = 10000;/, '10s foreground-only gentle left-collapse timer must be preserved');
   assert.match(hudSource, /cursor:\s*not-allowed;/, 'Original circle-slash lock shield cursor must be preserved');
