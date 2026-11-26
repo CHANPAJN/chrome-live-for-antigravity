@@ -597,13 +597,15 @@ const SENSITIVE_FILE_DIR_RX =
 const SENSITIVE_FILE_NAME_RX =
   /^(?:(?!.*\.pub$)id_(?:rsa|ed25519|ecdsa|dsa)(?:$|[._-].+)|authorized_keys|known_hosts|auth\.token|site-playbooks\.json|daemon\.pid|spawn\.(?:lock|cooldown)|\.local-runtime\.json|agent_vault\.enc|accessTokens\.json|\.env(?:\..+)?|\.npmrc|\.pypirc|\.netrc|\.git-credentials|kubeconfig|credentials(?:\.json)?|application_default_credentials\.json|Local\s+State|Cookies(?:-journal)?|cookies\.sqlite|key[34]\.db|cert9\.db|logins\.json|Login Data(?:\s+For\s+Account)?|Web Data|.*\.(?:pem|key|p12|pfx|kdbx|ovpn|jks|keystore|gpg|age)|.*\.tfstate(?:\.backup)?)$/i;
 
+const nativeRealpathSync = fs.realpathSync.native || fs.realpathSync;
+
 function resolveCanonicalPath(targetPath) {
   try {
-    return fs.realpathSync(targetPath);
+    return nativeRealpathSync(targetPath);
   } catch {
     // If file does not exist yet or symlink is dangling, still canonicalize its parent directory
     try {
-      const parentReal = fs.realpathSync(path.dirname(targetPath));
+      const parentReal = nativeRealpathSync(path.dirname(targetPath));
       return path.join(parentReal, path.basename(targetPath));
     } catch {
       return targetPath;
@@ -635,7 +637,7 @@ function parseAllowedUploadDirEntries(explicitDirs, stateDirOverride = '') {
   const entries = [];
   for (const raw of rawList) {
     const trimmed = expandLeadingTilde(String(raw || ''));
-    if (!trimmed) continue;
+    if (!trimmed || /^[;:\s]+$/.test(trimmed)) continue;
     const abs = path.resolve(trimmed);
     entries.push({ rawDir: abs, canonDir: resolveCanonicalPath(abs) });
   }

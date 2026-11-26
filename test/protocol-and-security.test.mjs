@@ -688,7 +688,7 @@ test('Upload guardrails block credential keys, restrict default uploads to stagi
     fs.mkdirSync(stagingDir, { recursive: true });
     const stagedIcon = path.join(stagingDir, 'staged-icon48.png');
     fs.copyFileSync(outsideIcon, stagedIcon);
-    const expectedRealIcon = fs.realpathSync(stagedIcon);
+    const expectedRealIcon = (fs.realpathSync.native || fs.realpathSync)(stagedIcon);
 
     const safeRes = evaluateUploadFileSafety(stagedIcon);
     assert.equal(safeRes.allowed, true);
@@ -1674,6 +1674,8 @@ test('Blind-audit round-1 regressions: multi-tab release isolation, paused frame
     fs.mkdirSync(stagingDir, { recursive: true });
     const stagedImg = path.join(stagingDir, 'ok.png');
     fs.writeFileSync(stagedImg, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    assert.equal(evaluateUploadFileSafety(stagedImg).allowed, true);
+    process.env.CHROME_LIVE_UPLOAD_DIR = ' : : ';
     assert.equal(evaluateUploadFileSafety(stagedImg).allowed, true);
 
     // NTFS Alternate Data Stream syntax & trailing dot bypasses must be rejected before fs access
