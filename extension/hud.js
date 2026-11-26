@@ -4,7 +4,7 @@
   if (window.top !== window) return;
 
   const REGISTRY_SYMBOL = '__chromeLiveHudController__';
-  const CURRENT_HUD_REV = 10;
+  const CURRENT_HUD_REV = 11;
   const HOST_Z_MARKER = '2147483647';
 
   function isExtensionContextValid() {
@@ -23,6 +23,7 @@
   }
 
   let inheritedDock = '';
+  let inheritedTopPct = null;
   if (window[REGISTRY_SYMBOL]) {
     if (
       window[REGISTRY_SYMBOL]._hudRev === CURRENT_HUD_REV &&
@@ -34,6 +35,7 @@
     if (typeof window[REGISTRY_SYMBOL].destroy === 'function') {
       try {
         inheritedDock = window[REGISTRY_SYMBOL]._state?.dock || '';
+        inheritedTopPct = window[REGISTRY_SYMBOL]._state?.topPct ?? null;
         window[REGISTRY_SYMBOL].destroy();
       } catch {}
     }
@@ -49,50 +51,56 @@
     }
   } catch {}
 
-  const HOLD_UNLOCK_MS = 3000;
-  const RING_CIRCUMFERENCE = 2 * Math.PI * 20; // r = 20 -> ~125.66
+  const DBL_TAP_WINDOW_MS = 420;
+  const DBL_TAP_MAX_DIST_PX = 36;
   // Original rounded collaboration dart silhouette (zero overlap with classic OS arrow paths)
   const COLLAB_DART_PATH =
     'M2.4 2.4 L19.2 8.512 C20.9 9.1 21.0 11.573 19.3 12.2 L12.7 15.057 L9.9 21.647 C9.2 23.2 6.8 23.1 6.2 21.4 Z';
 
   const DICT = {
     zh: {
-      dragTip: '按住拖动可吸附至页面顶部、底部或四角',
-      ready: '已就绪',
-      pausedByUser: '人工接管中',
-      resumed: '已恢复锁定操控',
-      pause: '暂停',
-      resume: '继续',
-      closeTip: '释放此标签页',
-      confirmAsk: '将 Chrome Live 与此标签页断开连接？',
+      dragTip: '上下拖动调整侧栏高度，或拖至左/右边缘贴壁停靠',
+      ready: '待命就绪',
+      pausedByUser: '手动接管中',
+      resumed: '已恢复自动执行',
+      badgeLive: 'LIVE',
+      badgeHold: 'HOLD',
+      badgeShared: 'LIVE',
+      pauseTip: '点击立即切为手动模式（也可双击页面或按 Esc）',
+      resumeTip: '点击恢复 AI 自动操控',
+      disconnectLabel: '断开',
+      closeTip: '释放此标签页控制权（不关闭网页）',
+      confirmAsk: '断开此页受控？',
       cancelBtn: '取消',
-      disconnectBtn: '断开连接',
-      lockedTapHint: '已防误触锁定 · 按住左键 3 秒解锁',
-      holdingHint: '继续按住解锁',
-      cursorClick: 'Live · 点击',
-      cursorType: 'Live · 输入',
-      cursorUpload: 'Live · 上传',
-      cursorScroll: 'Live · 滚动',
-      cursorMove: 'Live'
+      disconnectBtn: '确认断开',
+      lockedTapHint: '双击页面或按 Esc 立即切手动',
+      cursorClick: '点击',
+      cursorType: '输入',
+      cursorUpload: '上传',
+      cursorScroll: '滚动',
+      cursorMove: '定位'
     },
     en: {
-      dragTip: 'Drag to snap HUD to top, bottom, or corners',
+      dragTip: 'Drag vertically to reposition, or drag across to snap left/right edge',
       ready: 'Ready',
-      pausedByUser: 'Manual control',
-      resumed: 'Resumed automation',
-      pause: 'Pause',
-      resume: 'Resume',
-      closeTip: 'Detach this tab',
-      confirmAsk: 'Disconnect Chrome Live from this tab?',
+      pausedByUser: 'Manual mode',
+      resumed: 'Automation resumed',
+      badgeLive: 'LIVE',
+      badgeHold: 'HOLD',
+      badgeShared: 'LIVE',
+      pauseTip: 'Switch to manual control (or double-click page / press Esc)',
+      resumeTip: 'Resume AI control',
+      disconnectLabel: 'Detach',
+      closeTip: 'Detach this tab without closing it',
+      confirmAsk: 'Detach this tab?',
       cancelBtn: 'Cancel',
-      disconnectBtn: 'Disconnect',
-      lockedTapHint: 'Page locked · Hold left-click 3s to unlock',
-      holdingHint: 'Hold to unlock',
-      cursorClick: 'Live · Click',
-      cursorType: 'Live · Type',
-      cursorUpload: 'Live · Upload',
-      cursorScroll: 'Live · Scroll',
-      cursorMove: 'Live'
+      disconnectBtn: 'Confirm',
+      lockedTapHint: 'Double-click page or press Esc for manual mode',
+      cursorClick: 'Click',
+      cursorType: 'Type',
+      cursorUpload: 'Upload',
+      cursorScroll: 'Scroll',
+      cursorMove: 'Move'
     }
   };
 
@@ -103,9 +111,9 @@
       inset: 0;
       z-index: 2147483647;
       pointer-events: none;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+      font-family: "Microsoft YaHei UI", "PingFang SC", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
       --spring-width: 440ms linear(0, 0.4479, 0.8864, 1.055, 1.018, 0.998, 1);
-      --spring-pop: 360ms cubic-bezier(0.34, 1.46, 0.64, 1);
+      --spring-pop: 240ms cubic-bezier(0.22, 1, 0.36, 1);
     }
 
     .lock-shield {
@@ -113,7 +121,7 @@
       inset: 0;
       pointer-events: none;
       background: transparent;
-      cursor: not-allowed;
+      cursor: default;
       display: none;
     }
     .lock-shield[data-locked="true"] {
@@ -121,349 +129,238 @@
       pointer-events: auto;
     }
 
-    .aura-border {
+    /* Top 2.5px Solid Director Line (Zero 4-side blur glow) */
+    .director-topline {
       position: fixed;
-      inset: 0;
-      pointer-events: none;
-      box-shadow: inset 0 0 0 2px rgba(14, 165, 233, 0.72), inset 0 0 18px rgba(14, 165, 233, 0.18);
-      transition: opacity 0.25s ease, box-shadow 0.28s ease;
-      opacity: 0;
-    }
-    .aura-border[data-state="working"] {
-      opacity: 1;
-      animation: breatheBorder 2.4s ease-in-out infinite;
-    }
-    .aura-border[data-state="shared"] {
-      opacity: 1;
-      box-shadow: inset 0 0 0 2px rgba(16, 185, 129, 0.56);
-    }
-    .aura-border[data-state="paused"] {
-      opacity: 1;
-      box-shadow: inset 0 0 0 2px rgba(245, 158, 11, 0.68);
-    }
-    @keyframes breatheBorder {
-      0%, 100% {
-        box-shadow: inset 0 0 0 2px rgba(14, 165, 233, 0.52), inset 0 0 12px rgba(14, 165, 233, 0.13);
-      }
-      50% {
-        box-shadow: inset 0 0 0 2.5px rgba(56, 189, 248, 0.88), inset 0 0 22px rgba(14, 165, 233, 0.26);
-      }
-    }
-
-    .hold-badge {
-      position: fixed;
-      left: 0;
       top: 0;
-      translate: -50% -118%;
-      scale: 0.88;
-      display: inline-flex;
-      align-items: center;
-      gap: 9px;
-      padding: 7px 14px 7px 9px;
-      border-radius: 999px;
-      background: rgba(17, 17, 19, 0.94);
-      backdrop-filter: blur(16px) saturate(150%);
-      -webkit-backdrop-filter: blur(16px) saturate(150%);
-      border: 1px solid rgba(255, 255, 255, 0.15);
-      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.42);
-      color: #f4f4f5;
-      font-size: 12px;
-      font-weight: 500;
+      left: 0;
+      right: 0;
+      height: 2.5px;
       pointer-events: none;
+      overflow: hidden;
       opacity: 0;
-      transition: opacity 0.15s ease, scale var(--spring-pop);
-      white-space: nowrap;
+      background: rgba(37, 99, 235, 0.20);
+      transition: opacity 180ms ease, background-color 200ms ease;
     }
-    .hold-badge[data-active="true"] {
+    .director-topline-runner {
+      width: 36%;
+      height: 100%;
+      background: #2563eb;
+      transform: translateX(-100%);
+    }
+    .director-topline[data-state="working"] {
       opacity: 1;
-      scale: 1;
+      background: rgba(37, 99, 235, 0.22);
     }
-    .hold-ring-wrap {
-      position: relative;
-      width: 28px;
-      height: 28px;
-      display: grid;
-      place-items: center;
-      flex-shrink: 0;
+    .director-topline[data-state="working"] .director-topline-runner {
+      background: #2563eb;
+      animation: cliveDirectorSlide 1.95s cubic-bezier(0.4, 0, 0.2, 1) infinite;
     }
-    .hold-ring-svg {
-      width: 28px;
-      height: 28px;
-      transform: rotate(-90deg);
+    .director-topline[data-state="shared"] {
+      opacity: 1;
+      height: 2px;
+      background: #059669;
     }
-    .hold-ring-track {
-      fill: none;
-      stroke: rgba(255, 255, 255, 0.14);
-      stroke-width: 3.2;
+    .director-topline[data-state="shared"] .director-topline-runner {
+      display: none;
     }
-    .hold-ring-bar {
-      fill: none;
-      stroke: #38bdf8;
-      stroke-width: 3.2;
-      stroke-linecap: round;
-      stroke-dasharray: 125.66;
-      stroke-dashoffset: 125.66;
+    .director-topline[data-state="paused"] {
+      opacity: 1;
+      background: #d97706;
     }
-    .hold-sec-num {
-      position: absolute;
-      font-size: 11px;
-      font-weight: 700;
-      color: #ffffff;
+    .director-topline[data-state="paused"] .director-topline-runner {
+      display: none;
+    }
+    @keyframes cliveDirectorSlide {
+      0% { transform: translateX(-105%); }
+      100% { transform: translateX(285%); }
     }
 
-    /* Dynamic Island Full-Pill Shell with Zero-Overhead Spring Width Morph */
-    .island-shell {
+    /* B+C Fusion: Edge-Pinned Magnetic Two-Cell Tally Bookmark Strip */
+    .edge-tally-dock {
       position: fixed;
-      left: 50%;
-      bottom: 18px;
-      translate: -50% 0;
-      scale: 1;
-      height: 42px;
-      max-width: calc(100vw - 28px);
-      border-radius: 999px;
-      background: rgba(15, 15, 18, 0.93);
-      backdrop-filter: blur(18px) saturate(160%);
-      -webkit-backdrop-filter: blur(18px) saturate(160%);
-      box-shadow:
-        0 0 0 1px rgba(255, 255, 255, 0.13),
-        0 10px 28px rgba(0, 0, 0, 0.38),
-        0 2px 6px rgba(0, 0, 0, 0.24);
-      color: #ffffff;
-      font-size: 13px;
+      right: 0;
+      top: 78%;
+      height: 32px;
+      display: inline-flex;
+      align-items: stretch;
+      background: #ffffff;
+      color: #18181b;
+      border: 1px solid #cbd5e1;
+      border-right: none;
+      border-radius: 6px 0 0 6px;
+      box-shadow: 0 6px 20px rgba(15, 23, 42, 0.12), 0 1px 3px rgba(15, 23, 42, 0.06);
+      font-size: 12px;
       line-height: 1;
       pointer-events: auto;
       user-select: none;
       overflow: hidden;
-      will-change: width, scale, opacity;
+      will-change: transform, opacity;
+      transform: translate3d(var(--collapsed-shift, 0px), -50%, 0);
       transition:
-        width var(--spring-width),
-        scale var(--spring-pop),
-        opacity 190ms ease;
+        transform var(--spring-width),
+        opacity 160ms ease,
+        box-shadow 180ms ease;
     }
-    .island-shell[data-hidden="true"] {
+    .edge-tally-dock[data-side="left"] {
+      right: auto;
+      left: 0;
+      border-right: 1px solid #cbd5e1;
+      border-left: none;
+      border-radius: 0 6px 6px 0;
+      flex-direction: row-reverse;
+      transform: translate3d(calc(-1 * var(--collapsed-shift, 0px)), -50%, 0);
+    }
+    .edge-tally-dock[data-expanded="true"],
+    .edge-tally-dock:hover {
+      transform: translate3d(0, -50%, 0);
+      box-shadow: 0 10px 26px rgba(15, 23, 42, 0.16), 0 2px 6px rgba(15, 23, 42, 0.08);
+    }
+    .edge-tally-dock[data-hidden="true"] {
       opacity: 0;
-      scale: 0.84;
       pointer-events: none;
+      transform: translate3d(100%, -50%, 0);
     }
-    .island-shell[data-pressing="true"] {
-      scale: 0.97;
+    .edge-tally-dock[data-side="left"][data-hidden="true"] {
+      transform: translate3d(-100%, -50%, 0);
     }
-    .island-shell[data-dock="top-center"] {
-      bottom: auto;
-      top: 14px;
-      left: 50%;
-      translate: -50% 0;
-    }
-    .island-shell[data-dock="top-right"] {
-      left: auto;
-      bottom: auto;
-      top: 14px;
-      right: 16px;
-      translate: 0 0;
-    }
-    .island-shell[data-dock="bottom-right"] {
-      left: auto;
-      top: auto;
-      bottom: 18px;
-      right: 16px;
-      translate: 0 0;
-    }
-    .island-shell[data-dock="bottom-left"] {
-      right: auto;
-      top: auto;
-      bottom: 18px;
-      left: 16px;
-      translate: 0 0;
-    }
-    .island-shell[data-dock="top-left"] {
-      right: auto;
-      bottom: auto;
-      top: 14px;
-      left: 16px;
-      translate: 0 0;
+    .edge-tally-dock[data-pressing="true"] {
+      box-shadow: 0 12px 28px rgba(37, 99, 235, 0.22);
     }
 
-    .island-track {
+    /* Cell 1 (Always Exposed Tab Ear): Solid LIVE / HOLD Tally Switch */
+    .tally-head-cell {
       display: inline-flex;
-      align-items: center;
-      gap: 9px;
-      height: 42px;
-      padding: 0 7px 0 9px;
-      width: max-content;
-      max-width: calc(100vw - 28px);
-      box-sizing: border-box;
-    }
-
-    .drag-grip {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      cursor: grab;
+      align-items: stretch;
       height: 100%;
       flex-shrink: 0;
     }
-    .drag-grip:active {
-      cursor: grabbing;
-    }
-
-    .orb-badge {
-      width: 24px;
-      height: 24px;
-      border-radius: 50%;
-      background: linear-gradient(135deg, #0ea5e9, #2563eb);
-      box-shadow: 0 0 10px rgba(14, 165, 233, 0.48);
-      display: grid;
-      place-items: center;
-      flex-shrink: 0;
-      transition: background 0.25s ease, box-shadow 0.25s ease, scale var(--spring-pop);
-    }
-    .orb-badge::after {
-      content: "";
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: #ffffff;
-    }
-    .orb-badge[data-state="shared"],
-    .orb-badge[data-state="done"] {
-      background: linear-gradient(135deg, #10b981, #059669);
-      box-shadow: 0 0 10px rgba(16, 185, 129, 0.42);
-    }
-    .orb-badge[data-state="paused"] {
-      background: linear-gradient(135deg, #f59e0b, #d97706);
-      box-shadow: 0 0 10px rgba(245, 158, 11, 0.45);
-    }
-    .orb-badge[data-state="confirm"] {
-      background: linear-gradient(135deg, #ef4444, #dc2626);
-      box-shadow: 0 0 10px rgba(239, 68, 68, 0.45);
-    }
-
-    .copy-group {
+    .tally-mode-btn {
+      appearance: none;
+      border: none;
+      margin: 0;
+      height: 100%;
+      min-width: 50px;
+      padding: 0 9px;
+      background: #2563eb;
+      color: #ffffff;
+      font: 700 11px/1 "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+      letter-spacing: 0.04em;
+      font-variant-numeric: tabular-nums;
+      cursor: pointer;
       display: inline-flex;
       align-items: center;
-      gap: 6px;
-      min-width: 0;
+      justify-content: center;
+      transition: background-color 150ms ease, filter 150ms ease;
+    }
+    .tally-mode-btn:hover {
+      filter: brightness(1.08);
+    }
+    .tally-mode-btn:active {
+      filter: brightness(0.95);
+    }
+    .tally-mode-btn[data-mode="shared"] {
+      background: #059669;
+    }
+    .tally-mode-btn[data-mode="paused"] {
+      background: #d97706;
+    }
+    .tally-mode-btn[data-mode="confirm"] {
+      background: #dc2626;
     }
 
-    .title-tag {
-      font-weight: 600;
-      color: #ffffff;
-      letter-spacing: -0.01em;
-      white-space: nowrap;
-    }
-
-    .dot-sep {
-      color: rgba(255, 255, 255, 0.34);
-      font-size: 12px;
+    .grip-handle {
+      width: 12px;
+      height: 100%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: #f8fafc;
+      border-left: 1px solid #e2e8f0;
+      border-right: 1px solid #e2e8f0;
+      cursor: grab;
       flex-shrink: 0;
     }
+    .grip-handle:active {
+      cursor: grabbing;
+      background: #eff6ff;
+    }
+    .grip-dots {
+      width: 2px;
+      height: 12px;
+      border-radius: 1px;
+      background: #94a3b8;
+    }
 
-    .status-label {
-      color: rgba(244, 244, 245, 0.86);
-      font-weight: 500;
+    /* Cell 2 (Slide-out Drawer Body): Crisp White Porcelain Status & Actions */
+    .drawer-body {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      height: 100%;
+      padding: 0 8px 0 9px;
       white-space: nowrap;
+      background: #ffffff;
+    }
+    .status-label {
+      color: #27272a;
+      font-size: 12px;
+      font-weight: 500;
+      max-width: 210px;
       overflow: hidden;
       text-overflow: ellipsis;
-      max-width: 240px;
+      white-space: nowrap;
     }
-    .status-label[data-shimmer="true"] {
-      background: linear-gradient(
-        100deg,
-        rgba(244, 244, 245, 0.78) 0%,
-        rgba(244, 244, 245, 0.78) 36%,
-        #7dd3fc 50%,
-        rgba(244, 244, 245, 0.78) 64%,
-        rgba(244, 244, 245, 0.78) 100%
-      ) 0 0 / 240% 100%;
-      color: transparent;
-      -webkit-background-clip: text;
-      background-clip: text;
-      animation: textSheen 2.4s linear infinite;
-    }
-    @keyframes textSheen {
-      0% { background-position: 100% 0; }
-      100% { background-position: -100% 0; }
+    .status-label[data-alert="true"] {
+      color: #1d4ed8;
+      font-weight: 600;
     }
 
     .action-cluster {
       display: inline-flex;
       align-items: center;
       gap: 4px;
-      margin-left: 2px;
       flex-shrink: 0;
     }
-
-    .pill-btn {
+    .flat-btn {
       appearance: none;
-      border: none;
-      border-radius: 999px;
-      height: 28px;
-      padding: 0 12px;
-      font: 600 12px/1 inherit;
+      border: 1px solid #e4e4e7;
+      border-radius: 4px;
+      height: 22px;
+      padding: 0 8px;
+      background: #f8fafc;
+      color: #3f3f46;
+      font: 500 11px/1 "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
       cursor: pointer;
-      white-space: nowrap;
-      background: rgba(255, 255, 255, 0.13);
-      color: #f4f4f5;
-      transition: background 0.15s ease, color 0.15s ease, scale var(--spring-pop);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease;
     }
-    .pill-btn:hover {
-      background: rgba(255, 255, 255, 0.22);
-      color: #ffffff;
+    .flat-btn:hover {
+      background: #fef2f2;
+      color: #dc2626;
+      border-color: #fecaca;
     }
-    .pill-btn:active {
-      scale: 0.93;
-    }
-    .pill-btn[data-primary="resume"] {
-      background: #0ea5e9;
-      color: #ffffff;
-      box-shadow: 0 2px 8px rgba(14, 165, 233, 0.38);
-    }
-    .pill-btn[data-primary="resume"]:hover {
-      background: #38bdf8;
-    }
-    .pill-btn[data-primary="solid-white"] {
-      background: #ffffff;
-      color: #09090b;
-      padding: 0 14px;
-    }
-    .pill-btn[data-primary="solid-white"]:hover {
-      background: #e4e4e7;
-    }
-    .pill-btn[data-ghost="true"] {
+    .flat-btn[data-kind="ghost"] {
       background: transparent;
-      color: rgba(255, 255, 255, 0.75);
-      font-weight: 500;
-      padding: 0 9px;
+      color: #52525b;
     }
-    .pill-btn[data-ghost="true"]:hover {
-      background: rgba(255, 255, 255, 0.1);
+    .flat-btn[data-kind="ghost"]:hover {
+      background: #f4f4f5;
+      color: #18181b;
+      border-color: #d4d4d8;
+    }
+    .flat-btn[data-kind="danger"] {
+      background: #dc2626;
       color: #ffffff;
+      border-color: #dc2626;
+      font-weight: 600;
     }
-
-    .close-circle-btn {
-      appearance: none;
-      border: none;
-      width: 28px;
-      height: 28px;
-      border-radius: 50%;
-      background: transparent;
-      color: rgba(255, 255, 255, 0.62);
-      display: grid;
-      place-items: center;
-      padding: 0;
-      cursor: pointer;
-      transition: background 0.15s ease, color 0.15s ease, scale var(--spring-pop);
-    }
-    .close-circle-btn:hover {
-      background: rgba(255, 255, 255, 0.15);
+    .flat-btn[data-kind="danger"]:hover {
+      background: #b91c1c;
+      border-color: #b91c1c;
       color: #ffffff;
-    }
-    .close-circle-btn:active {
-      scale: 0.88;
-    }
-    .close-circle-btn svg {
-      width: 14px;
-      height: 14px;
     }
 
     .hidden-el {
@@ -478,18 +375,18 @@
     }
     .coord-ring {
       position: absolute;
-      width: 28px;
-      height: 28px;
-      margin-left: -14px;
-      margin-top: -14px;
-      border-radius: 50%;
-      border: 2px solid #38bdf8;
-      box-shadow: 0 0 10px rgba(56, 189, 248, 0.55);
-      animation: expandRing 0.42s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+      width: 24px;
+      height: 24px;
+      margin-left: -12px;
+      margin-top: -12px;
+      border-radius: 4px;
+      border: 2px solid #2563eb;
+      background: rgba(37, 99, 235, 0.08);
+      animation: expandSquare 0.38s cubic-bezier(0.16, 1, 0.3, 1) forwards;
     }
-    @keyframes expandRing {
-      0% { transform: scale(0.35); opacity: 0.95; }
-      100% { transform: scale(1.75); opacity: 0; }
+    @keyframes expandSquare {
+      0% { transform: scale(0.4); opacity: 0.95; }
+      100% { transform: scale(1.65); opacity: 0; }
     }
 
     .collab-cursor {
@@ -514,34 +411,34 @@
     .collab-cursor-inner {
       position: relative;
       transform-origin: 3px 3px;
-      transition: transform 120ms cubic-bezier(0.34, 1.46, 0.64, 1);
+      transition: transform 120ms cubic-bezier(0.22, 1, 0.36, 1);
     }
     .collab-cursor[data-pressed="true"] .collab-cursor-inner {
-      transform: scale(0.82);
+      transform: scale(0.84);
     }
     .collab-dart-svg {
-      width: 24px;
-      height: 24px;
+      width: 22px;
+      height: 22px;
       display: block;
-      filter: drop-shadow(0 3px 7px rgba(0, 0, 0, 0.42));
+      filter: drop-shadow(0 2px 5px rgba(15, 23, 42, 0.28));
       transform: translate(-2px, -2px);
     }
     .collab-dart-svg path {
-      fill: #0ea5e9;
+      fill: #2563eb;
       stroke: #ffffff;
       stroke-width: 1.75;
       stroke-linejoin: round;
     }
     .collab-cursor-pill {
       position: absolute;
-      left: 16px;
-      top: 15px;
-      padding: 3px 9px;
-      border-radius: 999px;
-      background: rgba(15, 15, 18, 0.93);
-      border: 1px solid rgba(56, 189, 248, 0.45);
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.34);
-      color: #f4f4f5;
+      left: 15px;
+      top: 14px;
+      padding: 2px 7px;
+      border-radius: 4px;
+      background: #ffffff;
+      border: 1px solid #2563eb;
+      box-shadow: 0 3px 10px rgba(15, 23, 42, 0.16);
+      color: #1d4ed8;
       font-size: 11px;
       font-weight: 600;
       white-space: nowrap;
@@ -549,13 +446,13 @@
 
     @media (prefers-reduced-motion: reduce) {
       :host {
-        --spring-width: 160ms ease;
-        --spring-pop: 140ms ease;
+        --spring-width: 140ms ease;
+        --spring-pop: 120ms ease;
       }
-      .status-label[data-shimmer="true"] {
+      .director-topline[data-state="working"] .director-topline-runner {
         animation: none;
-        background: none;
-        color: rgba(244, 244, 245, 0.88);
+        width: 100%;
+        transform: none;
       }
     }
 
@@ -570,14 +467,20 @@
     constructor() {
       this._hudRev = CURRENT_HUD_REV;
       this._cleanups = [];
-      this._holdRaf = null;
       this._flashTimer = null;
       this._confirmTimer = null;
+      this._hoverCollapseTimer = null;
       this._cursorIdleTimer = null;
       this._cursorPressTimer = null;
       this._cursorPlaced = false;
       this._wasVisible = false;
+      this._pointerInsideDock = false;
       const defaultLang = /^zh\b/i.test(navigator.language || '') ? 'zh' : 'en';
+      const initSide = inheritedDock === 'left' ? 'left' : 'right';
+      const initTopPct =
+        typeof inheritedTopPct === 'number' && Number.isFinite(inheritedTopPct)
+          ? Math.min(90, Math.max(12, inheritedTopPct))
+          : 78;
       this._state = {
         lang: defaultLang,
         visible: false,
@@ -585,7 +488,8 @@
         activity: DICT[defaultLang].ready,
         flashText: '',
         confirmingDisconnect: false,
-        dock: inheritedDock || 'bottom-center',
+        dock: initSide,
+        topPct: initTopPct,
         userActionQueue: []
       };
       this._mount();
@@ -610,13 +514,17 @@
       this.shieldEl = document.createElement('div');
       this.shieldEl.className = 'lock-shield';
 
+      // Top 2.5px Solid Director Line
       this.borderEl = document.createElement('div');
-      this.borderEl.className = 'aura-border';
+      this.borderEl.className = 'director-topline';
+      const runnerEl = document.createElement('div');
+      runnerEl.className = 'director-topline-runner';
+      this.borderEl.appendChild(runnerEl);
 
       this.rippleLayer = document.createElement('div');
       this.rippleLayer.className = 'ripple-layer';
 
-      // Smooth collaboration cursor + action pill
+      // Smooth collaboration cursor + white porcelain tag
       this.cursorEl = document.createElement('div');
       this.cursorEl.className = 'collab-cursor';
       this.cursorEl.dataset.visible = 'false';
@@ -634,122 +542,66 @@
       cursorInner.append(dartSvg, this.cursorPillEl);
       this.cursorEl.appendChild(cursorInner);
 
-      // 3-second left-click hold unlock progress indicator
-      this.holdBadgeEl = document.createElement('div');
-      this.holdBadgeEl.className = 'hold-badge';
-      const ringWrap = document.createElement('div');
-      ringWrap.className = 'hold-ring-wrap';
-      const svg = document.createElementNS(svgNs, 'svg');
-      svg.setAttribute('viewBox', '0 0 48 48');
-      svg.setAttribute('class', 'hold-ring-svg');
-      const trackCircle = document.createElementNS(svgNs, 'circle');
-      trackCircle.setAttribute('cx', '24');
-      trackCircle.setAttribute('cy', '24');
-      trackCircle.setAttribute('r', '20');
-      trackCircle.setAttribute('class', 'hold-ring-track');
-      this.holdBarCircle = document.createElementNS(svgNs, 'circle');
-      this.holdBarCircle.setAttribute('cx', '24');
-      this.holdBarCircle.setAttribute('cy', '24');
-      this.holdBarCircle.setAttribute('r', '20');
-      this.holdBarCircle.setAttribute('class', 'hold-ring-bar');
-      svg.append(trackCircle, this.holdBarCircle);
-
-      this.holdSecEl = document.createElement('span');
-      this.holdSecEl.className = 'hold-sec-num';
-      this.holdSecEl.textContent = '3';
-      ringWrap.append(svg, this.holdSecEl);
-
-      this.holdTextEl = document.createElement('span');
-      this.holdTextEl.textContent = this._t().holdingHint;
-      this.holdBadgeEl.append(ringWrap, this.holdTextEl);
-
-      // Dynamic Island Full-Pill Capsule
+      // B+C Edge-Pinned Magnetic Tally Strip
       this.capsuleEl = document.createElement('div');
-      this.capsuleEl.className = 'island-shell';
+      this.capsuleEl.className = 'edge-tally-dock';
       this.capsuleEl.dataset.hidden = 'true';
-      this.capsuleEl.dataset.dock = this._state.dock;
+      this.capsuleEl.dataset.side = this._state.dock;
+      this.capsuleEl.dataset.expanded = 'false';
 
-      this.trackEl = document.createElement('div');
-      this.trackEl.className = 'island-track';
+      this.headCellEl = document.createElement('div');
+      this.headCellEl.className = 'tally-head-cell';
+
+      // Exposed Tally Mode Button (`LIVE` / `HOLD`) acts directly as `pauseBtn` for 1-click toggle!
+      this.pauseBtn = document.createElement('button');
+      this.pauseBtn.type = 'button';
+      this.pauseBtn.className = 'tally-mode-btn';
+      this.pauseBtn.textContent = this._t().badgeLive;
 
       this.gripEl = document.createElement('div');
-      this.gripEl.className = 'drag-grip';
+      this.gripEl.className = 'grip-handle';
       this.gripEl.title = this._t().dragTip;
+      const gripDots = document.createElement('span');
+      gripDots.className = 'grip-dots';
+      this.gripEl.appendChild(gripDots);
 
-      this.orbEl = document.createElement('span');
-      this.orbEl.className = 'orb-badge';
+      this.headCellEl.append(this.pauseBtn, this.gripEl);
 
-      const copyGroup = document.createElement('div');
-      copyGroup.className = 'copy-group';
-
-      this.brandEl = document.createElement('span');
-      this.brandEl.className = 'title-tag';
-      this.brandEl.textContent = 'Chrome Live';
-
-      this.sepEl = document.createElement('span');
-      this.sepEl.className = 'dot-sep';
-      this.sepEl.textContent = '·';
+      // Slide-out White Porcelain Drawer Body
+      this.drawerEl = document.createElement('div');
+      this.drawerEl.className = 'drawer-body';
 
       this.labelEl = document.createElement('span');
       this.labelEl.className = 'status-label';
       this.labelEl.textContent = this._t().ready;
 
-      copyGroup.append(this.brandEl, this.sepEl, this.labelEl);
-      this.gripEl.append(this.orbEl, copyGroup);
-
-      // Normal action cluster: [Pause/Resume pill] + [× circle]
       this.normalActionsEl = document.createElement('div');
       this.normalActionsEl.className = 'action-cluster';
 
-      this.pauseBtn = document.createElement('button');
-      this.pauseBtn.type = 'button';
-      this.pauseBtn.className = 'pill-btn';
-      this.pauseBtn.textContent = this._t().pause;
-
       this.closeBtn = document.createElement('button');
       this.closeBtn.type = 'button';
-      this.closeBtn.className = 'close-circle-btn';
-      const closeSvg = document.createElementNS(svgNs, 'svg');
-      closeSvg.setAttribute('viewBox', '0 0 24 24');
-      closeSvg.setAttribute('fill', 'none');
-      closeSvg.setAttribute('stroke', 'currentColor');
-      closeSvg.setAttribute('stroke-width', '2.2');
-      closeSvg.setAttribute('stroke-linecap', 'round');
-      const l1 = document.createElementNS(svgNs, 'line');
-      l1.setAttribute('x1', '18');
-      l1.setAttribute('y1', '6');
-      l1.setAttribute('x2', '6');
-      l1.setAttribute('y2', '18');
-      const l2 = document.createElementNS(svgNs, 'line');
-      l2.setAttribute('x1', '6');
-      l2.setAttribute('y1', '6');
-      l2.setAttribute('x2', '18');
-      l2.setAttribute('y2', '18');
-      closeSvg.append(l1, l2);
-      this.closeBtn.appendChild(closeSvg);
+      this.closeBtn.className = 'flat-btn';
+      this.closeBtn.textContent = this._t().disconnectLabel;
+      this.normalActionsEl.appendChild(this.closeBtn);
 
-      this.normalActionsEl.append(this.pauseBtn, this.closeBtn);
-
-      // Inline spring-expanded disconnect confirmation cluster: [Cancel] + [Disconnect solid white pill]
       this.confirmActionsEl = document.createElement('div');
       this.confirmActionsEl.className = 'action-cluster hidden-el';
 
       this.cancelConfirmBtn = document.createElement('button');
       this.cancelConfirmBtn.type = 'button';
-      this.cancelConfirmBtn.className = 'pill-btn';
-      this.cancelConfirmBtn.dataset.ghost = 'true';
+      this.cancelConfirmBtn.className = 'flat-btn';
+      this.cancelConfirmBtn.dataset.kind = 'ghost';
       this.cancelConfirmBtn.textContent = this._t().cancelBtn;
 
       this.confirmDisconnectBtn = document.createElement('button');
       this.confirmDisconnectBtn.type = 'button';
-      this.confirmDisconnectBtn.className = 'pill-btn';
-      this.confirmDisconnectBtn.dataset.primary = 'solid-white';
+      this.confirmDisconnectBtn.className = 'flat-btn';
+      this.confirmDisconnectBtn.dataset.kind = 'danger';
       this.confirmDisconnectBtn.textContent = this._t().disconnectBtn;
 
       this.confirmActionsEl.append(this.cancelConfirmBtn, this.confirmDisconnectBtn);
-
-      this.trackEl.append(this.gripEl, this.normalActionsEl, this.confirmActionsEl);
-      this.capsuleEl.appendChild(this.trackEl);
+      this.drawerEl.append(this.labelEl, this.normalActionsEl, this.confirmActionsEl);
+      this.capsuleEl.append(this.headCellEl, this.drawerEl);
 
       this.shadow.append(
         styleEl,
@@ -757,21 +609,11 @@
         this.borderEl,
         this.rippleLayer,
         this.cursorEl,
-        this.holdBadgeEl,
         this.capsuleEl
       );
 
       this._bindInteractions();
       (document.documentElement || document.body).appendChild(this.hostEl);
-    }
-
-    _cancelHoldUnlock() {
-      if (this._holdRaf !== null) {
-        cancelAnimationFrame(this._holdRaf);
-        this._holdRaf = null;
-      }
-      this.holdBadgeEl.dataset.active = 'false';
-      this.holdBarCircle.style.strokeDashoffset = String(RING_CIRCUMFERENCE);
     }
 
     _clearConfirmState() {
@@ -782,7 +624,7 @@
       this._state.confirmingDisconnect = false;
     }
 
-    _flashMessage(msg, durationMs = 2000) {
+    _flashMessage(msg, durationMs = 2200) {
       if (this._flashTimer) clearTimeout(this._flashTimer);
       this._state.flashText = msg;
       this._render();
@@ -805,6 +647,16 @@
       this._state.userActionQueue.push(eventName);
     }
 
+    _switchToManualNow() {
+      this._clearConfirmState();
+      this._state.userPausedLock = true;
+      this._state.mode = 'paused';
+      this._state.activity = this._t().pausedByUser;
+      this._state.flashText = '';
+      this._notifyBackground('pause');
+      this._render();
+    }
+
     _bindInteractions() {
       const selfDestructIfOrphan = () => {
         if (!isExtensionContextValid()) {
@@ -819,7 +671,6 @@
         ev._cliveBtnDone = true;
         ev.stopPropagation();
         if (selfDestructIfOrphan()) return;
-        this._cancelHoldUnlock();
         this._clearConfirmState();
         const nextPaused = this._state.mode !== 'paused';
         this._state.userPausedLock = nextPaused;
@@ -835,7 +686,6 @@
         ev._cliveBtnDone = true;
         ev.stopPropagation();
         if (selfDestructIfOrphan()) return;
-        this._cancelHoldUnlock();
         this._clearConfirmState();
         this._state.confirmingDisconnect = true;
         this._render();
@@ -862,7 +712,6 @@
         ev._cliveBtnDone = true;
         ev.stopPropagation();
         if (selfDestructIfOrphan()) return;
-        this._cancelHoldUnlock();
         this._clearConfirmState();
         this._state.userPausedLock = true;
         this._state.mode = 'paused';
@@ -871,9 +720,10 @@
         this._render();
       };
 
-      // Left-click hold 3s on locked page shield to unlock manual control
-      let holdStartAt = 0;
-      let holdingPointerId = null;
+      // Double-click anywhere on locked page OR press `Esc` -> instant manual takeover!
+      let lastTapAt = 0;
+      let lastTapX = 0;
+      let lastTapY = 0;
 
       const onShieldPointerDown = (ev) => {
         if (!ev.isTrusted) return;
@@ -884,75 +734,17 @@
         ev.stopPropagation();
         if (ev.button !== 0 || this._state.mode !== 'working') return;
 
-        holdingPointerId = ev.pointerId;
-        holdStartAt = performance.now();
-        try {
-          this.shieldEl.setPointerCapture(ev.pointerId);
-        } catch {}
-
-        const placeBadge = (cx, cy) => {
-          const vw = window.innerWidth || 1280;
-          const halfBound = Math.min(90, Math.floor(vw * 0.4));
-          const clampedX = Math.min(Math.max(halfBound, cx), Math.max(halfBound, vw - halfBound));
-          const clampedY = Math.max(64, cy);
-          this.holdBadgeEl.style.left = `${Math.round(clampedX)}px`;
-          this.holdBadgeEl.style.top = `${Math.round(clampedY)}px`;
-        };
-        placeBadge(ev.clientX, ev.clientY);
-        this.holdTextEl.textContent = this._t().holdingHint;
-
-        const step = (now) => {
-          if (holdingPointerId === null) return;
-          const elapsed = now - holdStartAt;
-          if (elapsed >= 110) {
-            this.holdBadgeEl.dataset.active = 'true';
-          }
-          const ratio = Math.min(1, elapsed / HOLD_UNLOCK_MS);
-          const offset = RING_CIRCUMFERENCE * (1 - ratio);
-          this.holdBarCircle.style.strokeDashoffset = offset.toFixed(2);
-          const remainSec = Math.max(1, Math.ceil((HOLD_UNLOCK_MS - elapsed) / 1000));
-          this.holdSecEl.textContent = String(remainSec);
-
-          if (ratio >= 1) {
-            holdingPointerId = null;
-            this._cancelHoldUnlock();
-            this._clearConfirmState();
-            this._state.userPausedLock = true;
-            this._state.mode = 'paused';
-            this._state.activity = this._t().pausedByUser;
-            this._state.flashText = '';
-            this._notifyBackground('pause');
-            this._render();
-            return;
-          }
-          this._holdRaf = requestAnimationFrame(step);
-        };
-
-        this._cancelHoldUnlock();
-        this._holdRaf = requestAnimationFrame(step);
-      };
-
-      const onShieldPointerMove = (ev) => {
-        if (holdingPointerId !== ev.pointerId) return;
-        const clampedX = Math.min(Math.max(90, ev.clientX), (window.innerWidth || 1280) - 90);
-        const clampedY = Math.max(64, ev.clientY);
-        this.holdBadgeEl.style.left = `${Math.round(clampedX)}px`;
-        this.holdBadgeEl.style.top = `${Math.round(clampedY)}px`;
-      };
-
-      const endShieldHold = (ev) => {
-        if (holdingPointerId === null) return;
-        const elapsed = performance.now() - holdStartAt;
-        try {
-          if (ev && typeof ev.pointerId === 'number') {
-            this.shieldEl.releasePointerCapture(ev.pointerId);
-          }
-        } catch {}
-        holdingPointerId = null;
-        this._cancelHoldUnlock();
-        if (elapsed < HOLD_UNLOCK_MS && this._state.mode === 'working') {
-          this._flashMessage(this._t().lockedTapHint, 2100);
+        const now = performance.now();
+        const dist = Math.hypot(ev.clientX - lastTapX, ev.clientY - lastTapY);
+        if (lastTapAt > 0 && now - lastTapAt <= DBL_TAP_WINDOW_MS && dist <= DBL_TAP_MAX_DIST_PX) {
+          lastTapAt = 0;
+          this._switchToManualNow();
+          return;
         }
+        lastTapAt = now;
+        lastTapX = ev.clientX;
+        lastTapY = ev.clientY;
+        this._flashMessage(this._t().lockedTapHint, 2200);
       };
 
       const swallowLockedEvent = (ev) => {
@@ -963,11 +755,43 @@
         }
       };
 
-      // Drag capsule to snap to 6 positions (top/bottom left/center/right; require >= 8px movement)
+      const onEscKeyDown = (ev) => {
+        if (!ev || !ev.isTrusted) return;
+        if (selfDestructIfOrphan()) return;
+        if (this._state.visible && this._state.mode === 'working' && ev.key === 'Escape') {
+          ev.preventDefault();
+          ev.stopPropagation();
+          this._switchToManualNow();
+        }
+      };
+
+      // Hover slide-out & auto-collapse on edge dock
+      const onDockEnter = (ev) => {
+        if (ev && !ev.isTrusted) return;
+        if (this._hoverCollapseTimer) {
+          clearTimeout(this._hoverCollapseTimer);
+          this._hoverCollapseTimer = null;
+        }
+        this._pointerInsideDock = true;
+        this._render();
+      };
+
+      const onDockLeave = (ev) => {
+        if (ev && !ev.isTrusted) return;
+        this._pointerInsideDock = false;
+        if (this._hoverCollapseTimer) clearTimeout(this._hoverCollapseTimer);
+        this._hoverCollapseTimer = setTimeout(() => {
+          this._hoverCollapseTimer = null;
+          this._render();
+        }, 280);
+      };
+
+      // Vertical reposition & left/right edge snap via grip handle
       let dragging = false;
       let dragPointerId = null;
       let dragStartX = 0;
       let dragStartY = 0;
+
       const onGripDown = (ev) => {
         if (!ev.isTrusted || ev._cliveGripDone || ev.button !== 0) return;
         ev._cliveGripDone = true;
@@ -981,6 +805,14 @@
         } catch {}
       };
 
+      const onGripMove = (ev) => {
+        if (!dragging || (dragPointerId !== null && ev.pointerId !== dragPointerId)) return;
+        const vh = Math.max(200, window.innerHeight || 800);
+        const pct = Math.min(90, Math.max(12, (ev.clientY / vh) * 100));
+        this._state.topPct = Math.round(pct * 10) / 10;
+        this.capsuleEl.style.top = `${this._state.topPct}%`;
+      };
+
       const onGripUp = (ev) => {
         if (!dragging || (dragPointerId !== null && ev.pointerId !== dragPointerId)) return;
         dragging = false;
@@ -989,14 +821,13 @@
         try {
           this.gripEl.releasePointerCapture(ev.pointerId);
         } catch {}
-        if (Math.hypot(ev.clientX - dragStartX, ev.clientY - dragStartY) < 8) {
+        if (Math.hypot(ev.clientX - dragStartX, ev.clientY - dragStartY) < 6) {
           return;
         }
-        const vw = window.innerWidth || 1280;
-        const vh = window.innerHeight || 800;
-        const isTop = ev.clientY < vh * 0.45;
-        const zone = ev.clientX < vw * 0.32 ? 'left' : ev.clientX > vw * 0.68 ? 'right' : 'center';
-        this._state.dock = `${isTop ? 'top' : 'bottom'}-${zone}`;
+        const vw = Math.max(320, window.innerWidth || 1280);
+        const vh = Math.max(200, window.innerHeight || 800);
+        this._state.dock = ev.clientX < vw * 0.45 ? 'left' : 'right';
+        this._state.topPct = Math.round(Math.min(90, Math.max(12, (ev.clientY / vh) * 100)) * 10) / 10;
         this._render();
       };
 
@@ -1029,31 +860,19 @@
 
       // Guard HUD host interactions in window capture phase (via `document_start` slot 0 when available)
       // so hostile page `window.addEventListener(..., e => e.stopImmediatePropagation(), true)` can never lock out
-      // Pause / Disconnect buttons, capsule drag, or the 3s Hold-to-Unlock gesture!
+      // LIVE/HOLD mode switch, Detach confirmation, dock drag, or double-click unlock!
       const captureHostGuard = (ev) => {
         if (!ev || !ev.isTrusted || ev._cliveHandled) return;
         const evtType = ev.type;
         if (evtType === 'pointermove') {
-          if (holdingPointerId !== null && ev.pointerId === holdingPointerId) {
-            ev._cliveHandled = true;
-            ev.stopImmediatePropagation?.();
-            onShieldPointerMove(ev);
-            return;
-          }
           if (dragging && dragPointerId !== null && ev.pointerId === dragPointerId) {
             ev._cliveHandled = true;
             ev.stopImmediatePropagation?.();
-            return;
+            onGripMove(ev);
           }
           return;
         }
         if (evtType === 'pointerup' || evtType === 'pointercancel') {
-          if (holdingPointerId !== null && ev.pointerId === holdingPointerId) {
-            ev._cliveHandled = true;
-            ev.stopImmediatePropagation?.();
-            endShieldHold(ev);
-            return;
-          }
           if (dragging && dragPointerId !== null && ev.pointerId === dragPointerId) {
             ev._cliveHandled = true;
             ev.stopImmediatePropagation?.();
@@ -1070,26 +889,30 @@
         evClientX = typeof ev.clientX === 'number' ? ev.clientX : null;
         evClientY = typeof ev.clientY === 'number' ? ev.clientY : null;
         const isConfirming = Boolean(this._state.confirmingDisconnect);
+        const onPauseToggle =
+          topTarget === this.pauseBtn || this.pauseBtn.contains(topTarget) || hitHudButton(this.pauseBtn, true);
         const onActiveBtn = isConfirming
-          ? topTarget === this.cancelConfirmBtn ||
+          ? onPauseToggle ||
+            topTarget === this.cancelConfirmBtn ||
             this.cancelConfirmBtn.contains(topTarget) ||
             hitHudButton(this.cancelConfirmBtn, true) ||
             topTarget === this.confirmDisconnectBtn ||
             this.confirmDisconnectBtn.contains(topTarget) ||
             hitHudButton(this.confirmDisconnectBtn, true)
-          : topTarget === this.pauseBtn ||
-            this.pauseBtn.contains(topTarget) ||
-            hitHudButton(this.pauseBtn, true) ||
+          : onPauseToggle ||
             topTarget === this.closeBtn ||
             this.closeBtn.contains(topTarget) ||
             hitHudButton(this.closeBtn, true);
         const onGrip =
           topTarget === this.gripEl || this.gripEl.contains(topTarget) || hitHudBox(this.gripEl, this._state.visible);
+        const onDockCard =
+          topTarget === this.capsuleEl ||
+          this.capsuleEl.contains(topTarget) ||
+          hitHudBox(this.capsuleEl, this._state.visible);
         const onLockedShield = Boolean(this._state.visible && this._state.mode === 'working');
 
         if (evtType === 'pointerdown') {
           if (onActiveBtn) {
-            // Preempt hostile page pointerdown capture listeners without calling preventDefault so click still synthesizes
             ev._cliveHandled = true;
             ev.stopImmediatePropagation?.();
             return;
@@ -1098,6 +921,11 @@
             ev._cliveHandled = true;
             ev.stopImmediatePropagation?.();
             onGripDown(ev);
+            return;
+          }
+          if (onDockCard) {
+            ev._cliveHandled = true;
+            ev.stopImmediatePropagation?.();
             return;
           }
           if (onLockedShield) {
@@ -1109,7 +937,7 @@
         }
 
         if (evtType === 'pointerup' || evtType === 'pointercancel' || evtType === 'mousedown' || evtType === 'mouseup') {
-          if (onActiveBtn || onGrip || onLockedShield) {
+          if (onActiveBtn || onGrip || onDockCard || onLockedShield) {
             ev._cliveHandled = true;
             ev.stopImmediatePropagation?.();
           }
@@ -1117,7 +945,7 @@
         }
 
         if (evtType === 'contextmenu') {
-          if (onActiveBtn || onGrip || onLockedShield) {
+          if (onActiveBtn || onGrip || onDockCard || onLockedShield) {
             ev._cliveHandled = true;
             ev.preventDefault?.();
             ev.stopImmediatePropagation?.();
@@ -1126,10 +954,7 @@
         }
 
         if (evtType === 'click') {
-          if (
-            !isConfirming &&
-            (topTarget === this.pauseBtn || this.pauseBtn.contains(topTarget) || hitHudButton(this.pauseBtn, true))
-          ) {
+          if (onPauseToggle) {
             ev._cliveHandled = true;
             ev.stopImmediatePropagation?.();
             onPauseClick(ev);
@@ -1158,7 +983,7 @@
             ev._cliveHandled = true;
             ev.stopImmediatePropagation?.();
             onConfirmReleaseClick(ev);
-          } else if (onGrip || onLockedShield) {
+          } else if (onGrip || onDockCard || onLockedShield) {
             ev._cliveHandled = true;
             ev.preventDefault?.();
             ev.stopImmediatePropagation?.();
@@ -1185,25 +1010,25 @@
         }
       }
 
+      window.addEventListener('keydown', onEscKeyDown, true);
+      this.capsuleEl.addEventListener('pointerenter', onDockEnter);
+      this.capsuleEl.addEventListener('pointerleave', onDockLeave);
       this.pauseBtn.addEventListener('click', onPauseClick);
       this.closeBtn.addEventListener('click', onCloseAskClick);
       this.cancelConfirmBtn.addEventListener('click', onCancelConfirmClick);
       this.confirmDisconnectBtn.addEventListener('click', onConfirmReleaseClick);
       this.shieldEl.addEventListener('pointerdown', onShieldPointerDown, true);
-      this.shieldEl.addEventListener('pointermove', onShieldPointerMove, true);
-      this.shieldEl.addEventListener('pointerup', endShieldHold, true);
-      this.shieldEl.addEventListener('pointercancel', endShieldHold, true);
       this.shieldEl.addEventListener('contextmenu', swallowLockedEvent, true);
       this.shieldEl.addEventListener('wheel', swallowLockedEvent, { passive: false, capture: true });
-      window.addEventListener('blur', endShieldHold);
       this.gripEl.addEventListener('pointerdown', onGripDown, true);
+      this.gripEl.addEventListener('pointermove', onGripMove, true);
       this.gripEl.addEventListener('pointerup', onGripUp, true);
       this.gripEl.addEventListener('pointercancel', onGripCancel, true);
 
       this._cleanups.push(() => {
-        this._cancelHoldUnlock();
         this._clearConfirmState();
         if (this._flashTimer) clearTimeout(this._flashTimer);
+        if (this._hoverCollapseTimer) clearTimeout(this._hoverCollapseTimer);
         if (this._cursorIdleTimer) clearTimeout(this._cursorIdleTimer);
         if (this._cursorPressTimer) clearTimeout(this._cursorPressTimer);
         if (usedEarlyGuard && typeof window.__CLIVE_SET_CAPTURE_GUARD__ === 'function') {
@@ -1213,35 +1038,27 @@
             window.removeEventListener(tName, captureHostGuard, true);
           }
         }
+        window.removeEventListener('keydown', onEscKeyDown, true);
+        this.capsuleEl.removeEventListener('pointerenter', onDockEnter);
+        this.capsuleEl.removeEventListener('pointerleave', onDockLeave);
         this.pauseBtn.removeEventListener('click', onPauseClick);
         this.closeBtn.removeEventListener('click', onCloseAskClick);
         this.cancelConfirmBtn.removeEventListener('click', onCancelConfirmClick);
         this.confirmDisconnectBtn.removeEventListener('click', onConfirmReleaseClick);
         this.shieldEl.removeEventListener('pointerdown', onShieldPointerDown, true);
-        this.shieldEl.removeEventListener('pointermove', onShieldPointerMove, true);
-        this.shieldEl.removeEventListener('pointerup', endShieldHold, true);
-        this.shieldEl.removeEventListener('pointercancel', endShieldHold, true);
         this.shieldEl.removeEventListener('contextmenu', swallowLockedEvent, true);
         this.shieldEl.removeEventListener('wheel', swallowLockedEvent, true);
-        window.removeEventListener('blur', endShieldHold);
         this.gripEl.removeEventListener('pointerdown', onGripDown, true);
+        this.gripEl.removeEventListener('pointermove', onGripMove, true);
         this.gripEl.removeEventListener('pointerup', onGripUp, true);
         this.gripEl.removeEventListener('pointercancel', onGripCancel, true);
       });
     }
 
-    _syncCapsuleWidth(instant = false) {
-      const maxW = Math.max(220, (window.innerWidth || 1280) - 28);
-      const naturalW = Math.min(maxW, Math.ceil(this.trackEl.offsetWidth));
-      if (naturalW <= 0) return;
-      if (instant) {
-        const prev = this.capsuleEl.style.transition;
-        this.capsuleEl.style.transition = 'none';
-        this.capsuleEl.style.width = `${naturalW}px`;
-        void this.capsuleEl.offsetWidth;
-        this.capsuleEl.style.transition = prev;
-      } else {
-        this.capsuleEl.style.width = `${naturalW}px`;
+    _syncCollapsedShift() {
+      const drawerW = Math.ceil(this.drawerEl.offsetWidth || 0);
+      if (drawerW > 0) {
+        this.capsuleEl.style.setProperty('--collapsed-shift', `${drawerW}px`);
       }
     }
 
@@ -1251,14 +1068,13 @@
       }
       const t = this._t();
       this.gripEl.title = t.dragTip;
+      this.closeBtn.textContent = t.disconnectLabel;
       this.closeBtn.title = t.closeTip;
-      this.holdTextEl.textContent = t.holdingHint;
       this.cancelConfirmBtn.textContent = t.cancelBtn;
       this.confirmDisconnectBtn.textContent = t.disconnectBtn;
 
       if (!this._state.visible) {
         this._wasVisible = false;
-        this._cancelHoldUnlock();
         this._clearConfirmState();
         this.capsuleEl.dataset.hidden = 'true';
         this.cursorEl.dataset.visible = 'false';
@@ -1268,39 +1084,37 @@
       }
 
       const isLockedWorking = this._state.mode === 'working';
+      const isPaused = this._state.mode === 'paused';
       this.shieldEl.dataset.locked = String(isLockedWorking);
-      if (!isLockedWorking) {
-        this._cancelHoldUnlock();
-      }
 
-      this.capsuleEl.dataset.dock = this._state.dock;
+      const side = this._state.dock === 'left' ? 'left' : 'right';
+      this.capsuleEl.dataset.side = side;
+      this.capsuleEl.style.top = `${this._state.topPct}%`;
       this.borderEl.dataset.state = this._state.mode;
 
+      this.pauseBtn.textContent = isPaused ? t.badgeHold : this._state.mode === 'shared' ? t.badgeShared : t.badgeLive;
+      this.pauseBtn.title = isPaused ? t.resumeTip : t.pauseTip;
+      this.pauseBtn.dataset.mode = this._state.confirmingDisconnect ? 'confirm' : this._state.mode;
+
       if (this._state.confirmingDisconnect) {
-        this.orbEl.dataset.state = 'confirm';
-        this.brandEl.textContent = t.confirmAsk;
-        this.sepEl.classList.add('hidden-el');
-        this.labelEl.classList.add('hidden-el');
+        this.labelEl.textContent = t.confirmAsk;
+        this.labelEl.dataset.alert = 'false';
         this.normalActionsEl.classList.add('hidden-el');
         this.confirmActionsEl.classList.remove('hidden-el');
       } else {
-        this.orbEl.dataset.state = this._state.mode;
-        this.brandEl.textContent = 'Chrome Live';
-        this.sepEl.classList.remove('hidden-el');
-        this.labelEl.classList.remove('hidden-el');
         this.labelEl.textContent = this._state.flashText || this._state.activity || t.ready;
-        this.labelEl.dataset.shimmer = String(isLockedWorking && !this._state.flashText);
-
-        const isPaused = this._state.mode === 'paused';
-        this.pauseBtn.textContent = isPaused ? t.resume : t.pause;
-        this.pauseBtn.dataset.primary = isPaused ? 'resume' : '';
+        this.labelEl.dataset.alert = String(Boolean(this._state.flashText));
         this.normalActionsEl.classList.remove('hidden-el');
         this.confirmActionsEl.classList.add('hidden-el');
       }
 
-      const firstAppear = !this._wasVisible;
+      const shouldExpand = Boolean(
+        this._pointerInsideDock || this._state.confirmingDisconnect || this._state.flashText
+      );
+      this.capsuleEl.dataset.expanded = String(shouldExpand);
+
       this._wasVisible = true;
-      this._syncCapsuleWidth(firstAppear);
+      this._syncCollapsedShift();
       this.capsuleEl.dataset.hidden = 'false';
     }
 
@@ -1325,7 +1139,9 @@
         this._state.activity = payload.activity;
         this._state.flashText = '';
       }
-      if (typeof payload.dock === 'string') this._state.dock = payload.dock;
+      if (payload.dock === 'left' || payload.dock === 'right') {
+        this._state.dock = payload.dock;
+      }
       this._render();
       return { ok: true, mode: this._state.mode, lang: this._state.lang };
     }
@@ -1392,7 +1208,7 @@
       this.rippleLayer.appendChild(ring);
       setTimeout(() => {
         ring.remove();
-      }, 440);
+      }, 420);
     }
 
     drainUserEvents() {

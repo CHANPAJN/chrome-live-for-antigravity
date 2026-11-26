@@ -75,37 +75,47 @@ function roundedBoxSdf(nx, ny, halfSize, radius) {
 }
 
 function samplePoint(nx, ny) {
-  // Normalized coordinates nx, ny in [-1, 1]
+  // Normalized coordinates nx, ny in [-1, 1] — White Porcelain Viewfinder Tally Icon
   const bgDist = roundedBoxSdf(nx, ny, 0.8869, 0.24);
   if (bgDist > 0) {
     return [0, 0, 0, 0];
   }
 
-  // Subtle dark slate gradient background (#111827 -> #090d16)
+  // Crisp white porcelain surface (#ffffff -> #f8fafc) with slate border (#cbd5e1)
   const t = (nx + ny + 2) / 4;
-  let r = Math.round(20 - t * 9);
-  let g = Math.round(27 - t * 11);
-  let b = Math.round(40 - t * 14);
+  let r = Math.round(255 - t * 6);
+  let g = Math.round(255 - t * 4);
+  let b = Math.round(255 - t * 2);
 
-  const distCenter = Math.hypot(nx, ny);
-
-  // Outer dual-arc broadcast ring
-  const ringDist = Math.abs(distCenter - 0.5017);
-  const angle = Math.atan2(ny, nx);
-  const inGap = Math.abs(Math.sin(angle - 0.6589)) < 0.22;
-  if (!inGap && ringDist < 0.085) {
-    const glow = 1 - ringDist / 0.085;
-    r = Math.round(r * (1 - glow) + 14 * glow);
-    g = Math.round(g * (1 - glow) + 165 * glow);
-    b = Math.round(b * (1 - glow) + 233 * glow);
+  if (bgDist > -0.075) {
+    r = 186;
+    g = 198;
+    b = 214;
   }
 
-  // Inner bright cyan live core
+  const ax = Math.abs(nx);
+  const ay = Math.abs(ny);
+  const distCenter = Math.max(ax, ay);
+
+  // Four optical viewfinder corner reticles in Prussian engineering blue (#2563eb)
+  const ringDist = Math.abs(distCenter - 0.5017);
+  const angle = Math.atan2(ny, nx);
+  const onDiagonalArm = ax >= 0.27 && ay >= 0.27 && Math.abs(Math.sin(angle - 0.6589)) <= 1.0;
+  if (onDiagonalArm && ringDist < 0.072) {
+    r = 37;
+    g = 99;
+    b = 235;
+  }
+
+  // Center solid director tally square (#2563eb)
+  const coreDist = roundedBoxSdf(nx, ny, 0.205, 0.06);
   if (distCenter < 0.2335) {
     const coreMix = Math.min(1, (0.2335 - distCenter) / 0.06);
-    r = Math.round(r * (1 - coreMix) + 240 * coreMix);
-    g = Math.round(g * (1 - coreMix) + 249 * coreMix);
-    b = Math.round(b * (1 - coreMix) + 255 * coreMix);
+    if (coreDist <= 0) {
+      r = Math.round(r * (1 - coreMix) + 37 * coreMix);
+      g = Math.round(g * (1 - coreMix) + 99 * coreMix);
+      b = Math.round(b * (1 - coreMix) + 235 * coreMix);
+    }
   }
 
   return [r, g, b, 255];
