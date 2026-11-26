@@ -104,7 +104,10 @@ function requestDaemon(method, routePath, bodyObj = null, timeoutMs = 30000) {
 async function ensureDaemonRunning(forceSpawn = false) {
   try {
     return await requestDaemon('GET', '/api/health', null, 1200);
-  } catch {
+  } catch (probeErr) {
+    if (probeErr instanceof Error && probeErr.message.includes('Unverified local service')) {
+      throw probeErr;
+    }
     // Daemon is offline; check cooldown before spawning a background process.
   }
 

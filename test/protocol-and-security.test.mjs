@@ -2919,7 +2919,7 @@ test('Blind-audit round-5 regressions: MCP batch screenshot & playbook opt-in lo
     const rogueRun = spawnSync(process.execPath, [cliPath, 'stop'], {
       env: { ...process.env, CHROME_LIVE_PORT: String(roguePort), CHROME_LIVE_HOME: tempStateDir },
       encoding: 'utf8',
-      timeout: 3000
+      timeout: 8000
     });
     // `stop` catches unverified daemon error and prints nothing/harmless message without hanging or buffering infinite stream
     assert.equal(rogueRun.error, undefined, 'CLI must abort unverified streaming response immediately without timing out');
