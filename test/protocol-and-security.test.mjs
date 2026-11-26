@@ -4607,6 +4607,7 @@ test('23. Collapsed background tab CDP deadlock & worker lifecycle regressions: 
   assert.match(hudSource, /_syncFreezeExemptionLock\(\)/);
   assert.match(hudSource, /navigator\.locks[\s\S]*?\.request\(/);
   assert.match(swSource, /wakeCollapsedGroupTabIfFrozen/);
+  assert.match(mcpSource, /getLatestInlineMonitorHtml/);
 });
 
 

@@ -1,6 +1,29 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { buildInlineMonitorHtml, INLINE_MONITOR_URI } from './inline-monitor-ui.mjs';
 import { timingSafeEqualToken } from './token-store.mjs';
+
+const INLINE_UI_MODULE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'inline-monitor-ui.mjs');
+let cachedUiMtimeMs = 0;
+let cachedUiHtml = '';
+
+async function getLatestInlineMonitorHtml() {
+  try {
+    const st = fs.statSync(INLINE_UI_MODULE_PATH);
+    if (cachedUiHtml && st.mtimeMs === cachedUiMtimeMs) {
+      return cachedUiHtml;
+    }
+    const mod = await import(`${pathToFileURL(INLINE_UI_MODULE_PATH).href}?v=${st.mtimeMs}`);
+    if (typeof mod.buildInlineMonitorHtml === 'function') {
+      cachedUiMtimeMs = st.mtimeMs;
+      cachedUiHtml = mod.buildInlineMonitorHtml();
+      return cachedUiHtml;
+    }
+  } catch {}
+  return buildInlineMonitorHtml();
+}
 
 // Ephemeral 256-bit capability token delivered ONLY inside `CallToolResult._meta.uiSecret`
 // (which MCP hosts route exclusively to the sandboxed `ui://` iframe via `ui/notifications/tool-result`,
@@ -398,6 +421,7 @@ export function startMcpStdioServer({ callDaemon }) {
           });
           return;
         }
+        const latestUiHtml = await getLatestInlineMonitorHtml();
         writeMessage({
           jsonrpc: '2.0',
           id,
@@ -406,7 +430,7 @@ export function startMcpStdioServer({ callDaemon }) {
               {
                 uri: INLINE_MONITOR_URI,
                 mimeType: 'text/html;profile=mcp-app',
-                text: buildInlineMonitorHtml(),
+                text: latestUiHtml,
                 _meta: {
                   ui: {
                     prefersBorder: false
