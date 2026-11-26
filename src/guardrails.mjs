@@ -416,7 +416,17 @@ export function redactUrlForAudit(rawUrl, depth = 0) {
         }
       }
 
-      cleanedHash = cleanedHash.replace(HASH_SENSITIVE_PAIR_RX, '$1$2=REDACTED');
+      cleanedHash = cleanedHash.replace(/([#?&])([^=&#]+)=([^&#]*)/g, (full, sep, rawKey) => {
+        let decKey = rawKey;
+        if (rawKey.includes('%')) {
+          try {
+            decKey = decodeURIComponent(rawKey);
+          } catch {}
+        }
+        return AUDIT_SENSITIVE_PARAM_RX.test(rawKey) || AUDIT_SENSITIVE_PARAM_RX.test(decKey)
+          ? `${sep}${rawKey}=REDACTED`
+          : full;
+      });
       if (cleanedHash !== parsed.hash) {
         parsed.hash = cleanedHash;
         mutated = true;
@@ -429,6 +439,21 @@ export function redactUrlForAudit(rawUrl, depth = 0) {
 }
 
 function splitBalancedUrlSuffix(rawMatch) {
+  let openParen = 0;
+  let closeParen = 0;
+  let openBracket = 0;
+  let closeBracket = 0;
+  let openBrace = 0;
+  let closeBrace = 0;
+  for (let i = 0; i < rawMatch.length; i++) {
+    const c = rawMatch[i];
+    if (c === '(') openParen++;
+    else if (c === ')') closeParen++;
+    else if (c === '[') openBracket++;
+    else if (c === ']') closeBracket++;
+    else if (c === '{') openBrace++;
+    else if (c === '}') closeBrace++;
+  }
   let end = rawMatch.length;
   while (end > 0) {
     const ch = rawMatch[end - 1];
@@ -436,32 +461,20 @@ function splitBalancedUrlSuffix(rawMatch) {
       end--;
       continue;
     }
-    if (ch === ')') {
-      const sub = rawMatch.slice(0, end);
-      const opens = (sub.match(/\(/g) || []).length;
-      const closes = (sub.match(/\)/g) || []).length;
-      if (closes > opens) {
-        end--;
-        continue;
-      }
+    if (ch === ')' && closeParen > openParen) {
+      closeParen--;
+      end--;
+      continue;
     }
-    if (ch === ']') {
-      const sub = rawMatch.slice(0, end);
-      const opens = (sub.match(/\[/g) || []).length;
-      const closes = (sub.match(/\]/g) || []).length;
-      if (closes > opens) {
-        end--;
-        continue;
-      }
+    if (ch === ']' && closeBracket > openBracket) {
+      closeBracket--;
+      end--;
+      continue;
     }
-    if (ch === '}') {
-      const sub = rawMatch.slice(0, end);
-      const opens = (sub.match(/\{/g) || []).length;
-      const closes = (sub.match(/\}/g) || []).length;
-      if (closes > opens) {
-        end--;
-        continue;
-      }
+    if (ch === '}' && closeBrace > openBrace) {
+      closeBrace--;
+      end--;
+      continue;
     }
     break;
   }

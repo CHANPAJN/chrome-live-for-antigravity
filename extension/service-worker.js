@@ -659,7 +659,17 @@ function redactAuditUrl(rawUrl, depth = 0) {
         }
       }
 
-      cleanedHash = cleanedHash.replace(LOCAL_HASH_SENSITIVE_PAIR_RX, '$1$2=REDACTED');
+      cleanedHash = cleanedHash.replace(/([#?&])([^=&#]+)=([^&#]*)/g, (full, sep, rawKey) => {
+        let decKey = rawKey;
+        if (rawKey.includes('%')) {
+          try {
+            decKey = decodeURIComponent(rawKey);
+          } catch {}
+        }
+        return LOCAL_AUDIT_SENSITIVE_PARAM_RX.test(rawKey) || LOCAL_AUDIT_SENSITIVE_PARAM_RX.test(decKey)
+          ? `${sep}${rawKey}=REDACTED`
+          : full;
+      });
       if (cleanedHash !== parsed.hash) {
         parsed.hash = cleanedHash;
         changed = true;
@@ -672,6 +682,21 @@ function redactAuditUrl(rawUrl, depth = 0) {
 }
 
 function splitLocalBalancedUrlSuffix(rawMatch) {
+  let openParen = 0;
+  let closeParen = 0;
+  let openBracket = 0;
+  let closeBracket = 0;
+  let openBrace = 0;
+  let closeBrace = 0;
+  for (let i = 0; i < rawMatch.length; i++) {
+    const c = rawMatch[i];
+    if (c === '(') openParen++;
+    else if (c === ')') closeParen++;
+    else if (c === '[') openBracket++;
+    else if (c === ']') closeBracket++;
+    else if (c === '{') openBrace++;
+    else if (c === '}') closeBrace++;
+  }
   let end = rawMatch.length;
   while (end > 0) {
     const ch = rawMatch[end - 1];
@@ -679,32 +704,20 @@ function splitLocalBalancedUrlSuffix(rawMatch) {
       end--;
       continue;
     }
-    if (ch === ')') {
-      const sub = rawMatch.slice(0, end);
-      const opens = (sub.match(/\(/g) || []).length;
-      const closes = (sub.match(/\)/g) || []).length;
-      if (closes > opens) {
-        end--;
-        continue;
-      }
+    if (ch === ')' && closeParen > openParen) {
+      closeParen--;
+      end--;
+      continue;
     }
-    if (ch === ']') {
-      const sub = rawMatch.slice(0, end);
-      const opens = (sub.match(/\[/g) || []).length;
-      const closes = (sub.match(/\]/g) || []).length;
-      if (closes > opens) {
-        end--;
-        continue;
-      }
+    if (ch === ']' && closeBracket > openBracket) {
+      closeBracket--;
+      end--;
+      continue;
     }
-    if (ch === '}') {
-      const sub = rawMatch.slice(0, end);
-      const opens = (sub.match(/\{/g) || []).length;
-      const closes = (sub.match(/\}/g) || []).length;
-      if (closes > opens) {
-        end--;
-        continue;
-      }
+    if (ch === '}' && closeBrace > openBrace) {
+      closeBrace--;
+      end--;
+      continue;
     }
     break;
   }
@@ -1139,12 +1152,12 @@ async function syncHudNow(tabId, payload) {
           for (const el of kids) {
             if (el === keepEl) continue;
             if (
-              el.hasAttribute?.('data-chrome-live-hud') ||
+              Element.prototype.hasAttribute.call(el, 'data-chrome-live-hud') ||
               (el.tagName === 'DIV' &&
                 el.id === '' &&
                 el.className === '' &&
                 el.childElementCount === 0 &&
-                (el.getAttribute('style') || '').includes('2147483646'))
+                (el.getAttribute('style') || '').match(/214748364[67]/))
             ) {
               el.remove();
             }
@@ -1228,12 +1241,12 @@ async function reconcileHudAfterStartup() {
             const kids = Array.from((document.documentElement || document.body)?.children || []);
             for (const el of kids) {
               if (
-                el.hasAttribute?.('data-chrome-live-hud') ||
+                Element.prototype.hasAttribute.call(el, 'data-chrome-live-hud') ||
                 (el.tagName === 'DIV' &&
                   el.id === '' &&
                   el.className === '' &&
                   el.childElementCount === 0 &&
-                  (el.getAttribute('style') || '').includes('2147483646'))
+                  (el.getAttribute('style') || '').match(/214748364[67]/))
               ) {
                 el.remove();
               }
@@ -1973,10 +1986,21 @@ async function inspectEmbeddedFramesSafety(tabId) {
             return false;
           }
         };
+        const _baseUriGet =
+          typeof Node !== 'undefined' ? Object.getOwnPropertyDescriptor(Node.prototype, 'baseURI')?.get : null;
         const resolveAbsHttpUrl = (rawVal, ownerDoc) => {
           if (!rawVal) return '';
           try {
-            const base = ownerDoc?.baseURI || document.baseURI || location.href;
+            const docRef = ownerDoc || document;
+            const rawBase =
+              _baseUriGet && typeof Node !== 'undefined' && docRef instanceof Node
+                ? _baseUriGet.call(docRef)
+                : typeof docRef?.baseURI === 'string'
+                  ? docRef.baseURI
+                  : typeof document?.baseURI === 'string'
+                    ? document.baseURI
+                    : '';
+            const base = typeof rawBase === 'string' && rawBase ? rawBase : location.href;
             const resolved = new URL(rawVal, base).href;
             return /^https?:/i.test(resolved) ? resolved : '';
           } catch {
@@ -2460,7 +2484,13 @@ async function executeBridgeRpc(method, params) {
           }
           if (sub) {
             el.dispatchEvent(new ownerWin.KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-            el.form?.requestSubmit?.();
+            if (el.form && el.form instanceof ownerWin.HTMLFormElement) {
+              if (typeof ownerWin.HTMLFormElement.prototype.requestSubmit === 'function') {
+                ownerWin.HTMLFormElement.prototype.requestSubmit.call(el.form);
+              } else {
+                ownerWin.HTMLFormElement.prototype.submit.call(el.form);
+              }
+            }
           }
           return { ok: true };
         },
@@ -2714,10 +2744,10 @@ async function executeBridgeRpc(method, params) {
           const extractCleanText = (rootNode) => {
             if (!rootNode) return '';
             const outParts = [];
-            const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
+            const tw = (typeof Document !== 'undefined' && document instanceof Document ? Document.prototype.createTreeWalker.bind(document) : document.createTreeWalker)(rootNode, NodeFilter.SHOW_TEXT);
             let tn;
             while ((tn = tw.nextNode())) {
-              const startEl = safeSlot(tn) || safeParent(tn);
+              const _tnSl = safeSlot(tn); const _tnPar = safeParent(tn); if (!_tnSl && _tnPar && (typeof getOpenShadow === 'function' ? getOpenShadow(_tnPar) : Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(_tnPar))) continue; const startEl = _tnSl || _tnPar;
               if (startEl && !isInsideSkipped(startEl, rootNode)) {
                 outParts.push(tn.nodeValue || '');
               }
@@ -3098,11 +3128,11 @@ async function executeBridgeRpc(method, params) {
                 if (root) {
                   const parts = [];
                   let accLen = 0;
-                  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                  const walker = (typeof Document !== 'undefined' && document instanceof Document ? Document.prototype.createTreeWalker.bind(document) : document.createTreeWalker)(root, NodeFilter.SHOW_TEXT);
                   let node;
                   while ((node = walker.nextNode())) {
-                    const p = sParent(node);
-                    const startEl = sSlot(node) || p;
+                    const p = sParent(node); const _nSl = sSlot(node); if (!_nSl && p && Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(p)) continue;
+                    const startEl = _nSl || p;
                     if (!startEl) continue;
                     if ((p && SKIP_TAGS.has(sTag(p))) || isInsideSkipped(startEl) || !isFlatVisible(startEl)) {
                       continue;
@@ -3273,7 +3303,7 @@ async function executeBridgeRpc(method, params) {
             allNodes = [];
           }
           for (const host of allNodes) {
-            if (host.hasAttribute && host.hasAttribute('data-chrome-live-hud')) continue;
+            if (host instanceof Element && Element.prototype.hasAttribute.call(host, 'data-chrome-live-hud')) continue;
             const sr =
               (typeof Element !== 'undefined' && Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(host)) ||
               (host.shadowRoot && typeof host.shadowRoot.querySelectorAll === 'function' ? host.shadowRoot : null);
@@ -3522,10 +3552,10 @@ async function executeBridgeRpc(method, params) {
           const extractCleanText = (rootNode) => {
             if (!rootNode) return '';
             const outParts = [];
-            const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
+            const tw = (typeof Document !== 'undefined' && document instanceof Document ? Document.prototype.createTreeWalker.bind(document) : document.createTreeWalker)(rootNode, NodeFilter.SHOW_TEXT);
             let tn;
             while ((tn = tw.nextNode())) {
-              const startEl = safeSlot(tn) || safeParent(tn);
+              const _tnSl = safeSlot(tn); const _tnPar = safeParent(tn); if (!_tnSl && _tnPar && (typeof getOpenShadow === 'function' ? getOpenShadow(_tnPar) : Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(_tnPar))) continue; const startEl = _tnSl || _tnPar;
               if (startEl && !isSnapSkipped(startEl, rootNode)) {
                 outParts.push(tn.nodeValue || '');
               }
@@ -3659,10 +3689,10 @@ async function executeBridgeRpc(method, params) {
             return false;
           };
           const cleanAlertParts = [];
-          const aWalker = document.createTreeWalker(aNode, NodeFilter.SHOW_TEXT);
+          const aWalker = (typeof Document !== 'undefined' && document instanceof Document ? Document.prototype.createTreeWalker.bind(document) : document.createTreeWalker)(aNode, NodeFilter.SHOW_TEXT);
           let aTn;
           while ((aTn = aWalker.nextNode())) {
-            const ap = safeSlot(aTn) || safeParent(aTn);
+            const _aSl = safeSlot(aTn); const _aPar = safeParent(aTn); if (!_aSl && _aPar && Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(_aPar)) continue; const ap = _aSl || _aPar;
             if (ap && !isAlertSkipped(ap, aNode)) {
               cleanAlertParts.push(aTn.nodeValue || '');
             }
@@ -3733,11 +3763,11 @@ async function executeBridgeRpc(method, params) {
         if (mainRoot) {
           const parts = [];
           let accLen = 0;
-          const walker = document.createTreeWalker(mainRoot, NodeFilter.SHOW_TEXT);
+          const walker = (typeof Document !== 'undefined' && document instanceof Document ? Document.prototype.createTreeWalker.bind(document) : document.createTreeWalker)(mainRoot, NodeFilter.SHOW_TEXT);
           let tNode;
           while ((tNode = walker.nextNode())) {
-            const p = safeParent(tNode);
-            const startEl = safeSlot(tNode) || p;
+            const p = safeParent(tNode); const _tSl = safeSlot(tNode); if (!_tSl && p && Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(p)) continue;
+            const startEl = _tSl || p;
             if (!startEl) continue;
             if ((p && SKIP_TAGS.has(safeTagLower(p).toUpperCase())) || isInsideSkipped(startEl) || !isFlatVisible(startEl)) {
               continue;
@@ -3803,7 +3833,7 @@ async function executeBridgeRpc(method, params) {
           }
           const hosts = root.querySelectorAll('*');
           for (const h of hosts) {
-            if (h.hasAttribute && h.hasAttribute('data-chrome-live-hud')) continue;
+            if (h instanceof Element && Element.prototype.hasAttribute.call(h, 'data-chrome-live-hud')) continue;
             const sr = getOpenShadow(h);
             if (sr) {
               const hit = queryDeep(sr, sel, depth + 1);
@@ -3819,7 +3849,7 @@ async function executeBridgeRpc(method, params) {
             for (const n of root.querySelectorAll(sel)) acc.push(n);
           } catch {}
           for (const h of root.querySelectorAll('*')) {
-            if (h.hasAttribute && h.hasAttribute('data-chrome-live-hud')) continue;
+            if (h instanceof Element && Element.prototype.hasAttribute.call(h, 'data-chrome-live-hud')) continue;
             const sr = getOpenShadow(h);
             if (sr) collectDeep(sr, sel, depth + 1, acc);
           }
@@ -3940,13 +3970,14 @@ async function executeBridgeRpc(method, params) {
           const pGet = typeof Node !== 'undefined' ? Object.getOwnPropertyDescriptor(Node.prototype, 'parentElement')?.get : null;
           const tsGet = typeof Text !== 'undefined' ? Object.getOwnPropertyDescriptor(Text.prototype, 'assignedSlot')?.get : null;
           const outParts = [];
-          const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
+          const tw = (typeof Document !== 'undefined' && document instanceof Document ? Document.prototype.createTreeWalker.bind(document) : document.createTreeWalker)(rootNode, NodeFilter.SHOW_TEXT);
           let tn;
           while ((tn = tw.nextNode())) {
             const sl =
               tsGet && typeof Text !== 'undefined' && tn instanceof Text ? tsGet.call(tn) : tn.assignedSlot || null;
             const par =
               pGet && typeof Node !== 'undefined' && tn instanceof Node ? pGet.call(tn) : tn.parentElement || null;
+            if (!sl && par && (typeof getOpenShadow === 'function' ? getOpenShadow(par) : null)) continue;
             const p = sl || par;
             if (p && !isClickSkipped(p, rootNode)) {
               outParts.push(tn.nodeValue || '');
@@ -4211,7 +4242,7 @@ async function executeBridgeRpc(method, params) {
           const nm = safeGetAttr(node, 'name');
           if (nm && /^[\w.:-]{1,48}$/.test(nm)) return `${tag}[name="${nm}"]`;
           const aria = (safeGetAttr(node, 'aria-label') || '').trim();
-          if (aria && aria.length <= 40 && !/["\\\n]/.test(aria)) return `${tag}[aria-label="${aria}"]`;
+          if (aria && aria.length <= 40 && !/["\\\r\n\f]|\/\*|\*\//.test(aria)) return `${tag}[aria-label="${aria}"]`;
           return '';
         }
 
@@ -4427,7 +4458,7 @@ async function executeBridgeRpc(method, params) {
             return null;
           }
           for (const h of root.querySelectorAll('*')) {
-            if (h.hasAttribute && h.hasAttribute('data-chrome-live-hud')) continue;
+            if (h instanceof Element && Element.prototype.hasAttribute.call(h, 'data-chrome-live-hud')) continue;
             const sr = getOpenShadow(h);
             if (sr) {
               const hit = queryDeep(sr, sel, depth + 1);
@@ -4443,7 +4474,7 @@ async function executeBridgeRpc(method, params) {
             for (const n of root.querySelectorAll(sel)) acc.push(n);
           } catch {}
           for (const h of root.querySelectorAll('*')) {
-            if (h.hasAttribute && h.hasAttribute('data-chrome-live-hud')) continue;
+            if (h instanceof Element && Element.prototype.hasAttribute.call(h, 'data-chrome-live-hud')) continue;
             const sr = getOpenShadow(h);
             if (sr) collectDeep(sr, sel, depth + 1, acc);
           }
@@ -4603,18 +4634,16 @@ async function executeBridgeRpc(method, params) {
             );
             const readCleanLabel = (lbl) => {
               if (!lbl) return '';
-              if (typeof document.createTreeWalker !== 'function' || typeof NodeFilter === 'undefined') {
-                return lbl.textContent || '';
-              }
+              if (typeof NodeFilter === 'undefined') return '';
               const skipSel =
                 'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
               const ancestorSkipSel =
                 '[contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
               const parts = [];
-              const tw = document.createTreeWalker(lbl, NodeFilter.SHOW_TEXT);
+              const tw = (typeof Document !== 'undefined' && document instanceof Document ? Document.prototype.createTreeWalker.bind(document) : document.createTreeWalker)(lbl, NodeFilter.SHOW_TEXT);
               let tn;
               while ((tn = tw.nextNode())) {
-                let cur = safeSlot(tn) || safeParent(tn);
+                const _lSl = safeSlot(tn); const _lPar = safeParent(tn); if (!_lSl && _lPar && (typeof getOpenShadow === 'function' ? getOpenShadow(_lPar) : Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(_lPar))) continue; let cur = _lSl || _lPar;
                 let blocked = false;
                 let passedRoot = false;
                 const seen = new Set();
@@ -4825,13 +4854,13 @@ async function executeBridgeRpc(method, params) {
           if (
             ph &&
             ph.length <= 24 &&
-            !/["\\\n]/.test(ph) &&
+            !/["\\\r\n\f]|\/\*|\*\//.test(ph) &&
             /(?:搜索|查找|输入|标题|内容|关键词|search|find|filter|enter|type|query|email|url)/i.test(ph)
           ) {
             return `${tag}[placeholder="${ph}"]`;
           }
           const aria = (safeGetAttr(node, 'aria-label') || '').trim();
-          if (aria && aria.length <= 40 && !/["\\\n]/.test(aria)) return `${tag}[aria-label="${aria}"]`;
+          if (aria && aria.length <= 40 && !/["\\\r\n\f]|\/\*|\*\//.test(aria)) return `${tag}[aria-label="${aria}"]`;
           return '';
         }
 
@@ -4857,10 +4886,10 @@ async function executeBridgeRpc(method, params) {
           const ancestorSkipSel =
             '[contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
           const parts = [];
-          const tw = document.createTreeWalker(lblNode, NodeFilter.SHOW_TEXT);
+          const tw = (typeof Document !== 'undefined' && document instanceof Document ? Document.prototype.createTreeWalker.bind(document) : document.createTreeWalker)(lblNode, NodeFilter.SHOW_TEXT);
           let tn;
           while ((tn = tw.nextNode())) {
-            let cur = safeSlot(tn) || safeParent(tn);
+            const _lSl = safeSlot(tn); const _lPar = safeParent(tn); if (!_lSl && _lPar && (typeof getOpenShadow === 'function' ? getOpenShadow(_lPar) : Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(_lPar))) continue; let cur = _lSl || _lPar;
             let blocked = false;
             let passedRoot = false;
             const seen = new Set();
@@ -5053,7 +5082,7 @@ async function executeBridgeRpc(method, params) {
           return null;
         }
         for (const h of root.querySelectorAll('*')) {
-          if (h.hasAttribute && h.hasAttribute('data-chrome-live-hud')) continue;
+          if (h instanceof Element && Element.prototype.hasAttribute.call(h, 'data-chrome-live-hud')) continue;
           const sr = getOpenShadow(h);
           if (sr) {
             const sub = queryDeep(sr, sel, depth + 1);
@@ -5069,7 +5098,7 @@ async function executeBridgeRpc(method, params) {
           for (const n of root.querySelectorAll(sel)) acc.push(n);
         } catch {}
         for (const h of root.querySelectorAll('*')) {
-          if (h.hasAttribute && h.hasAttribute('data-chrome-live-hud')) continue;
+          if (h instanceof Element && Element.prototype.hasAttribute.call(h, 'data-chrome-live-hud')) continue;
           const sr = getOpenShadow(h);
           if (sr) collectDeep(sr, sel, depth + 1, acc);
         }
@@ -5131,18 +5160,16 @@ async function executeBridgeRpc(method, params) {
           const needle = raw.toLowerCase();
           const readSafeClickableText = (node) => {
             if (!node) return '';
-            if (typeof document.createTreeWalker !== 'function' || typeof NodeFilter === 'undefined') {
-              return node.textContent || '';
-            }
+            if (typeof NodeFilter === 'undefined') return '';
             const skipSel =
               'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
             const ancestorSkipSel =
               '[contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
             const out = [];
-            const tw = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+            const tw = (typeof Document !== 'undefined' && document instanceof Document ? Document.prototype.createTreeWalker.bind(document) : document.createTreeWalker)(node, NodeFilter.SHOW_TEXT);
             let tn;
             while ((tn = tw.nextNode())) {
-              let cur = uSlot(tn) || uParent(tn);
+              const _uSl = uSlot(tn); const _uPar = uParent(tn); if (!_uSl && _uPar && getOpenShadow(_uPar)) continue; let cur = _uSl || _uPar;
               let blocked = false;
               let passedRoot = false;
               const seen = new Set();
@@ -5542,7 +5569,7 @@ async function executeBridgeRpc(method, params) {
                 return null;
               }
               for (const h of root.querySelectorAll('*')) {
-                if (h.hasAttribute && h.hasAttribute('data-chrome-live-hud')) continue;
+                if (h instanceof Element && Element.prototype.hasAttribute.call(h, 'data-chrome-live-hud')) continue;
                 const sr = getOpenShadow(h);
                 if (sr) {
                   const sub = queryDeep(sr, s, depth + 1);
@@ -6118,7 +6145,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (typeof msg.tabId === 'number' && managedTabs.has(msg.tabId)) {
         const entry = managedTabs.get(msg.tabId);
         if (entry.relayPopoutWinId) {
-          await mergeRelayTabBack(entry, { resumedByUserInBrowser: true });
+          await mergeRelayTabBack(entry);
         } else {
           await popoutRelayTab(entry, true);
         }
@@ -6205,14 +6232,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         : [];
       await chrome.storage.local.set({ [STORAGE_GUARDRAILS_KEY]: customBlockedDomains });
       for (const [tid, ent] of Array.from(managedTabs.entries())) {
-        const topCheck = checkTabUrlAllowed(ent.url || '');
+        const liveTab = await chrome.tabs.get(tid).catch(() => null);
+        const liveUrl = liveTab?.pendingUrl || liveTab?.url || ent.url || '';
+        const topCheck = checkTabUrlAllowed(liveUrl);
         if (!topCheck.allowed) {
           await detachManagedTab(tid, topCheck.reason || 'Custom blocked domain', true);
           continue;
         }
-        const subCheck = await inspectEmbeddedFramesSafety(tid);
-        if (!subCheck.allowed) {
-          await detachManagedTab(tid, subCheck.reason || 'Embedded custom blocked frame', true);
+        if (liveTab && !liveTab.discarded) {
+          const subCheck = await inspectEmbeddedFramesSafety(tid);
+          if (!subCheck.allowed) {
+            await detachManagedTab(tid, subCheck.reason || 'Embedded custom blocked frame', true);
+          }
         }
       }
       notifyPanelAndDaemon();

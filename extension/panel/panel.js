@@ -92,10 +92,13 @@ const I18N = {
       focus_tab: '定位标签页',
       relay_popout: '拆出副屏接力',
       relay_merge: '归队合回主窗',
+      relay_auto_merge: '关窗自动归队',
       remote_interact: '聊天框原地遥操',
       inspect_region: '画面框选识别',
       release_tab: '释放标签页',
-      reload_extension: '热重载扩展'
+      reload_extension: '热重载扩展',
+      auth_rejected: '鉴权签名拦截',
+      ws_yielded: '让渡活跃配置'
     }
   },
   en: {
@@ -191,10 +194,13 @@ const I18N = {
       focus_tab: 'Focused Tab',
       relay_popout: 'Relay Popout',
       relay_merge: 'Merged Relay',
+      relay_auto_merge: 'Auto-Merged Tab',
       remote_interact: 'Inline Remote',
       inspect_region: 'Region Inspect',
       release_tab: 'Released Tab',
-      reload_extension: 'Hot Reload'
+      reload_extension: 'Hot Reload',
+      auth_rejected: 'Auth Rejected',
+      ws_yielded: 'Yielded Connection'
     }
   }
 };

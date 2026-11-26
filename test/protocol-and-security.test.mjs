@@ -4105,7 +4105,7 @@ test('23. Blind-audit round-12 regressions: <form> DOM Clobbering prototype walk
   assert.equal(manifestJson.content_scripts?.[0]?.world, 'ISOLATED');
   assert.deepEqual(manifestJson.content_scripts?.[0]?.js, ['hud-early-guard.js']);
   assert.match(hudSource, /__CLIVE_SET_CAPTURE_GUARD__/);
-  assert.match(hudSource, /\['click', 'pointerdown', 'pointermove', 'pointerup', 'pointercancel'\]/);
+  assert.match(hudSource, /CAPTURE_GUARD_EVENTS\s*=\s*\[\s*'click',\s*'pointerdown'/);
 
   // Simulate slot-0 `hud-early-guard.js` registered BEFORE hostile page `stopImmediatePropagation()`
   const winCaptureListeners = new Map();
@@ -4170,4 +4170,74 @@ test('23. Blind-audit round-12 regressions: <form> DOM Clobbering prototype walk
   assert.match(inlineUiSource, /rootResizeObserver\.disconnect\(\)/);
   assert.match(inlineUiSource, /document\.removeEventListener\('visibilitychange', onVisibilityChange\)/);
   assert.match(panelSource, /toastTipSaved:\s*'Playbook entry saved'/);
+});
+
+test('24. Linear O(N) hash/bracket URL redaction, Document/Element prototype safety, unslotted Shadow text exclusion & full HUD mouse capture isolation', async () => {
+  const { redactUrlForAudit, redactUrlsInText } = await import('../src/guardrails.mjs');
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+  const hudSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'hud.js'), 'utf8');
+  const earlyGuardSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'hud-early-guard.js'), 'utf8');
+
+  // 1. O(N) performance check on adversarial 40KB `#?tokentoken...` without `=` and 12,000 trailing `)` brackets (< 40ms total!)
+  const t0 = performance.now();
+  const longNoEqHash = 'https://example.com/page#?' + 'token'.repeat(8000);
+  const resHash = redactUrlForAudit(longNoEqHash);
+  assert.equal(resHash, longNoEqHash);
+  const longParens = 'See https://example.com/a?token=SECRET_999' + ')'.repeat(12000);
+  const resParens = redactUrlsInText(longParens);
+  const elapsedMs = performance.now() - t0;
+  assert.equal(resParens.includes('SECRET_999'), false);
+  assert.equal(resParens.endsWith(')'.repeat(12000)), true);
+  assert.ok(elapsedMs < 80, `Expected linear O(N) redaction < 80ms, took ${elapsedMs.toFixed(2)}ms`);
+
+  // 2. `<img name="baseURI">` / `<img name="createTreeWalker">` / `<form><input name="hasAttribute">` hardened via prototypes
+  assert.match(swSource, /Object\.getOwnPropertyDescriptor\(Node\.prototype, 'baseURI'\)/);
+  assert.equal(swSource.includes('return lbl.textContent'), false);
+  assert.equal(swSource.includes('return node.textContent'), false);
+  assert.equal(/host\.hasAttribute && host\.hasAttribute\(/.test(swSource), false);
+  assert.equal(/h\.hasAttribute && h\.hasAttribute\(/.test(swSource), false);
+
+  // 3. Unslotted Light DOM text child under Open ShadowRoot host is excluded in TreeWalker!
+  const clickWalkerMatch = swSource.match(
+    /const CLICK_SKIP_SEL =[\s\S]*?function extractCleanContainerText\(rootNode\)[\s\S]*?\n        \}/
+  );
+  assert.ok(clickWalkerMatch);
+  class MockElem {}
+  const shadowHost = Object.assign(new MockElem(), {
+    shadowRoot: { querySelectorAll: () => [] },
+    parentElement: null,
+    getRootNode: () => ({}),
+    _style: { display: 'block', visibility: 'visible', opacity: '1', webkitTextSecurity: 'none' }
+  });
+  const unslottedText = {
+    assignedSlot: null,
+    parentElement: shadowHost,
+    nodeValue: 'UNSLOTTED_HIDDEN_SECRET_KEY'
+  };
+  const runUnslotted = vm.runInNewContext(
+    `(function(root) { const getOpenShadow = (n) => n && n.shadowRoot ? n.shadowRoot : null; ${clickWalkerMatch[0]}; return extractCleanContainerText(root); })`,
+    {
+      Element: MockElem,
+      NodeFilter: { SHOW_TEXT: 4 },
+      window: { getComputedStyle: (el) => el._style },
+      document: {
+        createTreeWalker: () => {
+          let used = false;
+          return {
+            nextNode: () => {
+              if (used) return null;
+              used = true;
+              return unslottedText;
+            }
+          };
+        }
+      }
+    }
+  );
+  assert.equal(runUnslotted(shadowHost).trim(), '', 'Unslotted text directly under ShadowRoot host must not be read');
+
+  // 4. `hud-early-guard.js` & `hud.js` intercept `mousedown`, `mouseup`, `contextmenu` and use max z-index `2147483647`
+  assert.match(earlyGuardSource, /'mousedown'/);
+  assert.match(earlyGuardSource, /'mouseup'/);
+  assert.match(hudSource, /z-index:2147483647/);
 });

@@ -5,7 +5,7 @@
 
   const REGISTRY_SYMBOL = '__chromeLiveHudController__';
   const CURRENT_HUD_REV = 10;
-  const HOST_Z_MARKER = '2147483646';
+  const HOST_Z_MARKER = '2147483647';
 
   function isExtensionContextValid() {
     try {
@@ -101,7 +101,7 @@
       all: initial;
       position: fixed;
       inset: 0;
-      z-index: 2147483646;
+      z-index: 2147483647;
       pointer-events: none;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
       --spring-width: 440ms linear(0, 0.44, 0.88, 1.055, 1.018, 0.998, 1);
@@ -600,7 +600,7 @@
       this.hostEl = document.createElement('div');
       this.hostEl.setAttribute(
         'style',
-        'all:initial;position:fixed;inset:0;pointer-events:none;z-index:2147483646;'
+        'all:initial;position:fixed;inset:0;pointer-events:none;z-index:2147483647;'
       );
       this.shadow = this.hostEl.attachShadow({ mode: 'closed' });
 
@@ -1061,7 +1061,6 @@
             else onGripCancel(ev);
             return;
           }
-          return;
         }
 
         if (typeof ev.composedPath !== 'function') return;
@@ -1071,37 +1070,57 @@
         evClientX = typeof ev.clientX === 'number' ? ev.clientX : null;
         evClientY = typeof ev.clientY === 'number' ? ev.clientY : null;
         const isConfirming = Boolean(this._state.confirmingDisconnect);
+        const onActiveBtn = isConfirming
+          ? topTarget === this.cancelConfirmBtn ||
+            this.cancelConfirmBtn.contains(topTarget) ||
+            hitHudButton(this.cancelConfirmBtn, true) ||
+            topTarget === this.confirmDisconnectBtn ||
+            this.confirmDisconnectBtn.contains(topTarget) ||
+            hitHudButton(this.confirmDisconnectBtn, true)
+          : topTarget === this.pauseBtn ||
+            this.pauseBtn.contains(topTarget) ||
+            hitHudButton(this.pauseBtn, true) ||
+            topTarget === this.closeBtn ||
+            this.closeBtn.contains(topTarget) ||
+            hitHudButton(this.closeBtn, true);
+        const onGrip =
+          topTarget === this.gripEl || this.gripEl.contains(topTarget) || hitHudBox(this.gripEl, this._state.visible);
+        const onLockedShield = Boolean(this._state.visible && this._state.mode === 'working');
 
         if (evtType === 'pointerdown') {
-          const onActiveBtn = isConfirming
-            ? topTarget === this.cancelConfirmBtn ||
-              this.cancelConfirmBtn.contains(topTarget) ||
-              hitHudButton(this.cancelConfirmBtn, true) ||
-              topTarget === this.confirmDisconnectBtn ||
-              this.confirmDisconnectBtn.contains(topTarget) ||
-              hitHudButton(this.confirmDisconnectBtn, true)
-            : topTarget === this.pauseBtn ||
-              this.pauseBtn.contains(topTarget) ||
-              hitHudButton(this.pauseBtn, true) ||
-              topTarget === this.closeBtn ||
-              this.closeBtn.contains(topTarget) ||
-              hitHudButton(this.closeBtn, true);
           if (onActiveBtn) {
             // Preempt hostile page pointerdown capture listeners without calling preventDefault so click still synthesizes
             ev._cliveHandled = true;
             ev.stopImmediatePropagation?.();
             return;
           }
-          if (topTarget === this.gripEl || this.gripEl.contains(topTarget) || hitHudBox(this.gripEl, this._state.visible)) {
+          if (onGrip) {
             ev._cliveHandled = true;
             ev.stopImmediatePropagation?.();
             onGripDown(ev);
             return;
           }
-          if (this._state.visible && this._state.mode === 'working') {
+          if (onLockedShield) {
             ev._cliveHandled = true;
             ev.stopImmediatePropagation?.();
             onShieldPointerDown(ev);
+          }
+          return;
+        }
+
+        if (evtType === 'pointerup' || evtType === 'pointercancel' || evtType === 'mousedown' || evtType === 'mouseup') {
+          if (onActiveBtn || onGrip || onLockedShield) {
+            ev._cliveHandled = true;
+            ev.stopImmediatePropagation?.();
+          }
+          return;
+        }
+
+        if (evtType === 'contextmenu') {
+          if (onActiveBtn || onGrip || onLockedShield) {
+            ev._cliveHandled = true;
+            ev.preventDefault?.();
+            ev.stopImmediatePropagation?.();
           }
           return;
         }
@@ -1139,11 +1158,24 @@
             ev._cliveHandled = true;
             ev.stopImmediatePropagation?.();
             onConfirmReleaseClick(ev);
+          } else if (onGrip || onLockedShield) {
+            ev._cliveHandled = true;
+            ev.preventDefault?.();
+            ev.stopImmediatePropagation?.();
           }
         }
       };
 
-      const CAPTURE_GUARD_EVENTS = ['click', 'pointerdown', 'pointermove', 'pointerup', 'pointercancel'];
+      const CAPTURE_GUARD_EVENTS = [
+        'click',
+        'pointerdown',
+        'pointermove',
+        'pointerup',
+        'pointercancel',
+        'mousedown',
+        'mouseup',
+        'contextmenu'
+      ];
       const usedEarlyGuard = typeof window.__CLIVE_SET_CAPTURE_GUARD__ === 'function';
       if (usedEarlyGuard) {
         window.__CLIVE_SET_CAPTURE_GUARD__(captureHostGuard);

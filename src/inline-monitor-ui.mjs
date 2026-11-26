@@ -889,7 +889,9 @@ export function buildInlineMonitorHtml() {
         } else if (frameMatchesPrimary && data.frameDataUrl && (ts !== lastFrameTs || frameTabId !== lastFrameTabId)) {
           lastFrameTs = ts || Date.now();
           lastFrameTabId = frameTabId;
-          screenImg.onload = () => reportSize();
+          screenImg.onload = () => {
+            if (!isTornDown) reportSize();
+          };
           screenImg.src = data.frameDataUrl;
           screenImg.style.display = 'block';
           emptyEl.style.display = 'none';
@@ -911,7 +913,7 @@ export function buildInlineMonitorHtml() {
         reportSize();
       }
 
-      window.addEventListener('message', (ev) => {
+      const onHostMessage = (ev) => {
         if (ev.source !== window.parent) return;
         if (typeof ev.origin === 'string' && ev.origin && ev.origin !== 'null') {
           parentTargetOrigin = ev.origin;
@@ -943,6 +945,13 @@ export function buildInlineMonitorHtml() {
             rootResizeObserver = null;
           }
           document.removeEventListener('visibilitychange', onVisibilityChange);
+          window.removeEventListener('message', onHostMessage);
+          for (const [, pEntry] of pending.entries()) {
+            try {
+              pEntry.reject(new Error('Inline monitor UI torn down'));
+            } catch {}
+          }
+          pending.clear();
           if (msg.id !== undefined) postJson({ jsonrpc: '2.0', id: msg.id, result: {} });
           return;
         }
@@ -974,7 +983,8 @@ export function buildInlineMonitorHtml() {
             scheduleNextPoll();
           }
         }
-      });
+      };
+      window.addEventListener('message', onHostMessage);
 
       let uiSecret = '';
       let isTornDown = false;
@@ -1297,6 +1307,7 @@ export function buildInlineMonitorHtml() {
             appInfo: { name: 'chrome-live-relay-studio', version: '1.1.0' },
             appCapabilities: {}
           });
+          if (isTornDown) return;
           if (initRes && initRes.hostCapabilities) hostCaps = initRes.hostCapabilities;
           syncCapabilityButtons();
           if (initRes && initRes.hostContext) applyHostContext(initRes.hostContext);

@@ -21,7 +21,16 @@
     if (activeGuard) activeGuard(ev);
   };
 
-  for (const evtType of ['click', 'pointerdown', 'pointermove', 'pointerup', 'pointercancel']) {
+  for (const evtType of [
+    'click',
+    'pointerdown',
+    'pointermove',
+    'pointerup',
+    'pointercancel',
+    'mousedown',
+    'mouseup',
+    'contextmenu'
+  ]) {
     window.addEventListener(evtType, earlyCaptureDispatch, true);
   }
 })();
