@@ -3347,6 +3347,7 @@ test('Blind-audit round-7 regressions: MV3 dormancy HUD state sync, UNC path NTL
     [20, { tabId: 20, substate: 'worker', paused: false, uiMode: 'working', activity: 'Active' }],
     [30, { tabId: 30, substate: 'worker', paused: false, uiMode: 'working', activity: 'Active' }]
   ]);
+  const ungroupedOrder = [];
   const removedWorkerIds = [];
   const runMultiDone = vm.runInNewContext(
     `(async function(method, params) { if (method === 'done') { ${doneBlockMatch[1]} } })`,
@@ -3364,7 +3365,11 @@ test('Blind-audit round-7 regressions: MV3 dormancy HUD state sync, UNC path NTL
       tr: () => ({ donePrefix: (s) => `Done: ${s}` }),
       chrome: {
         tabs: {
+          ungroup: async (id) => {
+            ungroupedOrder.push(`ungroup:${id}`);
+          },
           remove: async (id) => {
+            ungroupedOrder.push(`remove:${id}`);
             removedWorkerIds.push(id);
           }
         }
@@ -3375,6 +3380,11 @@ test('Blind-audit round-7 regressions: MV3 dormancy HUD state sync, UNC path NTL
   assert.deepEqual(Array.from(doneOut.closedWorkerTabs), [20, 30]);
   assert.deepEqual(Array.from(doneOut.preservedSharedTabs), [10]);
   assert.deepEqual(removedWorkerIds, [20, 30]);
+  assert.deepEqual(
+    ungroupedOrder,
+    ['ungroup:20', 'remove:20', 'ungroup:30', 'remove:30'],
+    'Must ungroup worker tabs BEFORE removing them so Chrome Saved Tab Groups does not pin leftover chips on bookmarks bar'
+  );
   assert.equal(multiManaged.has(10), true, 'Shared tab 10 must remain open and managed');
   assert.equal(multiManaged.get(10).uiMode, 'shared');
   assert.equal(multiManaged.has(20), false);

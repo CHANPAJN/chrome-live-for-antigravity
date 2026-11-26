@@ -1570,6 +1570,10 @@ function isOurGroupTitle(title) {
 async function syncLiveTabGroups() {
   syncActionBadge();
   try {
+    if (liveTabGroupId !== null) {
+      const curLiveGrp = await chrome.tabGroups.get(liveTabGroupId).catch(() => null);
+      if (!curLiveGrp) liveTabGroupId = null;
+    }
     const groups = await chrome.tabGroups.query({});
     for (const g of groups) {
       if (g.id !== liveTabGroupId && !isOurGroupTitle(g.title)) continue;
@@ -3022,11 +3026,13 @@ async function executeBridgeRpc(method, params) {
     const updatedTab = await chrome.tabs.get(created.id);
     const postCheck = checkTabUrlAllowed(updatedTab.url || '');
     if (!postCheck.allowed) {
+      await chrome.tabs.ungroup?.(created.id)?.catch(() => {});
       await chrome.tabs.remove(created.id).catch(() => {});
       throw new Error(`[GUARDRAIL] Redirected to protected URL: ${postCheck.reason}`);
     }
     const openSubCheck = await inspectEmbeddedFramesSafety(created.id);
     if (!openSubCheck.allowed) {
+      await chrome.tabs.ungroup?.(created.id)?.catch(() => {});
       await chrome.tabs.remove(created.id).catch(() => {});
       throw new Error(`[GUARDRAIL] Opened page embeds protected frame: ${openSubCheck.reason}`);
     }
@@ -3374,11 +3380,14 @@ async function executeBridgeRpc(method, params) {
           } finally {
             if (workerTab && typeof workerTab.id === 'number') {
               activeExtractTabIds.delete(workerTab.id);
+              // Ungroup BEFORE removing so Chrome TabGroupsSaveV2 deletes the group instead of saving "Live · Active" to bookmarks bar!
+              await chrome.tabs.ungroup?.(workerTab.id)?.catch(() => {});
               await chrome.tabs.remove(workerTab.id).catch(() => {});
             }
           }
         })
       );
+      await syncLiveTabGroups();
       return { items: results };
     } finally {
       activeExtractJobs = Math.max(0, activeExtractJobs - urls.length);
@@ -3412,6 +3421,8 @@ async function executeBridgeRpc(method, params) {
 
       const closedTabId = targetEntry.tabId;
       managedTabs.delete(closedTabId);
+      // Ungroup BEFORE removing so Chrome does not persist an empty Saved Tab Group chip on the bookmarks bar
+      await chrome.tabs.ungroup?.(closedTabId)?.catch(() => {});
       await chrome.tabs.remove(closedTabId).catch(() => {});
       await syncLiveTabGroups();
       notifyPanelAndDaemon();
@@ -3435,6 +3446,7 @@ async function executeBridgeRpc(method, params) {
       } else if (!item.paused) {
         const wId = item.tabId;
         managedTabs.delete(wId);
+        await chrome.tabs.ungroup?.(wId)?.catch(() => {});
         await chrome.tabs.remove(wId).catch(() => {});
         closedWorkerTabs.push(wId);
       }
