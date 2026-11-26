@@ -1063,7 +1063,7 @@
         window.removeEventListener('blur', endShieldHold);
         this.gripEl.removeEventListener('pointerdown', onGripDown, true);
         this.gripEl.removeEventListener('pointerup', onGripUp, true);
-        this.gripEl.removeEventListener('pointercancel', onGripCancel);
+        this.gripEl.removeEventListener('pointercancel', onGripCancel, true);
       });
     }
 

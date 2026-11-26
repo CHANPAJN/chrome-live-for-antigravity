@@ -481,10 +481,18 @@ export function createDaemonServer(options = {}) {
         if (!st.isFile()) {
           throw new Error(`Upload path is not a regular file: ${check.resolvedPath}`);
         }
-        // Secondary post-open canonical & symlink verification (covers Windows where O_NOFOLLOW is 0)
-        const lstatAfterOpen = fs.lstatSync(check.resolvedPath);
+        // Secondary post-open canonical, symlink & inode/dev identity verification (covers Windows & intermediate path swaps)
+        const fstatBig = fs.fstatSync(fd, { bigint: true });
+        const lstatAfterOpen = fs.lstatSync(check.resolvedPath, { bigint: true });
         if (lstatAfterOpen.isSymbolicLink()) {
           throw new Error('[GUARDRAIL:SYMLINK_BLOCKED] Uploading symbolic links is blocked by local guardrails');
+        }
+        if (
+          fstatBig.ino !== 0n &&
+          lstatAfterOpen.ino !== 0n &&
+          (fstatBig.dev !== lstatAfterOpen.dev || fstatBig.ino !== lstatAfterOpen.ino)
+        ) {
+          throw new Error('[GUARDRAIL:SYMLINK_BLOCKED] Upload file identity changed during open');
         }
         const realAfterOpen = (fs.realpathSync.native || fs.realpathSync)(check.resolvedPath);
         if (

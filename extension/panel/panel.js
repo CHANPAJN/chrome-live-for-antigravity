@@ -758,7 +758,9 @@ function renderPlaybookSites(sitesObj = {}) {
       a.textContent = `↗ ${rName}`;
       a.title = rUrl;
       a.addEventListener('click', () => {
-        chrome.tabs.create({ url: rUrl, active: true });
+        if (typeof rUrl === 'string' && /^https?:\/\//i.test(rUrl.trim())) {
+          chrome.tabs.create({ url: rUrl.trim(), active: true });
+        }
       });
 
       listEl.appendChild(

@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { timingSafeEqualToken } from './token-store.mjs';
 
 export const AUTH_MAX_SKEW_MS = 30000;
-const MAX_NONCE_CACHE = 2048;
+const MAX_NONCE_CACHE = 16384;
 const MAX_DECLARED_POST_BYTES = 12 * 1024 * 1024;
 
 export function sha256Hex(bufOrStr) {

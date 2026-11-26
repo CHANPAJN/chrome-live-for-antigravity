@@ -1476,11 +1476,11 @@ test('Security audit hardening: mutual HTTP/WS HMAC, replay defense, runtime boo
 
   // Execute the exact click label snippet from service-worker.js inside a VM against mock filled password/OTP inputs
   const clickLabelMatch = swSource.match(
-    /const elTagLower = el\.tagName\.toLowerCase\(\);[\s\S]*?if \(el\.disabled \|\| el\.getAttribute\('aria-disabled'\) === 'true'\) \{\s*const dLabel = safeElemLabel\(60\);\s*return \{ ok: false, error: `Element is disabled: \$\{dLabel\}` \};\s*\}/
+    /const elTagLower = safeTagLower\(el\);[\s\S]*?if \(el\.disabled \|\| el\.getAttribute\('aria-disabled'\) === 'true'\) \{\s*const dLabel = safeElemLabel\(60\);\s*return \{ ok: false, error: `Element is disabled: \$\{dLabel\}` \};\s*\}/
   );
   assert.ok(clickLabelMatch, 'Expected safeElemLabel block in service-worker.js click handler');
   const runClickLabelCheck = vm.runInNewContext(
-    `(function(el) { ${clickLabelMatch[0]} return { ok: true, label: safeElemLabel(42) }; })`
+    `(function(el) { const safeTagLower = (n) => String(n.tagName || '').toLowerCase(); const safeGetAttr = (n, k) => n.getAttribute(k); const extractCleanContainerText = (n) => n.textContent || ''; ${clickLabelMatch[0]} return { ok: true, label: safeElemLabel(42) }; })`
   );
 
   const secretValue = 'MyBankSecretPass#2026!';
@@ -3811,4 +3811,58 @@ test('Blind-audit round-9 regressions: array type confusion, Base64/backtick/CJK
   assert.match(swSource, /const merged = await autoMergeClosedRelayTab\(entry\)\.catch\(\(\) => false\);/);
   assert.match(swSource, /typeof target !== 'number' && typeof target !== 'string'/);
   assert.match(swSource, /replacedTabId: typeof item\.replacedTabId === 'number' \? item\.replacedTabId : null/);
+});
+
+test('Blind-audit round-10 regressions: ancestor opacity:0 candidate filter, CodeMirror/Monaco label scrub, customBlockedDomains live eviction & startup order, isolatedWorld fail-closed & form DOM-clobber safety', async () => {
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+  const hudSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'hud.js'), 'utf8');
+  const panelSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'panel', 'panel.js'), 'utf8');
+
+  // 1. `isElementFlatVisible` rejects ancestor `opacity: 0` / `visibility: hidden` across flattened slot/shadow tree!
+  const flatVisMatch = swSource.match(/const isElementFlatVisible = \(elNode\) => \{[\s\S]*?\n        \};/);
+  assert.ok(flatVisMatch, 'Expected isElementFlatVisible in service-worker.js');
+  const isElementFlatVisible = vm.runInNewContext(
+    `(function() { ${flatVisMatch[0]} return isElementFlatVisible; })()`,
+    {
+      window: { getComputedStyle: (el) => el._cs }
+    }
+  );
+  const transparentParent = {
+    _cs: { display: 'block', visibility: 'visible', opacity: '0' },
+    parentElement: null,
+    getRootNode: () => ({})
+  };
+  const innerOpaqueButton = {
+    _cs: { display: 'inline-block', visibility: 'visible', opacity: '1' },
+    parentElement: transparentParent,
+    getRootNode: () => ({})
+  };
+  assert.equal(
+    isElementFlatVisible(innerOpaqueButton),
+    false,
+    'Child button inside opacity:0 ancestor MUST be rejected before extracting aria-label/title/href'
+  );
+
+  // 2. `type` (`readCleanLabel`, `extractSafeLabelNode`) and `upload` (`readSafeClickableText`) all include CodeMirror/Monaco/Ace/ProseMirror!
+  const editorMatches = swSource.match(/\.CodeMirror, \.cm-editor, \.monaco-editor, \.ace_editor, \.ql-editor, \.ProseMirror/g) || [];
+  assert.ok(
+    editorMatches.length >= 8,
+    `Expected all 8 DOM skip selectors (snapshot, alerts, excerpt, extract, inspect_region, click, type x2, upload) to strip editor classes, got ${editorMatches.length}`
+  );
+
+  // 3. `loadBootstrapAndStorage` loads `STORAGE_GUARDRAILS_KEY` BEFORE calling `restoreSessionState()`!
+  const loadBootMatch = swSource.match(/async function loadBootstrapAndStorage\(\) \{[\s\S]*?\n\}/);
+  assert.ok(loadBootMatch);
+  const guardIdx = loadBootMatch[0].indexOf('STORAGE_GUARDRAILS_KEY');
+  const restoreIdx = loadBootMatch[0].indexOf('await restoreSessionState()');
+  assert.ok(guardIdx > 0 && restoreIdx > guardIdx, 'customBlockedDomains must be loaded before restoreSessionState()');
+
+  // 4. `panel:save_guardrails` actively evicts existing managedTabs whose top-level URL or embedded sub-frame hits new domains
+  assert.match(swSource, /if \(msg\.type === 'panel:save_guardrails'\)[\s\S]*?await detachManagedTab\(tid,/);
+
+  // 5. `upload` fails closed if `isolatedContextId` is missing; `wait` rejects non-string selector; `hud.js` removes capture listener cleanly
+  assert.match(swSource, /if \(typeof isolatedContextId !== 'number'\)\s*\{\s*throw new Error\('Failed to create isolated execution world for file upload'\);/);
+  assert.match(swSource, /\[GUARDRAIL\] wait selector must be a string/);
+  assert.match(hudSource, /removeEventListener\('pointercancel', onGripCancel, true\)/);
+  assert.match(panelSource, /\^https\?:\\\/\\\/\/i\.test\(rUrl\.trim\(\)\)/);
 });
