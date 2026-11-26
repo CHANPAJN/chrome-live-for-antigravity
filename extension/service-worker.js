@@ -125,9 +125,28 @@ function isHighEntropyPathSegment(rawSegment) {
   return false;
 }
 
-function canonicalizeRouteForGuardrail(rawSegment) {
+function decodeNestedPercentLocal(str) {
+  let changed = false;
+  const out = str.replace(/(?:%[0-9A-Fa-f]{2})+/g, (seq) => {
+    try {
+      const dec = decodeURIComponent(seq);
+      if (dec !== seq) changed = true;
+      return dec;
+    } catch {
+      const partial = seq.replace(/%[0-7][0-9A-Fa-f]/g, (asciiHex) => decodeURIComponent(asciiHex));
+      if (partial !== seq) changed = true;
+      return partial;
+    }
+  });
+  return { out, changed };
+}
+
+function canonicalizeRouteForGuardrail(rawSegment, splitRawQuery = false) {
   if (!rawSegment) return { ok: true, rawPath: '/', path: '/' };
-  let decoded = String(rawSegment);
+  const inputStr = String(rawSegment);
+  const rawQIdx = splitRawQuery ? inputStr.indexOf('?') : -1;
+  let decoded = rawQIdx === -1 ? inputStr : inputStr.slice(0, rawQIdx);
+  const queryPart = rawQIdx === -1 ? '' : inputStr.slice(rawQIdx);
   if (decoded.includes('%')) {
     if (/%(?![0-9A-Fa-f]{2})/.test(decoded)) {
       return { ok: false, rawPath: '', path: '' };
@@ -139,32 +158,18 @@ function canonicalizeRouteForGuardrail(rawSegment) {
     }
     for (let round = 1; round < 6; round++) {
       if (!/%[0-9A-Fa-f]{2}/.test(decoded)) break;
-      let malformedUtf8 = false;
-      const next = decoded.replace(/(?:%[0-9A-Fa-f]{2})+/g, (seq) => {
-        try {
-          return decodeURIComponent(seq);
-        } catch {
-          malformedUtf8 = true;
-          return seq;
-        }
-      });
-      if (malformedUtf8) {
-        return { ok: false, rawPath: '', path: '' };
-      }
-      if (next === decoded) break;
-      decoded = next;
+      const step = decodeNestedPercentLocal(decoded);
+      if (!step.changed) break;
+      decoded = step.out;
     }
-    if (/%[0-9A-Fa-f]{2}/.test(decoded)) {
+    if (/%[0-9A-Fa-f]{2}/.test(decoded) && decodeNestedPercentLocal(decoded).changed) {
       return { ok: false, rawPath: '', path: '' };
     }
   }
   const normalized = decoded.replace(/\\/g, '/');
-  const qIdx = normalized.indexOf('?');
-  const pathPart = qIdx === -1 ? normalized : normalized.slice(0, qIdx);
-  const queryPart = qIdx === -1 ? '' : normalized.slice(qIdx);
   const rawPieces = [];
   const stack = [];
-  for (const seg of pathPart.split('/')) {
+  for (const seg of normalized.split('/')) {
     const cleanSeg = seg.split(';')[0];
     if (!cleanSeg || cleanSeg === '.') continue;
     rawPieces.push(cleanSeg);
@@ -493,27 +498,49 @@ function redactAuditUrl(rawUrl) {
       }
     }
     if (parsed.hash) {
-      let cleanedHash = parsed.hash.replace(LOCAL_HASH_SENSITIVE_PAIR_RX, '$1$2=REDACTED');
-      if (cleanedHash === parsed.hash && /^#!?(?:eyJ[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{32,})$/.test(parsed.hash)) {
-        cleanedHash = '#REDACTED';
+      const prefixMatch = parsed.hash.match(/^(#!?)/);
+      const hashPrefix = prefixMatch ? prefixMatch[1] : '#';
+      const rawHashBody = parsed.hash.slice(hashPrefix.length);
+      let cleanedHash = parsed.hash;
+
+      if (
+        rawHashBody &&
+        !rawHashBody.includes('/') &&
+        !rawHashBody.includes('?') &&
+        !rawHashBody.includes('&') &&
+        !rawHashBody.includes('=') &&
+        (isHighEntropyPathSegment(rawHashBody) || /^(?:eyJ[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{32,})$/.test(rawHashBody))
+      ) {
+        cleanedHash = `${hashPrefix}REDACTED`;
+      } else if (!rawHashBody.startsWith('/') && !rawHashBody.includes('?') && (rawHashBody.includes('=') || rawHashBody.includes('&'))) {
+        const scrubbedFragPairs = scrubLocalQueryString(`?${rawHashBody}`);
+        if (scrubbedFragPairs.changed) {
+          cleanedHash = `${hashPrefix}${scrubbedFragPairs.text.slice(1)}`;
+        }
       } else {
-        const prefixMatch = cleanedHash.match(/^(#!?)/);
-        const hashPrefix = prefixMatch ? prefixMatch[1] : '#';
-        const body = cleanedHash.slice(hashPrefix.length);
-        const qPos = body.indexOf('?');
-        const hPath = qPos === -1 ? body : body.slice(0, qPos);
-        const hQuery = qPos === -1 ? '' : body.slice(qPos);
+        const qPos = rawHashBody.indexOf('?');
+        const hPath = qPos === -1 ? rawHashBody : rawHashBody.slice(0, qPos);
+        const hQuery = qPos === -1 ? '' : rawHashBody.slice(qPos);
         const hParts = hPath.split('/');
         let hChanged = false;
         for (let i = 0; i < hParts.length; i++) {
-          if (!hParts[i]) continue;
-          if (hParts[i].includes(';')) {
-            const nextSeg = scrubLocalMatrixSegment(hParts[i]);
-            if (nextSeg !== hParts[i]) {
+          const seg = hParts[i];
+          if (!seg) continue;
+          if (seg.includes('=') || seg.includes('&')) {
+            const scrubbedSegPairs = scrubLocalQueryString(`?${seg}`);
+            if (scrubbedSegPairs.changed) {
+              hParts[i] = scrubbedSegPairs.text.slice(1);
+              hChanged = true;
+              continue;
+            }
+          }
+          if (seg.includes(';')) {
+            const nextSeg = scrubLocalMatrixSegment(seg);
+            if (nextSeg !== seg) {
               hParts[i] = nextSeg;
               hChanged = true;
             }
-          } else if (isHighEntropyPathSegment(hParts[i])) {
+          } else if (isHighEntropyPathSegment(seg)) {
             hParts[i] = 'REDACTED';
             hChanged = true;
           }
@@ -523,6 +550,8 @@ function redactAuditUrl(rawUrl) {
           cleanedHash = `${hashPrefix}${hParts.join('/')}${scrubbedHQuery.text}`;
         }
       }
+
+      cleanedHash = cleanedHash.replace(LOCAL_HASH_SENSITIVE_PAIR_RX, '$1$2=REDACTED');
       if (cleanedHash !== parsed.hash) {
         parsed.hash = cleanedHash;
         changed = true;
@@ -598,12 +627,12 @@ function checkTabUrlAllowed(rawUrl) {
   if (CHECKOUT_SUBDOMAIN_RX.test(host)) {
     return { allowed: false, reason: `Protected payment/cashier subdomain (${host})` };
   }
-  const canonPath = canonicalizeRouteForGuardrail(parsed.pathname);
+  const canonPath = canonicalizeRouteForGuardrail(parsed.pathname, false);
   if (!canonPath.ok) {
     return { allowed: false, reason: 'Malformed percent-encoding in URL pathname' };
   }
   const rawHash = parsed.hash ? parsed.hash.replace(/^#+!?/, '') : '';
-  const canonHash = rawHash ? canonicalizeRouteForGuardrail(rawHash) : { ok: true, rawPath: '', path: '' };
+  const canonHash = rawHash ? canonicalizeRouteForGuardrail(rawHash, true) : { ok: true, rawPath: '', path: '' };
   if (!canonHash.ok) {
     return { allowed: false, reason: 'Malformed percent-encoding in URL fragment' };
   }
@@ -725,6 +754,7 @@ function serializeTabs() {
       originWindowId: entry.originWindowId ?? null,
       originIndex: entry.originIndex ?? null,
       relayPopoutWinId: entry.relayPopoutWinId ?? null,
+      replacedTabId: typeof entry.replacedTabId === 'number' ? entry.replacedTabId : null,
       attachedCdp: entry.attachedCdp,
       title: entry.title,
       url: redactAuditUrl(entry.url),
@@ -1661,12 +1691,39 @@ async function inspectEmbeddedFramesSafety(tabId) {
 
   const iframeRes = await runHudScriptSafe(tabId, {
     func: () => {
+      const rawGetAttr = Element.prototype.getAttribute;
+      const rawHasAttr = Element.prototype.hasAttribute;
+      const safeAttr = (el, attrName) => {
+        try {
+          const v = rawGetAttr.call(el, attrName);
+          return typeof v === 'string' ? v.trim() : '';
+        } catch {
+          return '';
+        }
+      };
+      const safeHasAttr = (el, attrName) => {
+        try {
+          return Boolean(rawHasAttr.call(el, attrName));
+        } catch {
+          return false;
+        }
+      };
+      const resolveAbsHttpUrl = (rawVal, ownerDoc) => {
+        if (!rawVal) return '';
+        try {
+          const base = ownerDoc?.baseURI || document.baseURI || location.href;
+          const resolved = new URL(rawVal, base).href;
+          return /^https?:/i.test(resolved) ? resolved : '';
+        } catch {
+          return '';
+        }
+      };
       const urls = [];
       const namedFrames = new Set();
       const collectFrames = (root, depth = 0) => {
         if (!root || depth > 6) return;
         for (const frame of root.querySelectorAll('iframe, frame')) {
-          const fName = (frame.getAttribute('name') || '').trim();
+          const fName = safeAttr(frame, 'name');
           if (fName) namedFrames.add(fName);
           const st = window.getComputedStyle(frame);
           const rc = frame.getBoundingClientRect();
@@ -1677,38 +1734,55 @@ async function inspectEmbeddedFramesSafety(tabId) {
             rc.width >= 24 &&
             rc.height >= 24;
           if (isVisible) {
-            const src = frame.src || frame.getAttribute('src') || '';
-            if (/^https?:/i.test(src)) urls.push(src);
+            const absSrc = resolveAbsHttpUrl(safeAttr(frame, 'src'), frame.ownerDocument);
+            if (absSrc) urls.push(absSrc);
           }
         }
         for (const el of root.querySelectorAll('*')) {
           if (el.shadowRoot) collectFrames(el.shadowRoot, depth + 1);
         }
       };
-      const collectTargetedForms = (root, depth = 0) => {
+      const collectTargetedNavigations = (root, depth = 0) => {
         if (!root || depth > 6) return;
         if (namedFrames.size > 0) {
-          for (const form of root.querySelectorAll('form[target]')) {
-            const tgt = (form.getAttribute('target') || '').trim();
-            const act = form.action || form.getAttribute('action') || '';
-            if (tgt && namedFrames.has(tgt) && /^https?:/i.test(act)) {
-              urls.push(act);
+          for (const form of root.querySelectorAll('form')) {
+            const tgt = safeAttr(form, 'target');
+            if (tgt && namedFrames.has(tgt) && safeHasAttr(form, 'action')) {
+              const absAct = resolveAbsHttpUrl(safeAttr(form, 'action'), form.ownerDocument);
+              if (absAct) urls.push(absAct);
             }
           }
-          for (const btn of root.querySelectorAll('button[formtarget], input[formtarget], button[formaction], input[formaction]')) {
-            const effTarget = (btn.getAttribute('formtarget') || btn.form?.getAttribute('target') || '').trim();
-            const effAction = btn.formAction || btn.getAttribute('formaction') || btn.form?.action || '';
-            if (effTarget && namedFrames.has(effTarget) && /^https?:/i.test(effAction)) {
-              urls.push(effAction);
+          for (const btn of root.querySelectorAll('button, input')) {
+            if (!safeHasAttr(btn, 'formtarget') && !safeHasAttr(btn, 'formaction')) continue;
+            const ownerForm = btn.form instanceof HTMLFormElement ? btn.form : btn.closest?.('form') || null;
+            const effTarget = safeHasAttr(btn, 'formtarget')
+              ? safeAttr(btn, 'formtarget')
+              : ownerForm
+                ? safeAttr(ownerForm, 'target')
+                : '';
+            if (!effTarget || !namedFrames.has(effTarget)) continue;
+            const rawAct = safeHasAttr(btn, 'formaction')
+              ? safeAttr(btn, 'formaction')
+              : ownerForm && safeHasAttr(ownerForm, 'action')
+                ? safeAttr(ownerForm, 'action')
+                : '';
+            const absAct = resolveAbsHttpUrl(rawAct, btn.ownerDocument);
+            if (absAct) urls.push(absAct);
+          }
+          for (const link of root.querySelectorAll('a[target][href], area[target][href]')) {
+            const lTarget = safeAttr(link, 'target');
+            if (lTarget && namedFrames.has(lTarget)) {
+              const absHref = resolveAbsHttpUrl(safeAttr(link, 'href'), link.ownerDocument);
+              if (absHref) urls.push(absHref);
             }
           }
         }
         for (const el of root.querySelectorAll('*')) {
-          if (el.shadowRoot) collectTargetedForms(el.shadowRoot, depth + 1);
+          if (el.shadowRoot) collectTargetedNavigations(el.shadowRoot, depth + 1);
         }
       };
       collectFrames(document);
-      collectTargetedForms(document);
+      collectTargetedNavigations(document);
       return urls;
     }
   });
@@ -2017,12 +2091,24 @@ async function executeBridgeRpc(method, params) {
           const ownerWin = el.ownerDocument?.defaultView || window;
           const st = ownerWin.getComputedStyle(el);
           const tSec = String(st.webkitTextSecurity || st.getPropertyValue('-webkit-text-security') || '').toLowerCase();
-          // Detect 4..8 single-character split OTP/PIN box groups
+          // Detect 4..8 single-character split OTP/PIN box groups (up to 6 hops & across sibling open ShadowRoots)
+          const countSingleCharBoxes = (root, d = 0) => {
+            if (!root || d > 3 || typeof root.querySelectorAll !== 'function') return 0;
+            let count = root.querySelectorAll('input[maxlength="1"]').length;
+            if (count >= 4) return count;
+            for (const sub of root.querySelectorAll('*')) {
+              if (sub.shadowRoot) {
+                count += countSingleCharBoxes(sub.shadowRoot, d + 1);
+                if (count >= 4) return count;
+              }
+            }
+            return count;
+          };
           let isSplitOtpBox = false;
           if (getTag(el) === 'input' && (el.maxLength === 1 || Number(el.getAttribute?.('maxlength')) === 1)) {
             let grp = el.parentElement || (el.getRootNode?.()?.host ? el.getRootNode() : null);
-            for (let gHop = 0; gHop < 3 && grp; gHop++) {
-              if (typeof grp.querySelectorAll === 'function' && grp.querySelectorAll('input[maxlength="1"]').length >= 4) {
+            for (let gHop = 0; gHop < 6 && grp; gHop++) {
+              if (countSingleCharBoxes(grp) >= 4) {
                 isSplitOtpBox = true;
                 break;
               }
@@ -3374,11 +3460,28 @@ async function executeBridgeRpc(method, params) {
               document,
               'input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"]), textarea, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"]'
             );
+            const readCleanLabel = (lbl) => {
+              if (!lbl) return '';
+              if (typeof document.createTreeWalker !== 'function' || typeof NodeFilter === 'undefined') {
+                return lbl.textContent || '';
+              }
+              const skipSel =
+                '[hidden], [aria-hidden="true"], style, script, noscript, template, textarea, [contenteditable]:not([contenteditable="false"])';
+              const parts = [];
+              const tw = document.createTreeWalker(lbl, NodeFilter.SHOW_TEXT);
+              let tn;
+              while ((tn = tw.nextNode())) {
+                const p = tn.parentElement;
+                if (p && typeof p.closest === 'function' && p.closest(skipSel)) continue;
+                if (tn.nodeValue) parts.push(tn.nodeValue);
+              }
+              return parts.join(' ');
+            };
             let partialMatch = null;
             for (const cand of inputs) {
               const rect = cand.getBoundingClientRect();
               if (rect.width < 4 || rect.height < 4) continue;
-              const labelText = cand.labels?.[0]?.textContent || '';
+              const labelText = readCleanLabel(cand.labels?.[0]);
               const haystacks = [
                 cand.getAttribute('placeholder'),
                 cand.getAttribute('aria-label'),
@@ -3419,14 +3522,26 @@ async function executeBridgeRpc(method, params) {
         if (!el) return { ok: false, error: `Input element not found: ${tgt}` };
         const elStyle = window.getComputedStyle(el);
         const elTextSec = String(elStyle.webkitTextSecurity || elStyle.getPropertyValue('-webkit-text-security') || '').toLowerCase();
-        // Detect 4..8 single-character split OTP/PIN input boxes
+        // Detect 4..8 single-character split OTP/PIN input boxes (up to 6 hops & across sibling open ShadowRoots)
+        const countSplitOtpDigits = (root, d = 0) => {
+          if (!root || d > 3 || typeof root.querySelectorAll !== 'function') return 0;
+          let count = root.querySelectorAll('input[maxlength="1"]').length;
+          if (count >= 4) return count;
+          for (const sub of root.querySelectorAll('*')) {
+            if (sub.shadowRoot) {
+              count += countSplitOtpDigits(sub.shadowRoot, d + 1);
+              if (count >= 4) return count;
+            }
+          }
+          return count;
+        };
         let isSplitOtpInput = false;
         const isInputNode =
           el instanceof HTMLInputElement || String(el.tagName || '').toLowerCase() === 'input';
         if (isInputNode && (el.maxLength === 1 || Number(el.getAttribute?.('maxlength')) === 1)) {
           let grp = el.parentElement || (el.getRootNode?.()?.host ? el.getRootNode() : null);
-          for (let gHop = 0; gHop < 3 && grp; gHop++) {
-            if (typeof grp.querySelectorAll === 'function' && grp.querySelectorAll('input[maxlength="1"]').length >= 4) {
+          for (let gHop = 0; gHop < 6 && grp; gHop++) {
+            if (countSplitOtpDigits(grp) >= 4) {
               isSplitOtpInput = true;
               break;
             }
@@ -3754,7 +3869,7 @@ async function executeBridgeRpc(method, params) {
       assertSafeModelSelector(params.target);
     }
     const EXT_SENSITIVE_BASE_RX =
-      /^(?:(?!.*\.pub$)id_(?:rsa|ed25519|ecdsa|dsa)(?:$|[._-].+)|authorized_keys|known_hosts|auth\.token|site-playbooks\.json|daemon\.pid|spawn\.(?:lock|cooldown)|\.local-runtime\.json|agent_vault\.enc|\.env(?:\..+)?|\.npmrc|\.pypirc|\.netrc|\.git-credentials|kubeconfig|credentials(?:\.json)?|application_default_credentials\.json|Local\s+State|Cookies(?:-journal)?|cookies\.sqlite|key[34]\.db|cert9\.db|logins\.json|Login Data(?:\s+For\s+Account)?|Web Data|.*\.(?:pem|key|p12|pfx|kdbx|ovpn|jks|keystore)|.*\.tfstate(?:\.backup)?)$/i;
+      /^(?:(?!.*\.pub$)id_(?:rsa|ed25519|ecdsa|dsa)(?:$|[._-].+)|authorized_keys|known_hosts|auth\.token|site-playbooks\.json|daemon\.pid|spawn\.(?:lock|cooldown)|\.local-runtime\.json|agent_vault\.enc|accessTokens\.json|\.env(?:\..+)?|\.npmrc|\.pypirc|\.netrc|\.git-credentials|kubeconfig|credentials(?:\.json)?|application_default_credentials\.json|Local\s+State|Cookies(?:-journal)?|cookies\.sqlite|key[34]\.db|cert9\.db|logins\.json|Login Data(?:\s+For\s+Account)?|Web Data|.*\.(?:pem|key|p12|pfx|kdbx|ovpn|jks|keystore|gpg|age)|.*\.tfstate(?:\.backup)?)$/i;
     for (const rawFile of files) {
       const fStr = String(rawFile || '').trim();
       const withoutDrive = fStr.replace(/^[A-Za-z]:/, '');
@@ -3852,9 +3967,26 @@ async function executeBridgeRpc(method, params) {
         let matched = raw ? queryDeep(document, raw) : null;
         if (!matched && raw) {
           const needle = raw.toLowerCase();
+          const readSafeClickableText = (node) => {
+            if (!node) return '';
+            if (typeof document.createTreeWalker !== 'function' || typeof NodeFilter === 'undefined') {
+              return node.textContent || '';
+            }
+            const skipSel =
+              '[hidden], [aria-hidden="true"], style, script, noscript, template, textarea, [contenteditable]:not([contenteditable="false"])';
+            const out = [];
+            const tw = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+            let tn;
+            while ((tn = tw.nextNode())) {
+              const p = tn.parentElement;
+              if (p && typeof p.closest === 'function' && p.closest(skipSel)) continue;
+              if (tn.nodeValue) out.push(tn.nodeValue);
+            }
+            return out.join(' ');
+          };
           const clickables = collectDeep(document, 'label, button, a, [role="button"]');
           for (const item of clickables) {
-            const txt = (item.textContent || item.getAttribute('aria-label') || item.getAttribute('title') || '')
+            const txt = (readSafeClickableText(item) || item.getAttribute('aria-label') || item.getAttribute('title') || '')
               .replace(/\\s+/g, ' ')
               .trim()
               .toLowerCase();
@@ -4425,6 +4557,7 @@ async function autoMergeClosedRelayTab(closedEntry) {
       : 'Relay closed · Merged back (Paused · Click Resume in Chrome)';
   const restoredEntry = {
     tabId: created.id,
+    replacedTabId: typeof closedEntry.tabId === 'number' ? closedEntry.tabId : null,
     substate: isWorker ? 'worker' : 'shared',
     uiMode: 'paused',
     attachedCdp: false,

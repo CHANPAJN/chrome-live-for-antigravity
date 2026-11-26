@@ -56,7 +56,7 @@ node "__CHROME_LIVE_CLI_PATH__" release --all
 ## Concurrency & Anti-Loop Rules (Important)
 
 - **Complex interactive publishing/forms -> run serially, not multi-agent concurrent:** Use `extract` for concurrent read-only scraping across many URLs. For multi-site rich-text posting (login flows, tag dropdowns, category switches, publish modals), run one site at a time rather than spawning parallel subagents against the same Chrome instance.
-- **Read `snapshot` state & alerts first:** `snapshot` reports `[DISABLED]`, `checked=true/false`, `selected`, `expanded`, and page `Alerts:` (form validation errors). Inspect those before retrying clicks or taking screenshots.
+- **Read `snapshot` state & alerts first:** `snapshot` reports `{DISABLED}`, `checked=true/false`, `selected`, `expanded`, and page `Alerts:` (form validation errors). Inspect those before retrying clicks or taking screenshots.
 - **Hard circuit-breaker for subagents:** Never read bridge source files (`chrome-live.mjs`, `service-worker.js`) or write ad-hoc `.mjs` workaround scripts during normal browsing tasks. Cap screenshots at 2 per page; if a page flow fails twice or exceeds 8 turns without reaching the target state, stop immediately and report the exact blocker.
 
 ## Safety Boundaries

@@ -12,6 +12,7 @@ import {
   DEFAULT_HOST,
   DEFAULT_PORT,
   ensureAuthToken,
+  ensureSecureDirSync,
   getStateDir,
   getTokenFilePath,
   tightenFileAclSync
@@ -140,15 +141,78 @@ async function callDaemonWithAutoStart(method, routePath, bodyObj = null, timeou
   return await requestDaemon(method, routePath, bodyObj, timeoutMs);
 }
 
-function parseFlags(args) {
+const BOOLEAN_CLI_FLAGS = new Set([
+  'compact',
+  'submit',
+  'fg',
+  'bg',
+  'json',
+  'all',
+  'no-focus',
+  'with-plugin',
+  'help',
+  'h'
+]);
+
+const KNOWN_VALUE_CLI_FLAGS = new Set([
+  'tab',
+  'out',
+  'label',
+  'max',
+  'target',
+  'selector',
+  'scroll',
+  'route',
+  'tip',
+  'domain',
+  'port',
+  'timeout'
+]);
+
+function parseFlags(args, cmd = '') {
   const positional = [];
   const flags = {};
+  let passthrough = false;
   for (let i = 0; i < args.length; i++) {
-    const cur = args[i];
-    if (cur.startsWith('--')) {
-      const key = cur.slice(2);
+    const cur = String(args[i] ?? '');
+    if (passthrough) {
+      positional.push(cur);
+      continue;
+    }
+    if (cur === '--') {
+      passthrough = true;
+      continue;
+    }
+    if (cur.startsWith('--') && cur.length > 2) {
+      const body = cur.slice(2);
+      const eqIdx = body.indexOf('=');
+      const key = eqIdx === -1 ? body : body.slice(0, eqIdx);
+      // Allow typing flag-like strings (`chrome-live type 0 "--silent-debugger-extension-api"`) without requiring `--`
+      if (
+        cmd === 'type' &&
+        positional.length === 1 &&
+        !BOOLEAN_CLI_FLAGS.has(key) &&
+        !KNOWN_VALUE_CLI_FLAGS.has(key)
+      ) {
+        positional.push(cur);
+        continue;
+      }
+      if (eqIdx !== -1) {
+        const rawVal = body.slice(eqIdx + 1);
+        flags[key] = BOOLEAN_CLI_FLAGS.has(key) ? rawVal !== 'false' && rawVal !== '0' : rawVal;
+        continue;
+      }
+      if (BOOLEAN_CLI_FLAGS.has(key)) {
+        flags[key] = true;
+        continue;
+      }
       const next = args[i + 1];
-      if (!next || next.startsWith('--')) {
+      const nextStr = next === undefined ? '' : String(next);
+      const nextKey = nextStr.startsWith('--') ? nextStr.slice(2).split('=')[0] : '';
+      if (
+        next === undefined ||
+        (nextStr.startsWith('--') && (BOOLEAN_CLI_FLAGS.has(nextKey) || KNOWN_VALUE_CLI_FLAGS.has(nextKey)))
+      ) {
         flags[key] = true;
       } else {
         flags[key] = next;
@@ -280,7 +344,7 @@ Usage:
 async function main() {
   const rawArgs = process.argv.slice(2);
   const cmd = rawArgs[0] || 'help';
-  const { positional, flags } = parseFlags(rawArgs.slice(1));
+  const { positional, flags } = parseFlags(rawArgs.slice(1), cmd);
 
   if (cmd === 'help' || cmd === '--help' || cmd === '-h') {
     printHelp();
@@ -648,8 +712,9 @@ async function main() {
     const outPath =
       typeof flags.out === 'string'
         ? path.resolve(flags.out)
-        : path.join(os.tmpdir(), `chrome-live-${Date.now()}.jpg`);
-    fs.writeFileSync(outPath, Buffer.from(b64, 'base64'));
+        : path.join(ensureSecureDirSync(path.join(getStateDir(), 'screenshots')), `chrome-live-${Date.now()}.jpg`);
+    fs.writeFileSync(outPath, Buffer.from(b64, 'base64'), { mode: 0o600 });
+    tightenFileAclSync(outPath);
     process.stdout.write(`${JSON.stringify({ ok: true, file: outPath, tabId: snap.result?.tabId })}\n`);
     return;
   }

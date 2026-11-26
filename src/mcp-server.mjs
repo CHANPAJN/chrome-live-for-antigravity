@@ -596,12 +596,22 @@ async function buildMonitorStructuredState(callDaemon, lastFrameTs = 0, targetTa
   const baseState = await callDaemon('GET', '/api/state');
   const tabs = Array.isArray(baseState?.tabs) ? baseState.tabs : [];
   // Never silently fall back to capturing a different shared tab when an explicit tabId was closed or released,
-  // and do NOT auto-pick/screenshot a tab when multiple tabs exist and no explicit targetTabId was given!
-  const resolvedPrimary = hasExplicitTab
-    ? tabs.find((t) => t.tabId === targetTabId) || null
-    : tabs.length === 1
-      ? tabs[0]
-      : tabs.find((t) => t.substate === 'shared') || tabs[0] || null;
+  // EXCEPT when the user closed a standalone relay popout window and `autoMergeClosedRelayTab` created its direct `paused: true` successor (`replacedTabId === targetTabId`).
+  let effectiveRequestedId = targetTabId;
+  let resolvedPrimary = null;
+  if (hasExplicitTab) {
+    resolvedPrimary = tabs.find((t) => t.tabId === targetTabId) || null;
+    if (!resolvedPrimary) {
+      const relaySuccessor = tabs.find((t) => t.replacedTabId === targetTabId) || null;
+      if (relaySuccessor) {
+        resolvedPrimary = relaySuccessor;
+        effectiveRequestedId = relaySuccessor.tabId;
+      }
+    }
+  } else {
+    resolvedPrimary =
+      tabs.length === 1 ? tabs[0] : tabs.find((t) => t.substate === 'shared') || tabs[0] || null;
+  }
   const effectiveTabId = resolvedPrimary ? resolvedPrimary.tabId : undefined;
   const hasTab = typeof effectiveTabId === 'number' && Number.isInteger(effectiveTabId);
   const canAutoSnap = hasTab && !resolvedPrimary?.paused && (hasExplicitTab || tabs.length === 1);
@@ -624,7 +634,7 @@ async function buildMonitorStructuredState(callDaemon, lastFrameTs = 0, targetTa
   const cachedIds = Array.isArray(baseState?.cachedFrameTabIds) ? baseState.cachedFrameTabIds : [];
   let fullState = baseState;
   if (hasExplicitTab && !resolvedPrimary) {
-    fullState = { ...baseState, requestedTabId: targetTabId, requestedTabMissing: true };
+    fullState = { ...baseState, requestedTabId: effectiveRequestedId, requestedTabMissing: true };
   } else if (hasTab && !resolvedPrimary?.paused && cachedIds.includes(effectiveTabId)) {
     if (lastFrameTs === 0 || targetServerTs !== lastFrameTs) {
       fullState = await callDaemon('GET', `/api/state?includeFrame=1${tabQuery}`);
@@ -637,7 +647,7 @@ async function buildMonitorStructuredState(callDaemon, lastFrameTs = 0, targetTa
     fullState = await callDaemon('GET', `/api/state?includeFrame=1${tabQuery}`);
   }
   if (hasExplicitTab && fullState && typeof fullState === 'object') {
-    fullState.requestedTabId = targetTabId;
+    fullState.requestedTabId = effectiveRequestedId;
   }
   return fullState;
 }

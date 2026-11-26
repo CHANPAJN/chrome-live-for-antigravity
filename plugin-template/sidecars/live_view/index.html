@@ -278,6 +278,13 @@
             let target = null;
             if (pinnedTabId !== null) {
               target = tabs.find((t) => t.tabId === pinnedTabId) || null;
+              if (!target) {
+                const relaySuccessor = tabs.find((t) => t.replacedTabId === pinnedTabId) || null;
+                if (relaySuccessor) {
+                  pinnedTabId = relaySuccessor.tabId;
+                  target = relaySuccessor;
+                }
+              }
               pinnedTabClosed = target === null;
             } else if (!pinnedTabClosed) {
               target = tabs.find((t) => t.substate === 'shared') || tabs[0] || null;

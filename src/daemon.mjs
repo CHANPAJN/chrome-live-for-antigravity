@@ -446,7 +446,7 @@ export function createDaemonServer(options = {}) {
 
     for (let idx = 0; idx < rawList.length; idx++) {
       const item = rawList[idx];
-      const check = evaluateUploadFileSafety(String(item || ''));
+      const check = evaluateUploadFileSafety(String(item || ''), { stateDir: resolveInstanceStateDir() });
       if (!check.allowed) {
         recordAudit('upload', { file: String(item || ''), code: check.code }, 'blocked');
         throw new Error(`[GUARDRAIL:${check.code}] ${check.reason}`);

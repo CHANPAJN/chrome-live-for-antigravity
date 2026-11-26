@@ -159,47 +159,57 @@ function scrubQueryStringTokens(rawQueryWithQuestionMark) {
   return { text: changed ? `?${pairs.join('&')}` : rawQueryWithQuestionMark, changed };
 }
 
-function canonicalizePathForGuardrail(rawSegment) {
+function decodeNestedPercentOnce(str) {
+  let changed = false;
+  const out = str.replace(/(?:%[0-9A-Fa-f]{2})+/g, (seq) => {
+    try {
+      const dec = decodeURIComponent(seq);
+      if (dec !== seq) changed = true;
+      return dec;
+    } catch {
+      // Literal `%25` followed by orphan high-bit hex (e.g. `100%25accurate` -> `%ac`, or mixed `%25ac%2563heckout` -> `%ac%63`):
+      // preserve invalid multi-byte sequences as literal `%XX` while still decoding valid single-byte ASCII `%00..%7F`!
+      const partial = seq.replace(/%[0-7][0-9A-Fa-f]/g, (asciiHex) => decodeURIComponent(asciiHex));
+      if (partial !== seq) changed = true;
+      return partial;
+    }
+  });
+  return { out, changed };
+}
+
+function canonicalizePathForGuardrail(rawSegment, splitRawQuery = false) {
   if (!rawSegment) return { ok: true, rawPath: '/', path: '/' };
-  let decoded = String(rawSegment);
-  if (decoded.includes('%')) {
-    if (/%(?![0-9A-Fa-f]{2})/.test(decoded)) {
+  const inputStr = String(rawSegment);
+  // Split unencoded `?` BEFORE percent-decoding so `%3f` inside a path (`/#/a%3f/../wallet/transfer` or `/v1%3f/wallet;x=1/transfer`)
+  // can never truncate matrix-parameter stripping or dot-segment collapsing!
+  const rawQIdx = splitRawQuery ? inputStr.indexOf('?') : -1;
+  let decodedPath = rawQIdx === -1 ? inputStr : inputStr.slice(0, rawQIdx);
+  const queryPart = rawQIdx === -1 ? '' : inputStr.slice(rawQIdx);
+
+  if (decodedPath.includes('%')) {
+    if (/%(?![0-9A-Fa-f]{2})/.test(decodedPath)) {
       return { ok: false, rawPath: '', path: '' };
     }
     try {
-      decoded = decodeURIComponent(decoded);
+      decodedPath = decodeURIComponent(decodedPath);
     } catch {
       return { ok: false, rawPath: '', path: '' };
     }
     for (let round = 1; round < 6; round++) {
-      if (!/%[0-9A-Fa-f]{2}/.test(decoded)) break;
-      let malformedUtf8 = false;
-      const next = decoded.replace(/(?:%[0-9A-Fa-f]{2})+/g, (seq) => {
-        try {
-          return decodeURIComponent(seq);
-        } catch {
-          malformedUtf8 = true;
-          return seq;
-        }
-      });
-      if (malformedUtf8) {
-        return { ok: false, rawPath: '', path: '' };
-      }
-      if (next === decoded) break;
-      decoded = next;
+      if (!/%[0-9A-Fa-f]{2}/.test(decodedPath)) break;
+      const step = decodeNestedPercentOnce(decodedPath);
+      if (!step.changed) break;
+      decodedPath = step.out;
     }
-    if (/%[0-9A-Fa-f]{2}/.test(decoded)) {
+    // Fail-closed if 7+ layers of nested percent-encoding still decode further
+    if (/%[0-9A-Fa-f]{2}/.test(decodedPath) && decodeNestedPercentOnce(decodedPath).changed) {
       return { ok: false, rawPath: '', path: '' };
     }
   }
-  const normalizedSlashes = decoded.replace(/\\/g, '/');
-  const qIdx = normalizedSlashes.indexOf('?');
-  const pathPart = qIdx === -1 ? normalizedSlashes : normalizedSlashes.slice(0, qIdx);
-  const queryPart = qIdx === -1 ? '' : normalizedSlashes.slice(qIdx);
-
+  const normalizedSlashes = decodedPath.replace(/\\/g, '/');
   const rawPieces = [];
   const stack = [];
-  for (const rawPiece of pathPart.split('/')) {
+  for (const rawPiece of normalizedSlashes.split('/')) {
     const cleanPiece = rawPiece.split(';')[0];
     if (!cleanPiece || cleanPiece === '.') continue;
     rawPieces.push(cleanPiece);
@@ -256,28 +266,50 @@ export function redactUrlForAudit(rawUrl) {
       }
     }
     if (parsed.hash) {
-      let cleanedHash = parsed.hash.replace(HASH_SENSITIVE_PAIR_RX, '$1$2=REDACTED');
-      if (cleanedHash === parsed.hash && /^#!?(?:eyJ[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{32,})$/.test(parsed.hash)) {
-        cleanedHash = '#REDACTED';
+      const prefixMatch = parsed.hash.match(/^(#!?)/);
+      const hashPrefix = prefixMatch ? prefixMatch[1] : '#';
+      const rawHashBody = parsed.hash.slice(hashPrefix.length);
+      let cleanedHash = parsed.hash;
+
+      if (
+        rawHashBody &&
+        !rawHashBody.includes('/') &&
+        !rawHashBody.includes('?') &&
+        !rawHashBody.includes('&') &&
+        !rawHashBody.includes('=') &&
+        (isHighEntropyPathToken(rawHashBody) || /^(?:eyJ[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{32,})$/.test(rawHashBody))
+      ) {
+        cleanedHash = `${hashPrefix}REDACTED`;
+      } else if (!rawHashBody.startsWith('/') && !rawHashBody.includes('?') && (rawHashBody.includes('=') || rawHashBody.includes('&'))) {
+        // OAuth2 / OIDC implicit fragment `#r=eyJ...&lang=zh`, `#state=xyz&v=eyJ...`, or percent-encoded `#%74oken=secret`
+        const scrubbedFragPairs = scrubQueryStringTokens(`?${rawHashBody}`);
+        if (scrubbedFragPairs.changed) {
+          cleanedHash = `${hashPrefix}${scrubbedFragPairs.text.slice(1)}`;
+        }
       } else {
-        // Scrub high-entropy token segments and query values inside SPA hash routes (#/invite/9f8e... or #/verify?v=eyJ...)
-        const prefixMatch = cleanedHash.match(/^(#!?)/);
-        const hashPrefix = prefixMatch ? prefixMatch[1] : '#';
-        const body = cleanedHash.slice(hashPrefix.length);
-        const qPos = body.indexOf('?');
-        const hPath = qPos === -1 ? body : body.slice(0, qPos);
-        const hQuery = qPos === -1 ? '' : body.slice(qPos);
+        const qPos = rawHashBody.indexOf('?');
+        const hPath = qPos === -1 ? rawHashBody : rawHashBody.slice(0, qPos);
+        const hQuery = qPos === -1 ? '' : rawHashBody.slice(qPos);
         const hParts = hPath.split('/');
         let hChanged = false;
         for (let i = 0; i < hParts.length; i++) {
-          if (!hParts[i]) continue;
-          if (hParts[i].includes(';')) {
-            const nextSeg = redactMatrixParamsInSegment(hParts[i]);
-            if (nextSeg !== hParts[i]) {
+          const seg = hParts[i];
+          if (!seg) continue;
+          if (seg.includes('=') || seg.includes('&')) {
+            const scrubbedSegPairs = scrubQueryStringTokens(`?${seg}`);
+            if (scrubbedSegPairs.changed) {
+              hParts[i] = scrubbedSegPairs.text.slice(1);
+              hChanged = true;
+              continue;
+            }
+          }
+          if (seg.includes(';')) {
+            const nextSeg = redactMatrixParamsInSegment(seg);
+            if (nextSeg !== seg) {
               hParts[i] = nextSeg;
               hChanged = true;
             }
-          } else if (isHighEntropyPathToken(hParts[i])) {
+          } else if (isHighEntropyPathToken(seg)) {
             hParts[i] = 'REDACTED';
             hChanged = true;
           }
@@ -287,6 +319,9 @@ export function redactUrlForAudit(rawUrl) {
           cleanedHash = `${hashPrefix}${hParts.join('/')}${scrubbedHQuery.text}`;
         }
       }
+
+      // Final pass with HASH_SENSITIVE_PAIR_RX in case of nested `#` markers inside fragment
+      cleanedHash = cleanedHash.replace(HASH_SENSITIVE_PAIR_RX, '$1$2=REDACTED');
       if (cleanedHash !== parsed.hash) {
         parsed.hash = cleanedHash;
         mutated = true;
@@ -371,12 +406,12 @@ export function evaluateUrlSafety(rawUrl, customBlockedDomains = []) {
     };
   }
 
-  const canonPath = canonicalizePathForGuardrail(parsed.pathname);
+  const canonPath = canonicalizePathForGuardrail(parsed.pathname, false);
   if (!canonPath.ok) {
     return { allowed: false, code: 'MALFORMED_URL', reason: 'Malformed percent-encoding in URL pathname' };
   }
   const rawHashBody = parsed.hash ? parsed.hash.replace(/^#+!?/, '') : '';
-  const canonHash = rawHashBody ? canonicalizePathForGuardrail(rawHashBody) : { ok: true, rawPath: '', path: '' };
+  const canonHash = rawHashBody ? canonicalizePathForGuardrail(rawHashBody, true) : { ok: true, rawPath: '', path: '' };
   if (!canonHash.ok) {
     return { allowed: false, code: 'MALFORMED_URL', reason: 'Malformed percent-encoding in URL fragment' };
   }
@@ -400,9 +435,9 @@ export function evaluateUrlSafety(rawUrl, customBlockedDomains = []) {
 }
 
 const SENSITIVE_FILE_DIR_RX =
-  /(?:^|\/)(?:\.ssh|\.gnupg|\.aws|\.kube|\.azure|\.gcloud|\.docker|\.chrome-live-antigravity|gcloud)(?:\/|$)/i;
+  /(?:^|\/)(?:\.ssh|\.gnupg|\.aws|\.kube|\.azure|\.gcloud|\.docker|gcloud)(?:\/|$)/i;
 const SENSITIVE_FILE_NAME_RX =
-  /^(?:(?!.*\.pub$)id_(?:rsa|ed25519|ecdsa|dsa)(?:$|[._-].+)|authorized_keys|known_hosts|auth\.token|site-playbooks\.json|daemon\.pid|spawn\.(?:lock|cooldown)|\.local-runtime\.json|agent_vault\.enc|\.env(?:\..+)?|\.npmrc|\.pypirc|\.netrc|\.git-credentials|kubeconfig|credentials(?:\.json)?|application_default_credentials\.json|Local\s+State|Cookies(?:-journal)?|cookies\.sqlite|key[34]\.db|cert9\.db|logins\.json|Login Data(?:\s+For\s+Account)?|Web Data|.*\.(?:pem|key|p12|pfx|kdbx|ovpn|jks|keystore)|.*\.tfstate(?:\.backup)?)$/i;
+  /^(?:(?!.*\.pub$)id_(?:rsa|ed25519|ecdsa|dsa)(?:$|[._-].+)|authorized_keys|known_hosts|auth\.token|site-playbooks\.json|daemon\.pid|spawn\.(?:lock|cooldown)|\.local-runtime\.json|agent_vault\.enc|accessTokens\.json|\.env(?:\..+)?|\.npmrc|\.pypirc|\.netrc|\.git-credentials|kubeconfig|credentials(?:\.json)?|application_default_credentials\.json|Local\s+State|Cookies(?:-journal)?|cookies\.sqlite|key[34]\.db|cert9\.db|logins\.json|Login Data(?:\s+For\s+Account)?|Web Data|.*\.(?:pem|key|p12|pfx|kdbx|ovpn|jks|keystore|gpg|age)|.*\.tfstate(?:\.backup)?)$/i;
 
 function resolveCanonicalPath(targetPath) {
   try {
@@ -425,11 +460,12 @@ function isPathInsideDir(candidatePath, dirPath) {
   return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
-export function getDefaultUploadStagingDir() {
-  return path.join(getStateDir(), 'uploads');
+export function getDefaultUploadStagingDir(stateDirOverride = '') {
+  const base = stateDirOverride ? path.resolve(String(stateDirOverride)) : getStateDir();
+  return path.join(base, 'uploads');
 }
 
-function parseAllowedUploadDirs(explicitDirs) {
+function parseAllowedUploadDirs(explicitDirs, stateDirOverride = '') {
   let rawList;
   if (Array.isArray(explicitDirs)) {
     rawList = explicitDirs;
@@ -448,7 +484,7 @@ function parseAllowedUploadDirs(explicitDirs) {
   // Strict Fail-Closed: if explicitDirs or CHROME_LIVE_UPLOAD_DIR resolves to zero valid directories
   // (e.g. ";" or empty array), always fall back to the isolated default staging directory.
   if (dirs.length === 0) {
-    const defaultDir = getDefaultUploadStagingDir();
+    const defaultDir = getDefaultUploadStagingDir(stateDirOverride);
     try {
       fs.mkdirSync(defaultDir, { recursive: true, mode: 0o700 });
     } catch {}
@@ -476,11 +512,12 @@ export function evaluateUploadFileSafety(rawFilePath, options = {}) {
   const resolvedPath = path.resolve(expandedPath);
   const realPath = resolveCanonicalPath(resolvedPath);
 
-  const allowedDirs = parseAllowedUploadDirs(options.allowedDirs);
-  // Check sensitive filename/directory patterns BEFORE and AFTER canonicalization,
-  // while exempting the dedicated uploads staging subdir inside ~/.chrome-live-antigravity/uploads
-  const defaultUploadsDir = resolveCanonicalPath(path.resolve(getDefaultUploadStagingDir()));
-  const activeStateDir = resolveCanonicalPath(path.resolve(getStateDir()));
+  const effectiveStateDir = options.stateDir ? path.resolve(String(options.stateDir)) : getStateDir();
+  const allowedDirs = parseAllowedUploadDirs(options.allowedDirs, effectiveStateDir);
+  // Check sensitive filename/directory patterns UNCONDITIONALLY (including `.aws/config`, `.ssh/config`, `.docker/config.json` inside `uploads/`!),
+  // while blocking files inside `effectiveStateDir` outside its `uploads/` subdirectory.
+  const defaultUploadsDir = resolveCanonicalPath(path.resolve(getDefaultUploadStagingDir(effectiveStateDir)));
+  const activeStateDir = resolveCanonicalPath(effectiveStateDir);
   for (const candidate of realPath === resolvedPath ? [resolvedPath] : [resolvedPath, realPath]) {
     const normalized = candidate.replace(/\\/g, '/');
     const baseName = path.basename(candidate).replace(/[.\s]+$/, '');
@@ -491,14 +528,21 @@ export function evaluateUploadFileSafety(rawFilePath, options = {}) {
         reason: `Uploading sensitive credential or key file "${baseName}" is blocked by local guardrails`
       };
     }
-    const inDefaultStaging = isPathInsideDir(candidate, defaultUploadsDir);
-    const inActiveStateDir =
-      isPathInsideDir(candidate, activeStateDir) || path.resolve(candidate) === path.resolve(activeStateDir);
-    if (!inDefaultStaging && (SENSITIVE_FILE_DIR_RX.test(normalized) || inActiveStateDir)) {
+    if (SENSITIVE_FILE_DIR_RX.test(normalized)) {
       return {
         allowed: false,
         code: 'SENSITIVE_FILE',
-        reason: `Uploading files from protected directory is blocked by local guardrails`
+        reason: `Uploading files from protected credential directory is blocked by local guardrails`
+      };
+    }
+    const inDefaultStaging = isPathInsideDir(candidate, defaultUploadsDir);
+    const inActiveStateDir =
+      isPathInsideDir(candidate, activeStateDir) || path.resolve(candidate) === path.resolve(activeStateDir);
+    if (!inDefaultStaging && inActiveStateDir) {
+      return {
+        allowed: false,
+        code: 'SENSITIVE_FILE',
+        reason: `Uploading internal bridge state files is blocked by local guardrails`
       };
     }
   }

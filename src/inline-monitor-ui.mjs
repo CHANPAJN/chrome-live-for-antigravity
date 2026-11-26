@@ -804,7 +804,14 @@ export function buildInlineMonitorHtml() {
         let primary = null;
         if (selectedTabId !== null) {
           primary = tabs.find((t) => t.tabId === selectedTabId) || null;
-          // Do NOT silently jump to capturing another shared tab when the watched tab closes or is released
+          if (!primary) {
+            const relaySuccessor = tabs.find((t) => t.replacedTabId === selectedTabId) || null;
+            if (relaySuccessor) {
+              selectedTabId = relaySuccessor.tabId;
+              primary = relaySuccessor;
+            }
+          }
+          // Do NOT silently jump to capturing another unrelated shared tab when the watched tab closes or is released
           pinnedTabClosed = primary === null;
         } else if (!pinnedTabClosed) {
           primary = tabs.find((t) => t.substate === 'shared') || tabs[0] || null;

@@ -25,6 +25,7 @@ import {
   saveManualPlaybook,
   setPlaybookEnabled
 } from '../src/playbook-store.mjs';
+import { tightenFileAclSync } from '../src/token-store.mjs';
 import { computeWebSocketAccept, encodeWsFrame, NativeWsPeer } from '../src/ws-codec.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -235,8 +236,9 @@ test('Repository hygiene gate: zero external npm dependencies, zero prebuilt bin
   fs.writeFileSync(
     runtimeBootstrapPath,
     JSON.stringify({ host: '127.0.0.1', port: 28196, token: 'simulated_secret_token_never_pack_me' }),
-    'utf8'
+    { encoding: 'utf8', mode: 0o600 }
   );
+  tightenFileAclSync(runtimeBootstrapPath);
   try {
     const packRun =
       process.platform === 'win32'
@@ -260,7 +262,8 @@ test('Repository hygiene gate: zero external npm dependencies, zero prebuilt bin
   } finally {
     try {
       if (hadExistingBootstrap && previousBootstrapRaw !== null) {
-        fs.writeFileSync(runtimeBootstrapPath, previousBootstrapRaw, 'utf8');
+        fs.writeFileSync(runtimeBootstrapPath, previousBootstrapRaw, { encoding: 'utf8', mode: 0o600 });
+        tightenFileAclSync(runtimeBootstrapPath);
       } else if (fs.existsSync(runtimeBootstrapPath)) {
         fs.unlinkSync(runtimeBootstrapPath);
       }
@@ -3130,6 +3133,318 @@ test('Blind-audit round-5 regressions: MCP batch screenshot & playbook opt-in lo
     await daemon.close();
     fs.rmSync(tempStateDir, { recursive: true, force: true });
   }
+});
+
+test('Blind-audit round-6 regressions: OAuth2 multi-param & percent-key #fragment redaction, DOM-clobber/formtarget/relative embedded checkout frame guardrails, uploads/.aws & stateDir upload confinement, 100%25accurate vs %3f/../wallet/transfer, CLI boolean parseFlags & closed-relay replacedTabId handoff', async () => {
+  const { buildInlineMonitorHtml } = await import('../src/inline-monitor-ui.mjs');
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+  const cliSource = fs.readFileSync(path.join(REPO_ROOT, 'bin', 'chrome-live.mjs'), 'utf8');
+
+  const extHelperMatch = swSource.match(
+    /const CHECKOUT_SEGMENT_RX =[\s\S]*?function canonicalizeRouteForGuardrail[\s\S]*?\n\}/
+  );
+  const extRedactorMatch = swSource.match(
+    /const LOCAL_AUDIT_SENSITIVE_PARAM_RX =[\s\S]*?function redactUrlsInTextLocal[\s\S]*?\n\}/
+  );
+  const extCheckTabMatch = swSource.match(/function checkTabUrlAllowed\(rawUrl\)[\s\S]*?\n\}/);
+  assert.ok(extHelperMatch && extRedactorMatch && extCheckTabMatch);
+  const extVm = vm.createContext({
+    URL,
+    decodeURIComponent,
+    BUILTIN_PROTECTED_DOMAINS: ['stripe.com', 'alipay.com'],
+    customBlockedDomains: [],
+    bridgeConfig: { port: 28196 }
+  });
+  vm.runInContext(`${extHelperMatch[0]}\n${extRedactorMatch[0]}\n${extCheckTabMatch[0]}`, extVm);
+
+  // 1. OAuth2 / OIDC `#k1=v1&k2=v2` multi-param high-entropy tokens & percent-encoded sensitive key `#%74oken=...`
+  for (const [rawOauthUrl, secretSubstr] of [
+    [
+      'https://app.example.com/cb#r=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U&lang=zh',
+      'eyJhbGci'
+    ],
+    [
+      'https://app.example.com/cb#state=xyz&v=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U',
+      'eyJhbGci'
+    ],
+    ['https://app.example.com/cb#%74oken=my_secret_123', 'my_secret_123'],
+    ['https://app.example.com/cb#access%5ftoken=short_sec_888&foo=bar', 'short_sec_888']
+  ]) {
+    assert.equal(
+      redactUrlForAudit(rawOauthUrl).includes(secretSubstr),
+      false,
+      `guardrails redactUrlForAudit leaked ${secretSubstr} in ${rawOauthUrl}`
+    );
+    assert.equal(
+      extVm.redactAuditUrl(rawOauthUrl).includes(secretSubstr),
+      false,
+      `service-worker redactAuditUrl leaked ${secretSubstr} in ${rawOauthUrl}`
+    );
+  }
+
+  // 2. Literal `%25` followed by orphan hex (`100%25accurate`, `10%25cashback`) passes, while `%3f` encoded path traversal/matrix `/wallet/transfer` is blocked!
+  for (const validUrl of [
+    'https://example.com/articles/100%25accurate',
+    'https://example.com/promo/10%25cashback',
+    'https://example.com/deals/100%25fast',
+    'https://example.com/#/topic/100%25deal'
+  ]) {
+    assert.equal(evaluateUrlSafety(validUrl).allowed, true, `Must allow valid literal %25 URL: ${validUrl}`);
+    assert.equal(extVm.checkTabUrlAllowed(validUrl).allowed, true);
+  }
+  for (const bypassAttempt of [
+    'https://shop.example.com/v1%3f/wallet;jsessionid=123/transfer',
+    'https://shop.example.com/v1%3f/%252e%252e/wallet/%252e/transfer',
+    'https://shop.example.com/#/a%3f/../wallet/./transfer',
+    'https://shop.example.com/100%25accurate/%2563heckout',
+    'https://shop.example.com/%25ac/%2563heckout'
+  ]) {
+    assert.equal(evaluateUrlSafety(bypassAttempt).allowed, false, `Must block payment evasion: ${bypassAttempt}`);
+    assert.equal(extVm.checkTabUrlAllowed(bypassAttempt).allowed, false);
+  }
+
+  // 3. `inspectEmbeddedFramesSafety` defeats `button.formAction` truthy shortcut, `<input name="action">` DOM Clobbering, relative `/checkout`, and `<a target="payFrame">`
+  const inspectFuncMatch = swSource.match(/const iframeRes = await runHudScriptSafe\(tabId, \{\s*func: \(\) => \{([\s\S]*?)\n    \}\n  \}\);/);
+  assert.ok(inspectFuncMatch, 'Must locate inspectEmbeddedFramesSafety page script');
+
+  class FakeElement {
+    constructor(tag, attrs = {}, children = []) {
+      this.tagName = tag.toUpperCase();
+      this._attrs = { ...attrs };
+      this.children = children;
+      this.shadowRoot = null;
+      this.ownerDocument = { baseURI: 'https://shop.example.com/orders/1' };
+    }
+    getAttribute(k) {
+      return Object.hasOwn(this._attrs, k) ? this._attrs[k] : null;
+    }
+    hasAttribute(k) {
+      return Object.hasOwn(this._attrs, k);
+    }
+    getBoundingClientRect() {
+      return { width: 300, height: 200 };
+    }
+    querySelectorAll() {
+      return [];
+    }
+    closest() {
+      return null;
+    }
+  }
+  class FakeFormElement extends FakeElement {}
+
+  // Simulate DOM Clobbering (`form.action` clobbered by `<input name="action">`, `form.getAttribute` clobbered) + WHATWG `btn.formAction = document.URL`!
+  const hiddenPayIframe = new FakeElement('iframe', { name: 'payFrame', src: 'about:blank' });
+  hiddenPayIframe.getBoundingClientRect = () => ({ width: 0, height: 0 });
+
+  const clobberedAlipayForm = Object.assign(new FakeFormElement('form', { target: 'payFrame', action: 'https://cashier.alipay.com/standard/lightpay' }), {
+    action: { clobberedInput: true },
+    getAttribute: { clobberedInput: true }
+  });
+  const stripeFormNoTarget = new FakeFormElement('form', { action: 'https://checkout.stripe.com/c/pay/cs_live_999' });
+  const submitBtnFormTarget = Object.assign(new FakeElement('button', { type: 'submit', formtarget: 'payFrame' }), {
+    form: stripeFormNoTarget,
+    formAction: 'https://shop.example.com/orders/1' // WHATWG default IDL property when no `formaction` content attribute exists!
+  });
+  const relativeCheckoutLink = new FakeElement('a', { target: 'payFrame', href: '/checkout?order=1' });
+
+  const allNodes = [hiddenPayIframe, clobberedAlipayForm, stripeFormNoTarget, submitBtnFormTarget, relativeCheckoutLink];
+  const domCtx = vm.createContext({
+    Element: FakeElement,
+    HTMLFormElement: FakeFormElement,
+    URL,
+    location: { href: 'https://shop.example.com/orders/1' },
+    window: { getComputedStyle: () => ({ display: 'none', visibility: 'visible', opacity: '1' }) },
+    document: {
+      baseURI: 'https://shop.example.com/orders/1',
+      querySelectorAll(sel) {
+        if (sel === 'iframe, frame') return [hiddenPayIframe];
+        if (sel === 'form') return [clobberedAlipayForm, stripeFormNoTarget];
+        if (sel === 'button, input') return [submitBtnFormTarget];
+        if (sel === 'a[target][href], area[target][href]') return [relativeCheckoutLink];
+        if (sel === '*') return allNodes;
+        return [];
+      }
+    }
+  });
+  const extractedUrls = vm.runInContext(`(function() { ${inspectFuncMatch[1]} })()`, domCtx);
+  assert.ok(extractedUrls.includes('https://cashier.alipay.com/standard/lightpay'), 'Must defeat <input name="action"> DOM clobbering');
+  assert.ok(extractedUrls.includes('https://checkout.stripe.com/c/pay/cs_live_999'), 'Must defeat button.formAction default URL shortcut');
+  assert.ok(extractedUrls.includes('https://shop.example.com/checkout?order=1'), 'Must resolve relative /checkout link targeting named iframe');
+
+  // 4. Default `uploads/` staging dir still blocks `.aws/config`, `.ssh/config`, `.docker/config.json`, AND `options.stateDir` isolates per-instance state!
+  const instStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-r6-inst-state-'));
+  const instUploadsDir = path.join(instStateDir, 'uploads');
+  fs.mkdirSync(path.join(instUploadsDir, '.aws'), { recursive: true });
+  fs.mkdirSync(path.join(instUploadsDir, '.ssh'), { recursive: true });
+  fs.mkdirSync(path.join(instUploadsDir, '.docker'), { recursive: true });
+  const awsCfg = path.join(instUploadsDir, '.aws', 'config');
+  const sshCfg = path.join(instUploadsDir, '.ssh', 'config');
+  const dockerCfg = path.join(instUploadsDir, '.docker', 'config.json');
+  const internalStateJson = path.join(instStateDir, 'custom-session.json');
+  const normalUploadPng = path.join(instUploadsDir, 'banner.png');
+  for (const p of [awsCfg, sshCfg, dockerCfg, internalStateJson, normalUploadPng]) {
+    fs.writeFileSync(p, 'test', 'utf8');
+  }
+  try {
+    // Notice we do NOT touch process.env.CHROME_LIVE_HOME here — verifying pure `options.stateDir` support!
+    assert.equal(evaluateUploadFileSafety(awsCfg, { stateDir: instStateDir }).allowed, false, 'uploads/.aws/config must be blocked');
+    assert.equal(evaluateUploadFileSafety(sshCfg, { stateDir: instStateDir }).allowed, false, 'uploads/.ssh/config must be blocked');
+    assert.equal(evaluateUploadFileSafety(dockerCfg, { stateDir: instStateDir }).allowed, false, 'uploads/.docker/config.json must be blocked');
+    assert.equal(evaluateUploadFileSafety(internalStateJson, { stateDir: instStateDir, allowedDirs: [os.tmpdir()] }).allowed, false, 'State dir files outside uploads/ must be blocked');
+    assert.equal(evaluateUploadFileSafety(normalUploadPng, { stateDir: instStateDir }).allowed, true, 'Valid staged image inside stateDir/uploads must be allowed');
+  } finally {
+    fs.rmSync(instStateDir, { recursive: true, force: true });
+  }
+
+  // 5. CLI `parseFlags` handles leading boolean flags (`batch --compact -`, `open --fg <url>`), `--key=value`, `--` terminator, and `--flag` text in `type`
+  const parseFlagsMatch = cliSource.match(/const BOOLEAN_CLI_FLAGS =[\s\S]*?function parseFlags[\s\S]*?\n\}/);
+  assert.ok(parseFlagsMatch);
+  const runParseFlags = vm.runInNewContext(`${parseFlagsMatch[0]}; parseFlags;`);
+
+  const pfBatch = runParseFlags(['--compact', '-'], 'batch');
+  assert.equal(pfBatch.flags.compact, true);
+  assert.deepEqual(Array.from(pfBatch.positional), ['-']);
+
+  const pfOpen = runParseFlags(['--fg', 'https://example.com'], 'open');
+  assert.equal(pfOpen.flags.fg, true);
+  assert.deepEqual(Array.from(pfOpen.positional), ['https://example.com']);
+
+  const pfTypeFlagText = runParseFlags(['0', '--silent-debugger-extension-api', '--submit'], 'type');
+  assert.equal(pfTypeFlagText.flags.submit, true);
+  assert.deepEqual(Array.from(pfTypeFlagText.positional), ['0', '--silent-debugger-extension-api']);
+
+  const pfTerminator = runParseFlags(['0', '--', '--submit'], 'type');
+  assert.equal(pfTerminator.flags.submit, undefined);
+  assert.deepEqual(Array.from(pfTerminator.positional), ['0', '--submit']);
+
+  const pfEq = runParseFlags(['--tab=77', '--max=25'], 'snapshot');
+  assert.equal(pfEq.flags.tab, '77');
+  assert.equal(pfEq.flags.max, '25');
+
+  // 6. Closing standalone relay popout window (`replacedTabId: 101 -> tabId: 102`) smoothly hands off `selectedTabId` without deadlock
+  const html = buildInlineMonitorHtml();
+  const renderBlockMatch = html.match(/function renderTabStrip\(tabs\)[\s\S]*?function renderSnapshot\(data\)[\s\S]*?\n      \}/);
+  assert.ok(renderBlockMatch);
+  const makeEl = () => ({
+    textContent: '',
+    disabled: false,
+    src: '',
+    onload: null,
+    style: { display: '' },
+    dataset: {},
+    removeAttribute(attr) {
+      if (attr === 'src') this.src = '';
+    },
+    replaceChildren() {},
+    appendChild() {},
+    addEventListener() {}
+  });
+  const uiVm = vm.createContext({
+    IS_ZH: true,
+    L: { offline: 'Offline', active: 'Active', idle: 'Idle', relayOut: 'Popout', relayBack: 'Merge' },
+    selectedTabId: 101,
+    currentTab: null,
+    hasActiveTabs: true,
+    lastFrameTs: 0,
+    lastFrameTabId: null,
+    interactionMode: 'watch',
+    led: makeEl(),
+    titleEl: makeEl(),
+    subEl: makeEl(),
+    screenImg: makeEl(),
+    emptyEl: makeEl(),
+    remoteBtn: makeEl(),
+    regionBtn: makeEl(),
+    attachBtn: makeEl(),
+    relayBtn: makeEl(),
+    snapBtn: makeEl(),
+    releaseBtn: makeEl(),
+    tabStrip: makeEl(),
+    document: { createElement: () => makeEl() },
+    setMode(m) {
+      this.interactionMode = m;
+    },
+    setBtnLabel() {},
+    showStatus() {},
+    reportSize() {},
+    callAppAction: async () => {}
+  });
+  vm.runInContext(
+    `${renderBlockMatch[0]}\nthis.__get = () => ({ selectedTabId, currentTab, pinnedTabClosed });\nthis.__render = renderSnapshot;`,
+    uiVm
+  );
+  // Relay window 101 was closed by clicking `×`, creating successor tab 102 with `replacedTabId: 101, paused: true`
+  uiVm.__render({
+    ok: true,
+    extensionConnected: true,
+    tabs: [{ tabId: 102, replacedTabId: 101, substate: 'shared', paused: true, inRelayPopout: false, title: 'Shop' }]
+  });
+  assert.equal(uiVm.__get().selectedTabId, 102, 'Inline UI must follow replacedTabId successor on relay close');
+  assert.equal(uiVm.__get().pinnedTabClosed, false);
+  assert.equal(uiVm.__get().currentTab?.tabId, 102);
+
+  // 7. 6-digit Web Component split OTP (`<otp-digit>` with open `shadowRoot` containing `<input maxlength="1">`, 5 hops deep) is blocked!
+  const typeGuardMatch = swSource.match(
+    /if \(!el\) return \{ ok: false, error: `Input element not found: \$\{tgt\}` \};\s*(const elStyle = window\.getComputedStyle\(el\);[\s\S]*?return \{\s*ok: false,\s*error:\s*'\[GUARDRAIL\] Automated typing into password[\s\S]*?\};\s*\})/
+  );
+  assert.ok(typeGuardMatch);
+  const evalTypeGuard = vm.runInNewContext(
+    `(function(el, outerMatchedEl, document, window, HTMLInputElement) { ${typeGuardMatch[1]} return { ok: true }; })`
+  );
+  class MockInput6 {}
+  const makeOtpDigitHost = () => ({
+    shadowRoot: {
+      querySelectorAll: (sel) => (sel === 'input[maxlength="1"]' ? [{}] : [])
+    }
+  });
+  const otpBoard = {
+    id: '',
+    labels: [],
+    previousElementSibling: null,
+    parentElement: null,
+    closest: () => null,
+    getRootNode: () => ({}),
+    getAttribute: () => '',
+    querySelectorAll: (sel) => (sel === '*' ? Array.from({ length: 6 }, makeOtpDigitHost) : [])
+  };
+  // Wrap inside 4 intermediate wrapper divs + ShadowRoot host (5 hops total)
+  let curParent = otpBoard;
+  for (let i = 0; i < 4; i++) {
+    curParent = {
+      id: '',
+      labels: [],
+      previousElementSibling: null,
+      parentElement: curParent,
+      closest: () => null,
+      getRootNode: () => ({}),
+      getAttribute: () => '',
+      querySelectorAll: () => []
+    };
+  }
+  const deepSplitInput = Object.assign(new MockInput6(), {
+    tagName: 'INPUT',
+    type: 'tel',
+    id: '',
+    maxLength: 1,
+    labels: [],
+    previousElementSibling: null,
+    parentElement: curParent,
+    closest: () => null,
+    getRootNode: () => ({}),
+    getAttribute: (k) => (k === 'maxlength' ? '1' : '')
+  });
+  assert.equal(
+    evalTypeGuard(
+      deepSplitInput,
+      deepSplitInput,
+      { getElementById: () => null },
+      { getComputedStyle: () => ({ webkitTextSecurity: 'none', getPropertyValue: () => 'none' }) },
+      MockInput6
+    ).ok,
+    false,
+    'Must block 5-hop deep Web Component <otp-digit> split OTP input'
+  );
 });
 
 test('Sub-frame guardrail allows passive 0x0 Stripe anti-fraud beacons on community forums while blocking real payment Elements & Checkout iframes', () => {
