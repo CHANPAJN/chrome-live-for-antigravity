@@ -1,32 +1,22 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Chrome Live View</title>
     <style>
       :root {
-        color-scheme: light dark;
-        --bg: #f8fafc;
+        --bg: #f6f7f9;
         --panel: #ffffff;
-        --stage: #f1f5f9;
-        --border: #e2e8f0;
-        --text: #0f172a;
-        --muted: #64748b;
-        --accent: #0284c7;
-        --ok: #10b981;
-      }
-      @media (prefers-color-scheme: dark) {
-        :root {
-          --bg: #0c0e13;
-          --panel: #151922;
-          --stage: #0f1219;
-          --border: #262c3a;
-          --text: #f1f5f9;
-          --muted: #94a3b8;
-          --accent: #0ea5e9;
-          --ok: #10b981;
-        }
+        --stage: #f1f3f6;
+        --border: #dde2ea;
+        --text: #1f2937;
+        --muted: #6b7280;
+        --accent: #2563eb;
+        --accent-soft: #eff6ff;
+        --ok: #16a34a;
+        --warn: #d97706;
+        --warn-soft: #fffbeb;
       }
       * {
         box-sizing: border-box;
@@ -43,13 +33,14 @@
         border: 1px solid var(--border);
         border-radius: 12px;
         padding: 12px;
+        box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
       }
       .head {
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 10px;
-        margin-bottom: 10px;
+        margin-bottom: 8px;
       }
       .dot-wrap {
         display: flex;
@@ -61,18 +52,47 @@
         width: 9px;
         height: 9px;
         border-radius: 50%;
-        background: #94a3b8;
+        background: #9ca3af;
         flex-shrink: 0;
       }
       .dot[data-on="true"] {
         background: var(--ok);
-        box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.22);
       }
       .title-text {
         font-weight: 600;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+      }
+      .tab-strip {
+        display: none;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-bottom: 8px;
+      }
+      .tab-pill {
+        font: 500 11.5px/1.2 inherit;
+        padding: 5px 9px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: var(--stage);
+        color: var(--text);
+        cursor: pointer;
+        max-width: 190px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .tab-pill[data-active="true"] {
+        background: var(--accent-soft);
+        border-color: var(--accent);
+        color: var(--accent);
+        font-weight: 600;
+      }
+      .tab-pill[data-popout="true"] {
+        background: var(--warn-soft);
+        border-color: #fcd34d;
+        color: var(--warn);
       }
       .toolbar {
         display: flex;
@@ -120,7 +140,7 @@
         border: 1px solid var(--border);
         border-radius: 0 0 9px 9px;
         overflow: hidden;
-        min-height: 240px;
+        min-height: 260px;
         display: grid;
         place-items: center;
       }
@@ -133,7 +153,7 @@
         padding: 32px 18px;
         text-align: center;
         color: var(--muted);
-        max-width: 360px;
+        max-width: 380px;
       }
       .primary-btn {
         margin-top: 10px;
@@ -155,11 +175,13 @@
           <span class="dot" id="led"></span>
           <span class="title-text" id="statusTitle">Connecting...</span>
         </div>
-        <span id="tabBadge" style="font-size: 11.5px; color: var(--muted)">0 tabs</span>
+        <span id="tabBadge" style="font-size: 11.5px; color: var(--muted); flex-shrink: 0">0 tabs</span>
       </div>
 
+      <div class="tab-strip" id="tabStrip"></div>
+
       <div class="toolbar">
-        <span class="url-label" id="urlLabel">127.0.0.1:__CHROME_LIVE_PORT__</span>
+        <span class="url-label" id="urlLabel">127.0.0.1:28196</span>
         <div class="btn-group">
           <button type="button" id="refreshBtn">Refresh</button>
           <button type="button" id="releaseBtn">Release</button>
@@ -179,20 +201,26 @@
         const IS_ZH = /^zh\b/i.test(navigator.language || '');
         const TXT = IS_ZH
           ? {
-              waking: '正在唤醒本地 __CHROME_LIVE_PORT__ 桥接服务...',
+              waking: '正在唤醒本地 28196 桥接服务...',
               extOffline: '等待 Chrome 扩展连接（在 chrome://extensions 点一下重新加载 ↻）',
-              connectedIdle: '主 Chrome 已在线 · 按 Alt+Shift+L 共享标签页或直接发任务',
-              emptyHint: '已连接主 Chrome！即使浏览器最小化收在任务栏，执行网页任务时也会在此实时同步画面。',
+              connectedIdle: 'Chrome 已在线 · 按 Alt+Shift+L 共享标签页或直接发任务',
+              emptyHint: '已连接 Chrome！执行网页任务时将在此实时同步操作画面与多窗口轨迹。',
+              autoFollow: '⚡ 跟随实时操作',
+              popoutTag: '[独立窗] ',
+              pausedTag: '[暂停] ',
               refresh: '刷新画面',
               release: '释放',
               focusTab: '切换到受控标签页',
               tabsSuffix: '个受控页'
             }
           : {
-              waking: 'Starting local bridge on port __CHROME_LIVE_PORT__...',
+              waking: 'Starting local bridge on port 28196...',
               extOffline: 'Waiting for Chrome extension (click Reload ↻ in chrome://extensions)',
               connectedIdle: 'Chrome Connected · Press Alt+Shift+L to share a tab',
               emptyHint: 'Connected to Chrome! Live screencast frames appear here automatically during tasks.',
+              autoFollow: '⚡ Follow Live',
+              popoutTag: '[Window] ',
+              pausedTag: '[Paused] ',
               refresh: 'Refresh',
               release: 'Release',
               focusTab: 'Focus Controlled Tab',
@@ -202,6 +230,7 @@
         const led = document.getElementById('led');
         const statusTitle = document.getElementById('statusTitle');
         const tabBadge = document.getElementById('tabBadge');
+        const tabStrip = document.getElementById('tabStrip');
         const urlLabel = document.getElementById('urlLabel');
         const liveImg = document.getElementById('liveImg');
         const emptyMsg = document.getElementById('emptyMsg');
@@ -214,11 +243,12 @@
         focusBtn.textContent = TXT.focusTab;
         emptyMsg.textContent = TXT.waking;
 
-        let lastCapturedAt = 0;
-        let activeTabId = null;
+        let followMode = true;
         let pinnedTabId = null;
-        let pinnedTabClosed = false;
+        let activeTabId = null;
         let displayedFrameTabId = null;
+        let lastCapturedAt = 0;
+        let lastStripSig = '';
         let pollInFlight = false;
 
         const sidecarFetch = (route, opts = {}) => {
@@ -229,17 +259,81 @@
           return fn(route, { cache: 'no-store', ...opts });
         };
 
+        function renderTabStrip(tabs) {
+          if (!Array.isArray(tabs) || tabs.length === 0) {
+            if (lastStripSig !== '') {
+              lastStripSig = '';
+              tabStrip.style.display = 'none';
+              tabStrip.textContent = '';
+            }
+            return;
+          }
+          const popoutCount = tabs.filter((t) => t && t.inRelayPopout).length;
+          const sig = JSON.stringify({
+            followMode,
+            activeTabId,
+            items: tabs.map((t) => [t.tabId, t.title || t.url || '', Boolean(t.inRelayPopout), Boolean(t.paused)])
+          });
+          if (sig === lastStripSig) return;
+          lastStripSig = sig;
+
+          tabStrip.textContent = '';
+          tabStrip.style.display = 'flex';
+
+          if (tabs.length > 1) {
+            const autoBtn = document.createElement('button');
+            autoBtn.type = 'button';
+            autoBtn.className = 'tab-pill';
+            autoBtn.dataset.active = String(followMode);
+            autoBtn.textContent = TXT.autoFollow;
+            autoBtn.onclick = () => {
+              followMode = true;
+              pinnedTabId = null;
+              lastCapturedAt = 0;
+              poll(true);
+            };
+            tabStrip.appendChild(autoBtn);
+          }
+
+          tabs.forEach((t, idx) => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'tab-pill';
+            const isSelected = !followMode && pinnedTabId === t.tabId;
+            const isShowing = followMode && activeTabId === t.tabId && tabs.length === 1;
+            btn.dataset.active = String(isSelected || isShowing || (followMode && activeTabId === t.tabId));
+            if (t.inRelayPopout) btn.dataset.popout = 'true';
+            const prefix = t.inRelayPopout ? TXT.popoutTag : t.paused ? TXT.pausedTag : '';
+            const label = t.title || t.url || `#${idx + 1}`;
+            btn.textContent = `${prefix}${label}`;
+            btn.title = `${label} (${t.url || ''})`;
+            btn.onclick = () => {
+              followMode = false;
+              pinnedTabId = t.tabId;
+              lastCapturedAt = 0;
+              poll(true);
+            };
+            tabStrip.appendChild(btn);
+          });
+
+          if (popoutCount > 0) {
+            tabBadge.textContent = IS_ZH
+              ? `${tabs.length} ${TXT.tabsSuffix} (${popoutCount} 独立窗)`
+              : `${tabs.length} ${TXT.tabsSuffix} (${popoutCount} popout)`;
+          }
+        }
+
         async function poll(forceFrame = false) {
           if (document.hidden || pollInFlight) return;
           pollInFlight = true;
           try {
-            // Lightweight metadata poll first; fetch Base64 JPEG below only for the resolved activeTabId!
             const resp = await sidecarFetch('/api/live_state?includeFrame=0');
             const s = await resp.json();
             if (!s || s.daemonOffline) {
               led.dataset.on = 'false';
               lastCapturedAt = 0;
               displayedFrameTabId = null;
+              renderTabStrip([]);
               statusTitle.textContent = TXT.waking;
               emptyMsg.textContent = TXT.waking;
               liveImg.removeAttribute('src');
@@ -259,6 +353,7 @@
             if (!connected) {
               lastCapturedAt = 0;
               displayedFrameTabId = null;
+              renderTabStrip([]);
               statusTitle.textContent = TXT.extOffline;
               emptyMsg.textContent = TXT.extOffline;
               liveImg.removeAttribute('src');
@@ -270,88 +365,89 @@
               return;
             }
 
-            // When all controlled tabs have been closed/released, reset pin lock so future sessions mount cleanly
             if (tabs.length === 0) {
+              followMode = true;
               pinnedTabId = null;
-              pinnedTabClosed = false;
+              activeTabId = null;
+              lastCapturedAt = 0;
+              displayedFrameTabId = null;
+              renderTabStrip([]);
+              statusTitle.textContent = TXT.connectedIdle;
+              urlLabel.textContent = '127.0.0.1:28196';
+              liveImg.removeAttribute('src');
+              liveImg.style.display = 'none';
+              emptyMsg.textContent = TXT.emptyHint;
+              emptyMsg.style.display = 'block';
+              focusBtn.disabled = true;
+              refreshBtn.disabled = true;
+              releaseBtn.disabled = true;
+              return;
             }
 
             let target = null;
-            if (pinnedTabId !== null) {
-              target = tabs.find((t) => t.tabId === pinnedTabId) || null;
-              if (!target) {
-                const relaySuccessor = tabs.find((t) => t.replacedTabId === pinnedTabId) || null;
-                if (relaySuccessor) {
-                  pinnedTabId = relaySuccessor.tabId;
-                  target = relaySuccessor;
-                }
+            if (!followMode && pinnedTabId !== null) {
+              target =
+                tabs.find((t) => t.tabId === pinnedTabId) ||
+                tabs.find((t) => t.replacedTabId === pinnedTabId) ||
+                null;
+              if (target) {
+                pinnedTabId = target.tabId;
+              } else {
+                // Watched tab closed while other tabs are still active -> seamlessly resume live follow!
+                followMode = true;
+                pinnedTabId = null;
               }
-              pinnedTabClosed = target === null;
-            } else if (!pinnedTabClosed) {
-              target = tabs.find((t) => t.substate === 'shared') || tabs[0] || null;
-              pinnedTabId = target ? target.tabId : null;
             }
+
+            if (followMode || !target) {
+              const latestTid = s.latestFrameMeta?.tabId;
+              target =
+                (typeof latestTid === 'number' && tabs.find((t) => t.tabId === latestTid && !t.paused)) ||
+                tabs.find((t) => !t.paused && t.substate === 'shared') ||
+                tabs.find((t) => !t.paused) ||
+                tabs[0] ||
+                null;
+            }
+
             activeTabId = target ? target.tabId : null;
+            renderTabStrip(tabs);
+
             const isTargetPaused = Boolean(target && target.paused);
             focusBtn.disabled = activeTabId === null || isTargetPaused;
             refreshBtn.disabled = activeTabId === null || isTargetPaused;
             releaseBtn.disabled = activeTabId === null;
 
-            // Allow clicking tabBadge to cycle through remaining tabs when multiple tabs are open
-            tabBadge.style.cursor = tabs.length > 0 ? 'pointer' : 'default';
-            tabBadge.onclick = () => {
-              if (tabs.length === 0) return;
-              const curIdx = tabs.findIndex((t) => t.tabId === pinnedTabId);
-              const nextTab = tabs[(curIdx + 1) % tabs.length];
-              if (nextTab) {
-                pinnedTabId = nextTab.tabId;
-                pinnedTabClosed = false;
-                lastCapturedAt = 0;
-                poll(true);
-              }
-            };
-
-            if (!target) {
-              lastCapturedAt = 0;
-              displayedFrameTabId = null;
-              statusTitle.textContent = TXT.connectedIdle;
-              urlLabel.textContent = '127.0.0.1:__CHROME_LIVE_PORT__';
-              liveImg.removeAttribute('src');
-              liveImg.style.display = 'none';
-              emptyMsg.textContent =
-                pinnedTabClosed && tabs.length > 0
-                  ? (IS_ZH ? '原监控页已关闭或释放' : 'Watched tab was closed or released')
-                  : TXT.emptyHint;
-              emptyMsg.style.display = 'block';
-              return;
-            }
-
-            statusTitle.textContent = target.activity || TXT.connectedIdle;
-            urlLabel.textContent = target.url || target.title || '127.0.0.1:__CHROME_LIVE_PORT__';
+            statusTitle.textContent = target.activity || target.title || TXT.connectedIdle;
+            urlLabel.textContent = `${target.title ? target.title + ' · ' : ''}${target.url || '127.0.0.1:28196'}`;
 
             if (target.paused) {
               lastCapturedAt = 0;
               displayedFrameTabId = null;
               liveImg.removeAttribute('src');
               liveImg.style.display = 'none';
-              emptyMsg.textContent = IS_ZH
-                ? '已暂停 · 人工接管期间画面流已停止'
-                : 'Paused · Stream stopped during manual control';
+              emptyMsg.textContent = target.inRelayPopout
+                ? IS_ZH
+                  ? '已弹出独立接力窗口 · 人工接管期间暂停推流'
+                  : 'Popped out into standalone relay window · Stream paused'
+                : IS_ZH
+                  ? '已暂停 · 人工接管期间画面流已停止'
+                  : 'Paused · Stream stopped during manual control';
               emptyMsg.style.display = 'block';
               return;
             }
 
-            const perTabMap = s.frameTimestampsByTab && typeof s.frameTimestampsByTab === 'object' ? s.frameTimestampsByTab : null;
+            const perTabMap =
+              s.frameTimestampsByTab && typeof s.frameTimestampsByTab === 'object' ? s.frameTimestampsByTab : null;
             const remoteTs =
               (activeTabId !== null && perTabMap && Number(perTabMap[activeTabId])) ||
               (s.latestFrameMeta?.tabId === activeTabId ? s.latestFrameMeta?.capturedAt || 0 : 0);
+
             if ((remoteTs && remoteTs !== lastCapturedAt) || forceFrame || displayedFrameTabId !== activeTabId) {
               const frameResp = await sidecarFetch(
                 `/api/live_state?includeFrame=1&tabId=${encodeURIComponent(activeTabId)}`
               );
               const frameJson = await frameResp.json();
-              const dataUrl =
-                frameJson?.frameTabId === activeTabId ? frameJson?.frameDataUrl || '' : '';
+              const dataUrl = frameJson?.frameTabId === activeTabId ? frameJson?.frameDataUrl || '' : '';
               if (dataUrl) {
                 lastCapturedAt = Number(frameJson?.frameCapturedAt) || remoteTs || Date.now();
                 displayedFrameTabId = activeTabId;
@@ -366,8 +462,6 @@
                 emptyMsg.textContent = TXT.emptyHint;
                 emptyMsg.style.display = 'block';
               }
-            } else if (!lastCapturedAt) {
-              emptyMsg.textContent = TXT.emptyHint;
             }
           } catch {
           } finally {
@@ -415,7 +509,7 @@
           }
         });
 
-        setInterval(poll, 1200);
+        setInterval(poll, 650);
         poll();
       })();
     </script>
