@@ -1447,8 +1447,9 @@ async function pollHudUserEvents(tabId, entry) {
       }
     }
     // Fail-safe live HUD state reconciliation (defeats MV3 Service Worker dormancy/wakeup races!)
+    // Ignore freshly injected `document_start` HUD instances (`hydrated === false`) or in-flight navigations so concurrent `screenshot` polls never falsely release a navigating tab!
     if (managedTabs.has(tabId)) {
-      if (state.visible === false) {
+      if (state.visible === false && state.hydrated !== false && !entry?.navigating) {
         await detachManagedTab(tabId, tr().released);
         return;
       }
@@ -6201,24 +6202,29 @@ async function executeBridgeRpc(method, params) {
     // Pre-stop any active screencast BEFORE navigating so transitional frames on pages embedding protected frames are never streamed
     await stopCdpForTab(entry.tabId, entry);
     entry.activity = tr().navigating;
-    await chrome.tabs.update(entry.tabId, { url });
-    await waitForTabComplete(entry.tabId, 15000);
-    await verifyEntryStillControllable(entry);
-    const updated = await chrome.tabs.get(entry.tabId);
-    entry.title = updated.title || '';
-    entry.url = updated.url || url;
-    const postSafety = checkTabUrlAllowed(entry.url);
-    if (!postSafety.allowed) {
-      await detachManagedTab(entry.tabId, postSafety.reason, true);
-      throw new Error(`[GUARDRAIL] Blocked redirect: ${postSafety.reason}`);
+    entry.navigating = true;
+    try {
+      await chrome.tabs.update(entry.tabId, { url });
+      await waitForTabComplete(entry.tabId, 15000);
+      await verifyEntryStillControllable(entry);
+      const updated = await chrome.tabs.get(entry.tabId);
+      entry.title = updated.title || '';
+      entry.url = updated.url || url;
+      const postSafety = checkTabUrlAllowed(entry.url);
+      if (!postSafety.allowed) {
+        await detachManagedTab(entry.tabId, postSafety.reason, true);
+        throw new Error(`[GUARDRAIL] Blocked redirect: ${postSafety.reason}`);
+      }
+      const navSubCheck = await inspectEmbeddedFramesSafety(entry.tabId);
+      if (!navSubCheck.allowed) {
+        await detachManagedTab(entry.tabId, navSubCheck.reason, true);
+        throw new Error(`[GUARDRAIL] Blocked embedded payment frame: ${navSubCheck.reason}`);
+      }
+      entry.activity = tr().loaded(entry.title.slice(0, 28));
+      await syncHud(entry.tabId, { visible: true, mode: 'working', activity: entry.activity });
+    } finally {
+      entry.navigating = false;
     }
-    const navSubCheck = await inspectEmbeddedFramesSafety(entry.tabId);
-    if (!navSubCheck.allowed) {
-      await detachManagedTab(entry.tabId, navSubCheck.reason, true);
-      throw new Error(`[GUARDRAIL] Blocked embedded payment frame: ${navSubCheck.reason}`);
-    }
-    entry.activity = tr().loaded(entry.title.slice(0, 28));
-    await syncHud(entry.tabId, { visible: true, mode: 'working', activity: entry.activity });
     await verifyEntryStillControllable(entry);
     await captureQuickFrame(entry.tabId, entry);
     notifyPanelAndDaemon();

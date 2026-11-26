@@ -704,6 +704,7 @@
           : DEFAULT_BOTTOM_OFFSET_PX;
       this._state = {
         lang: defaultLang,
+        hydrated: false,
         visible: false,
         mode: 'working', // 'working' | 'shared' | 'paused' | 'done'
         activity: DICT[defaultLang].ready,
@@ -1085,6 +1086,9 @@
     }
 
     _notifyBackground(eventName) {
+      if (eventName === 'release') {
+        this._state.hydrated = true;
+      }
       try {
         if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.sendMessage === 'function') {
           chrome.runtime.sendMessage({ type: 'hud:user_event', event: eventName }).catch(() => {
@@ -1716,6 +1720,7 @@
       }
       const prevMode = this._state.mode;
       const prevVisible = this._state.visible;
+      this._state.hydrated = true;
       if (typeof payload.visible === 'boolean') this._state.visible = payload.visible;
       if (typeof payload.mode === 'string') {
         if (payload.mode === 'paused') {
@@ -1813,7 +1818,7 @@
 
     drainUserEvents() {
       const copy = this._state.userActionQueue.splice(0, this._state.userActionQueue.length);
-      return { events: copy, mode: this._state.mode, visible: this._state.visible };
+      return { events: copy, mode: this._state.mode, visible: this._state.visible, hydrated: this._state.hydrated };
     }
 
     ping() {

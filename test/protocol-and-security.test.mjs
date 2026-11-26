@@ -4598,6 +4598,10 @@ test('23. Collapsed background tab CDP deadlock & worker lifecycle regressions: 
   // 4. `mcp-server.mjs` relays worker-to-worker stream rotation during polling while preserving `release_tab` isolation
   assert.match(mcpSource, /workerSuccessor/);
   assert.match(mcpSource, /act !== 'release_tab'/);
+
+  // 5. Unhydrated `document_start` HUD (`hydrated: false`) during concurrent `navigate` + `screenshot` poll MUST NOT falsely release tab
+  assert.match(hudSource, /hydrated:\s*false/);
+  assert.match(swSource, /state\.hydrated !== false && !entry\?\.navigating/);
 });
 
 
