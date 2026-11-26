@@ -24,7 +24,7 @@ const SW_I18N = {
     loaded: (title) => `已加载 ${title}`,
     donePrefix: (sum) => `已完成 · ${sum}`,
     waiting: '正在等待页面响应',
-    batchStep: (i, n) => `连招执行 (${i}/${n})`,
+    batchStep: (i, n) => `批量执行 (${i}/${n})`,
     groupTitle: 'Live · 操控中',
     groupShared: 'Live · 已共享',
     groupPaused: 'Live · 已暂停',

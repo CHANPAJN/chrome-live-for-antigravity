@@ -3,7 +3,7 @@
 # chrome-live-for-antigravity
 
 专为 **Google Antigravity** 打造的零依赖 Chrome MV3 桥接与原生 **MCP App（`SEP-1865`）**，支持 Windows、macOS 与 Linux。  
-直接复用你日常已登录的 Chrome / Edge 浏览器——聊天内 0 Token 实时画框、防误触禁止点击锁、青 / 黄彩色标签组状态、独立副屏扫码接力与单轮 `batch` 连招，无任何第三方 npm 包或黑盒二进制。
+直接复用你日常已登录的 Chrome / Edge 浏览器——聊天内 0 Token 实时画框、防误触禁止点击锁、青 / 黄彩色标签组状态、独立副屏扫码接力与单轮 `batch` 批处理，无任何第三方 npm 包或黑盒二进制。
 
 <p>
   <a href="./README.md">English</a> ·
@@ -36,11 +36,11 @@
 - **青 / 黄标签组状态 + 四边 `3.5px` 对角双光束整圈巡航**：AI 操作时页面归入顶部青色 **`Live · 操控中`** 标签组，视口四边同步开启 `3.5px` 对角双光束顺时针 360° 匀速巡航边框（左下角锁图标外环同步旋转），后台新开查询页自动折叠成小胶囊，不弹新窗不抢前台焦点；一旦长按左键 3 秒解锁、点击左下角 `LIVE` 锁块、按 `Esc` 或弹出独立副屏人工接手，标签组与四周边框立刻定格切换为琥珀色 **`Live · 已暂停`**（`HOLD`），当前归谁操控一目了然。
 - **聊天内 0 Token 实时画框 + 多标签同屏切换（`SEP-1865`）**：支持聊天内联（`chrome_live_monitor`）、右侧分屏与左侧全屏工作台（`chrome_live_workspace`），实时画面不消耗模型 Token。支持同时托管多个受控标签页，按 `tabId` 独立隔离帧流并在画框顶栏随时切屏，内置 6 个快捷动作：
   - **接管**：直接在画框里远程点击、滚轮翻页和输入文字；
-  - **圈选**：在画框上拉框选区域，穿透开放 Shadow DOM 提取真实选择器和文本发回对话；
+  - **圈选**：在画框上拉框选区域，遍历开放 Shadow DOM 提取真实选择器和文本发回对话；
   - **挂入**：把当前页面标题、URL 和 `tabId` 附到下一条提示词上下文；
   - **副屏 / 归队**：遇到扫码或人机验证时一键弹出独立小窗手动处理；在浏览器悬浮条点「继续」即可合回并恢复 AI 接管，若从外部点「归队」或直接点右上角 `×` 关掉副屏窗口，页面会带 Cookie 归队回主窗口并保持「已暂停」保护态（关窗重开会重新加载该页 URL，在浏览器内点「继续」后恢复操控）；
   - **刷新 / 释放**：手动拉取最新一帧，或立即解除受控并卸载调试器。
-- **拟人化交互、单轮 `batch` 连招与并发正文提取**：鼠标移动带贝塞尔曲线轨迹与接近减速，打字带错落间隔；支持通过 stdin 把 `open → type → click → wait → snapshot → done` 合并为 1 轮调用；`extract` 在后台标签页并发抓正文和原图直链、抓完即关；`snapshot` 穿透开放 Shadow DOM，准确标出 `{DISABLED}`、`{checked}`、`{selected}`、`{expanded}` 与页面校验报错。
+- **拟人化交互、单轮 `batch` 批处理与并发正文提取**：鼠标移动带贝塞尔曲线轨迹与接近减速，打字带错落间隔；支持通过 stdin 把 `open → type → click → wait → snapshot → done` 合并为 1 轮调用；`extract` 在后台标签页并发抓正文和原图直链、抓完即关；`snapshot` 遍历开放 Shadow DOM，准确标出 `{DISABLED}`、`{checked}`、`{selected}`、`{expanded}` 与页面校验报错。
 - **按需开启的本地站点路书（`playbook on`，默认关闭）**：代码默认 `false`。在扩展侧边栏或命令行开启后，自动剔除敏感与追踪查询参数，在本地 `~/.chrome-live-antigravity/site-playbooks.json`（POSIX `0700`/`0600` 权限，Windows 自动配置当前登录用户专属 `icacls` ACL）记录直达路由、稳定 CSS 选择器与避坑提示，二次访问同域名直接跳过摸索。
 
 ## 实测对比
@@ -50,7 +50,7 @@
 | 模式 | 对话轮次 | 总耗时 | 总 Token 吞吐 | 非缓存净消耗 |
 | :--- | :---: | :---: | :---: | :---: |
 | 传统逐步调用（`open → snapshot → type → click → wait → snapshot → done`） | 7 轮 | 71.0s | 419,162 | 20,360 |
-| `batch --compact` 单轮连招 | **1 轮（-85.7%）** | **13.0s（提速 5.5 倍）** | **67,365（-83.9%）** | **2,445（-88.0%）** |
+| `batch --compact` 单轮批处理 | **1 轮（-85.7%）** | **13.0s（提速 5.5 倍）** | **67,365（-83.9%）** | **2,445（-88.0%）** |
 | 开启本地路书（`playbook on`）二次访问 | **1 轮（-85.7%）** | **10.0s** | 跳过首页直接定位 | — |
 
 常驻后台占用实测：空闲 CPU `< 0.01%`（实测 `0.0096%`），私有内存约 `30–34 MB`，守护进程重启后扩展约 `3 秒` 自动重连，本地安全拦截耗时 `< 100ms`。
@@ -114,7 +114,7 @@ node ./bin/chrome-live.mjs snapshot                         # 提取带编号元
 node ./bin/chrome-live.mjs click 0                          # 按序号、CSS 选择器或按钮文字点击
 node ./bin/chrome-live.mjs type "搜索" "关键词" --submit    # 填词并提交
 node ./bin/chrome-live.mjs upload "~/.chrome-live-antigravity/uploads/demo.png" # 通过原生 CDP 上传暂存目录附件
-node ./bin/chrome-live.mjs batch - --compact                # 从 stdin 单轮执行多步连招
+node ./bin/chrome-live.mjs batch - --compact                # 从 stdin 单轮批量执行多步指令
 node ./bin/chrome-live.mjs extract "https://a.com"          # 后台并发提取正文与原图直链
 node ./bin/chrome-live.mjs relay popout                     # 弹出独立副屏供人工处理扫码/验证
 node ./bin/chrome-live.mjs relay merge                      # 合回原主窗口（保持已暂停保护态，在浏览器内点继续恢复 AI）

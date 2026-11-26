@@ -85,7 +85,7 @@ const I18N = {
       scroll: '滚动视口',
       navigate: '页面跳转',
       extract: '多页并发提取',
-      batch: '批量连招执行',
+      batch: '单轮批量执行',
       wait: '等待页面就绪',
       screenshot: '抓取实时画面',
       done: '任务收尾释放',
