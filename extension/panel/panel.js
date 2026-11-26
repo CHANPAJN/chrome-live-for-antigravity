@@ -57,7 +57,15 @@ const I18N = {
     savePairing: '保存配对并重连',
     guardTitle: '金融与收银台硬护栏',
     guardAlways: '常驻开启',
-    guardDesc: '触碰支付网关、收银台路径或网银域名时，后台毫秒级强制断开调试器交还本人操作。',
+    guardDesc: '触碰支付网关、/checkout · /pay · /billing 收银台路径或主流网银域名时，后台立即断开调试器交还本人操作。',
+    guardChips: [
+      'Alipay / 支付宝',
+      'WeChat Pay / 微信支付',
+      'Stripe / PayPal',
+      '主流网银域名',
+      '/checkout · /pay · /billing',
+      'chrome:// · 上传沙箱'
+    ],
     customGuardLabel: '自定义额外保护域名（每行一个）',
     saveGuard: '更新自定义拦截名单',
     toastSaved: '设置已保存并生效',
@@ -148,7 +156,15 @@ const I18N = {
     savePairing: 'Save & Reconnect',
     guardTitle: 'Financial & Security Guardrails',
     guardAlways: 'Always On',
-    guardDesc: 'Checkout routes, Stripe, PayPal, Alipay, WeChat Pay, banking, and cloud billing auto-detach immediately.',
+    guardDesc: 'Checkout routes (/checkout, /pay, /billing), Stripe, PayPal, Alipay, WeChat Pay, and retail banking domains auto-detach immediately.',
+    guardChips: [
+      'Alipay',
+      'WeChat Pay',
+      'Stripe / PayPal',
+      'Retail Banking',
+      '/checkout · /pay · /billing',
+      'chrome:// · Upload Sandbox'
+    ],
     customGuardLabel: 'Additional Protected Domains (one per line)',
     saveGuard: 'Update Protected Domains',
     toastSaved: 'Settings saved',
@@ -237,6 +253,7 @@ const els = {
   guardCardTitle: $('guardCardTitle'),
   guardAlwaysBadge: $('guardAlwaysBadge'),
   guardCardDesc: $('guardCardDesc'),
+  builtinGuardChips: $('builtinGuardChips'),
   customGuardLabel: $('customGuardLabel'),
   customDomainsInput: $('customDomainsInput'),
   saveGuardBtn: $('saveGuardBtn'),
@@ -333,6 +350,16 @@ function applyStaticLabels() {
   els.guardCardTitle.textContent = d.guardTitle;
   els.guardAlwaysBadge.textContent = d.guardAlways;
   els.guardCardDesc.textContent = d.guardDesc;
+  if (els.builtinGuardChips && Array.isArray(d.guardChips)) {
+    els.builtinGuardChips.replaceChildren(
+      ...d.guardChips.map((chipText) => {
+        const sp = document.createElement('span');
+        sp.className = 'guard-chip';
+        sp.textContent = chipText;
+        return sp;
+      })
+    );
+  }
   els.customGuardLabel.textContent = d.customGuardLabel;
   els.saveGuardBtn.textContent = d.saveGuard;
 }

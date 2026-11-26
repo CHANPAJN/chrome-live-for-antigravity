@@ -810,3 +810,108 @@ export function evaluateUploadFileSafety(rawFilePath, options = {}) {
 
   return { allowed: true, code: 'OK', reason: '', resolvedPath: verifiedNonSymlinkPath };
 }
+
+export const SAFE_ATTR_SELECTOR_ALLOWLIST_RX =
+  /^(?:id|class|name|type|role|placeholder|aria-(?:label|expanded|selected|checked|controls|current|disabled)|title|for|disabled|checked|selected|readonly|required|multiple|contenteditable|tabindex|data-(?:testid|test|cy|qa|clive-idx|index|id|action|role|tab|state)|target|alt)$/i;
+
+export const SAFE_FUNCTIONAL_PSEUDO_RX =
+  /^(?:nth-child|nth-last-child|nth-of-type|nth-last-of-type|not|is|where)$/i;
+
+export function assertSafeAutomationSelector(rawSelector) {
+  if (typeof rawSelector !== 'string') {
+    throw new Error('[GUARDRAIL] CSS selector must be a string');
+  }
+  const s = rawSelector.trim();
+  if (!s) return;
+  if (s.includes('\\') || s.includes('/*') || s.includes('*/')) {
+    throw new Error('[GUARDRAIL] CSS escape sequences and comments are blocked in automation selectors');
+  }
+
+  let quoteChar = '';
+  let bracketDepth = 0;
+  let parenDepth = 0;
+  let attrStart = -1;
+
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quoteChar) {
+      if (ch === quoteChar) quoteChar = '';
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quoteChar = ch;
+      continue;
+    }
+    if (ch === '[') {
+      if (bracketDepth === 0) attrStart = i + 1;
+      bracketDepth += 1;
+      if (bracketDepth > 1) {
+        throw new Error('[GUARDRAIL] Nested CSS attribute brackets are blocked');
+      }
+      continue;
+    }
+    if (ch === ']') {
+      if (bracketDepth <= 0) {
+        throw new Error('[GUARDRAIL] Unbalanced closing bracket in CSS selector');
+      }
+      bracketDepth -= 1;
+      const inner = s.slice(attrStart, i).trim();
+      if (!inner) {
+        throw new Error('[GUARDRAIL] Empty CSS attribute selector is blocked');
+      }
+      let innerQuote = '';
+      let eqIndex = -1;
+      for (let j = 0; j < inner.length; j++) {
+        const ic = inner[j];
+        if (innerQuote) {
+          if (ic === innerQuote) innerQuote = '';
+          continue;
+        }
+        if (ic === '"' || ic === "'") {
+          innerQuote = ic;
+          continue;
+        }
+        if (ic === '=') {
+          const prevChar = j > 0 ? inner[j - 1] : '';
+          if (prevChar === '*' || prevChar === '^' || prevChar === '$' || prevChar === '~' || prevChar === '|') {
+            throw new Error('[GUARDRAIL] CSS attribute substring/prefix/suffix operators (*=, ^=, $=, ~=, |=) are blocked');
+          }
+          if (eqIndex !== -1) {
+            throw new Error('[GUARDRAIL] Malformed multiple "=" operators in CSS attribute selector');
+          }
+          eqIndex = j;
+        }
+      }
+      const rawAttr = (eqIndex === -1 ? inner : inner.slice(0, eqIndex)).trim().replace(/^\*?\|/, '').trim();
+      if (!SAFE_ATTR_SELECTOR_ALLOWLIST_RX.test(rawAttr)) {
+        throw new Error(`[GUARDRAIL] CSS attribute selector on "${rawAttr}" is restricted for credential safety`);
+      }
+      continue;
+    }
+    if (bracketDepth === 0 && ch === ':') {
+      const rest = s.slice(i + 1);
+      const fnMatch = rest.match(/^:?([a-zA-Z_-][a-zA-Z0-9_-]*)\s*\(/);
+      if (fnMatch) {
+        const fnName = fnMatch[1];
+        if (!SAFE_FUNCTIONAL_PSEUDO_RX.test(fnName)) {
+          throw new Error(`[GUARDRAIL] Functional CSS pseudo-class ":${fnName}()" is blocked to prevent hidden-DOM probing`);
+        }
+      }
+      continue;
+    }
+    if (bracketDepth === 0 && ch === '(') {
+      parenDepth += 1;
+      continue;
+    }
+    if (bracketDepth === 0 && ch === ')') {
+      parenDepth -= 1;
+      if (parenDepth < 0) {
+        throw new Error('[GUARDRAIL] Unbalanced closing parenthesis in CSS selector');
+      }
+    }
+  }
+
+  if (quoteChar || bracketDepth !== 0 || parenDepth !== 0) {
+    throw new Error('[GUARDRAIL] Unbalanced quotes, brackets, or parentheses in CSS selector');
+  }
+}

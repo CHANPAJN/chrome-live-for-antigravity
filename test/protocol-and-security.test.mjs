@@ -3866,3 +3866,130 @@ test('Blind-audit round-10 regressions: ancestor opacity:0 candidate filter, Cod
   assert.match(hudSource, /removeEventListener\('pointercancel', onGripCancel, true\)/);
   assert.match(panelSource, /\^https\?:\\\/\\\/\/i\.test\(rUrl\.trim\(\)\)/);
 });
+
+test('22. Blind-audit round-11 regressions: cross-Shadow editor/aria-hidden ancestor skip, panel UI guardrail parity, closed-Shadow HUD click guard, playbook selector allowlist & forward-skew nonce TTL', async () => {
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+  const hudSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'hud.js'), 'utf8');
+  const panelHtml = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'panel', 'index.html'), 'utf8');
+  const panelSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'panel', 'panel.js'), 'utf8');
+
+  // 1. Cross-Shadow-DOM editor/aria-hidden ancestor check NEVER breaks prematurely at `stopRoot`!
+  const clickWalkerMatch = swSource.match(
+    /const CLICK_SKIP_SEL =[\s\S]*?function extractCleanContainerText\(rootNode\)[\s\S]*?\n        \}/
+  );
+  assert.ok(clickWalkerMatch);
+  class FakeShadowElem {}
+  const outerEditorHost = Object.assign(new FakeShadowElem(), {
+    isContentEditable: false,
+    matches: (sel) => sel.includes('.ProseMirror'),
+    closest: (sel) => (sel.includes('.ProseMirror') ? outerEditorHost : null),
+    parentElement: null,
+    getRootNode: () => ({}),
+    _style: { display: 'block', visibility: 'visible', opacity: '1', webkitTextSecurity: 'none' }
+  });
+  const shadowInnerBtn = Object.assign(new FakeShadowElem(), {
+    isContentEditable: false,
+    matches: () => false,
+    closest: () => null,
+    parentElement: null,
+    getRootNode: () => ({ host: outerEditorHost }),
+    _style: { display: 'inline-block', visibility: 'visible', opacity: '1', webkitTextSecurity: 'none' }
+  });
+  const shadowDraftNodes = [{ parentElement: shadowInnerBtn, nodeValue: 'DRAFT_SECRET_INSIDE_SHADOW_WIDGET' }];
+  const runShadowExtract = vm.runInNewContext(
+    `(function(root) { ${clickWalkerMatch[0]}; return extractCleanContainerText(root); })`,
+    {
+      Element: FakeShadowElem,
+      NodeFilter: { SHOW_TEXT: 4 },
+      window: { getComputedStyle: (el) => el._style },
+      document: {
+        createTreeWalker: () => {
+          let i = 0;
+          return { nextNode: () => (i < shadowDraftNodes.length ? shadowDraftNodes[i++] : null) };
+        }
+      }
+    }
+  );
+  assert.equal(
+    runShadowExtract(shadowInnerBtn).trim(),
+    '',
+    'Open-Shadow button hosted inside outer .ProseMirror editor must be redacted past stopRoot'
+  );
+
+  // Also ensure none of the 7 DOM walkers break prematurely on `cur === stopRoot` / `lbl` / `lblNode` / `node`
+  assert.equal(
+    /if \(cur === (?:stopRoot|lbl|lblNode|node)\)\s*\{?\s*(?:passedStop = true;\s*)?break;/.test(swSource),
+    false,
+    'No TreeWalker ancestor loop may break at stopRoot before traversing outer Shadow hosts'
+  );
+
+  // 2. Side Panel UI chips & descriptions accurately match active guardrails (no stale AWS/GCP/Azure/cloud billing claims)
+  assert.equal(/AWS|GCP|Azure|cloud billing/i.test(panelHtml), false, 'panel/index.html must not claim cloud billing guardrails');
+  assert.equal(/AWS|GCP|Azure|cloud billing/i.test(panelSource), false, 'panel/panel.js must not claim cloud billing guardrails');
+  assert.match(panelSource, /guardChips:\s*\[/);
+  assert.match(panelSource, /els\.builtinGuardChips\.replaceChildren\(/);
+
+  // 3. `chrome.debugger.onDetach` awaits `ensureSwInitialized()` before checking `managedTabs`
+  assert.match(
+    swSource,
+    /chrome\.debugger\.onDetach\.addListener\(async \(source, reason\) => \{\s*await ensureSwInitialized\(\);/
+  );
+
+  // 4. `hud.js` `captureHostGuard` supports `mode: 'closed'` ShadowRoot retargeting via bounding-box hit test + idempotent `_cliveBtnDone`
+  assert.match(hudSource, /hitHudButton\(this\.pauseBtn,\s*true\)/);
+  assert.match(hudSource, /ev\._cliveBtnDone = true;/);
+
+  // 5. `playbook-store` uses `assertSafeAutomationSelector` to reject `input[value="123"]` and non-allowlisted attributes
+  const { assertSafeAutomationSelector } = await import('../src/guardrails.mjs');
+  const { saveManualPlaybook, setPlaybookEnabled } = await import('../src/playbook-store.mjs');
+  assert.throws(() => assertSafeAutomationSelector('input[value="123456"]'), /restricted for credential safety/);
+  assert.throws(() => assertSafeAutomationSelector('div[data-secret="abc"]'), /restricted for credential safety/);
+  assertSafeAutomationSelector('button[data-testid="submit-btn"]:not([disabled])');
+
+  const tmpPbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-pb-r11-'));
+  try {
+    setPlaybookEnabled(true, tmpPbDir);
+    assert.throws(
+      () =>
+        saveManualPlaybook({
+          domain: 'docs.example.com',
+          selector: { name: 'Search field', css: 'input[value="123456"]' },
+          stateDir: tmpPbDir
+        }),
+      /Refusing to store sensitive or probing selector/
+    );
+  } finally {
+    fs.rmSync(tmpPbDir, { recursive: true, force: true });
+  }
+
+  // 6. Forward-skewed (+29000ms) HMAC nonce stays cached across its entire +30000ms replay window
+  const {
+    computeHttpHeaderHmac,
+    computeHttpRequestHmac,
+    createReplayProtectedVerifier
+  } = await import('../src/hmac-auth.mjs');
+  const token = 'f'.repeat(64);
+  const baseNow = 1_800_000_000_000;
+  let fakeClock = baseNow;
+  const verifier = createReplayProtectedVerifier(() => token, () => fakeClock);
+  const forwardTs = String(baseNow + 29_000);
+  const nonce = 'a'.repeat(32);
+  const hdrSig = computeHttpHeaderHmac(token, 'GET', '/api/tabs', forwardTs, nonce, 0);
+  const sig = computeHttpRequestHmac(token, 'GET', '/api/tabs', forwardTs, nonce, null);
+  const mockReq = {
+    method: 'GET',
+    headers: {
+      'x-chrome-live-ts': forwardTs,
+      'x-chrome-live-nonce': nonce,
+      'x-chrome-live-hdr-sig': hdrSig,
+      'x-chrome-live-sig': sig
+    }
+  };
+  assert.equal(verifier(mockReq, '/api/tabs', null).ok, true);
+  // Advance clock by +58,000ms (`fakeClock = baseNow + 58,000`): `fakeClock - forwardTs` is `+29,000ms` (still inside 30s skew!),
+  // so `seenNonces` MUST still remember `nonce` and block replay!
+  fakeClock = baseNow + 58_000;
+  const replayRes = verifier(mockReq, '/api/tabs', null);
+  assert.equal(replayRes.ok, false);
+  assert.match(replayRes.reason, /Replayed HMAC request nonce rejected/);
+});

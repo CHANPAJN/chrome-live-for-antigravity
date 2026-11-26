@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   AUDIT_SENSITIVE_PARAM_RX,
+  assertSafeAutomationSelector,
   evaluateUrlSafety,
   isHighEntropyPathToken,
   redactUrlForAudit,
@@ -366,11 +367,17 @@ export function learnFromPageVisit({ url, title, elements = [], customBlockedDom
     for (const el of elements) {
       if (el && el.stableSelector && el.label && Object.keys(bucket.selectors).length < MAX_SELECTORS_PER_SITE) {
         const key = String(el.label).slice(0, 40);
-        if (!isSafeDictKey(key) || SENSITIVE_SELECTOR_RX.test(key) || SENSITIVE_SELECTOR_RX.test(String(el.stableSelector))) {
+        const cssStr = String(el.stableSelector).trim();
+        if (!isSafeDictKey(key) || !cssStr || SENSITIVE_SELECTOR_RX.test(key) || SENSITIVE_SELECTOR_RX.test(cssStr)) {
           continue;
         }
-        if (bucket.selectors[key] !== el.stableSelector) {
-          bucket.selectors[key] = el.stableSelector;
+        try {
+          assertSafeAutomationSelector(cssStr);
+        } catch {
+          continue;
+        }
+        if (bucket.selectors[key] !== cssStr) {
+          bucket.selectors[key] = cssStr;
           changed = true;
         }
       }
@@ -397,6 +404,11 @@ export function learnInteractionSelector({ url, label, selector, customBlockedDo
   const cleanCss = String(selector).trim().slice(0, 140);
   if (!isSafeDictKey(cleanKey) || !cleanCss || cleanKey.includes('REDACTED')) return false;
   if (SENSITIVE_SELECTOR_RX.test(`${cleanKey} ${cleanCss}`)) {
+    return false;
+  }
+  try {
+    assertSafeAutomationSelector(cleanCss);
+  } catch {
     return false;
   }
 
@@ -457,8 +469,13 @@ export function saveManualPlaybook({ domain: rawDomain, route, tip, tipIndex, se
   if (selector && typeof selector === 'object' && selector.name && selector.css) {
     const name = redactUrlsInText(String(selector.name).replace(/[\x00-\x1f]/g, ' ').trim()).slice(0, 48);
     const css = String(selector.css).replace(/[\x00-\x1f]/g, ' ').trim().slice(0, 140);
-    if (!isSafeDictKey(name)) throw new Error('Invalid selector alias');
-    if (SENSITIVE_SELECTOR_RX.test(name) || SENSITIVE_SELECTOR_RX.test(css) || /[\^$*~|]=|\\|\/\*|\*\/|:has\s*\(/i.test(css)) {
+    if (!isSafeDictKey(name) || !css) throw new Error('Invalid selector alias');
+    if (SENSITIVE_SELECTOR_RX.test(name) || SENSITIVE_SELECTOR_RX.test(css)) {
+      throw new Error('Refusing to store sensitive or probing selector in playbook');
+    }
+    try {
+      assertSafeAutomationSelector(css);
+    } catch {
       throw new Error('Refusing to store sensitive or probing selector in playbook');
     }
     if (selector.oldName && selector.oldName !== name && Object.hasOwn(bucket.selectors, selector.oldName)) {

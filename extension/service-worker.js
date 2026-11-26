@@ -2556,6 +2556,26 @@ async function executeBridgeRpc(method, params) {
           }
           return true;
         };
+        const NESTED_EDITOR_OR_HIDDEN_SEL =
+          '.CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], [data-chrome-live-hud]';
+        const isNestedInsideEditorOrHidden = (elNode) => {
+          const seen = new Set();
+          const startRn = elNode?.getRootNode?.();
+          let cur = elNode?.assignedSlot || elNode?.parentElement || (startRn && startRn.host ? startRn.host : null);
+          while (cur && !seen.has(cur)) {
+            seen.add(cur);
+            if (cur.isContentEditable || cur.matches?.(NESTED_EDITOR_OR_HIDDEN_SEL)) {
+              return true;
+            }
+            if (cur.assignedSlot) {
+              cur = cur.assignedSlot;
+              continue;
+            }
+            const rn = cur.getRootNode?.();
+            cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+          }
+          return false;
+        };
 
         const cands = collectDeep(
           document,
@@ -2563,7 +2583,7 @@ async function executeBridgeRpc(method, params) {
         );
         const scored = [];
         for (const el of cands) {
-          if (safeClosest(el, '[data-chrome-live-hud]')) continue;
+          if (safeClosest(el, '[data-chrome-live-hud]') || isNestedInsideEditorOrHidden(el)) continue;
           if (!isElementFlatVisible(el)) continue;
           const r = el.getBoundingClientRect();
           if (r.width < 4 || r.height < 4) continue;
@@ -2591,6 +2611,8 @@ async function executeBridgeRpc(method, params) {
           // Never read user-typed .value, nested <textarea>/contenteditable/editor drafts, or hidden text across Shadow DOM
           const REGION_SKIP_SEL =
             'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
+          const REGION_ANCESTOR_SKIP_SEL =
+            '[contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
           const isInsideSkipped = (node, stopRoot) => {
             const seen = new Set();
             let cur = node instanceof Element ? node : node?.assignedSlot || node?.parentElement;
@@ -2600,7 +2622,13 @@ async function executeBridgeRpc(method, params) {
               if (!passedStop && (cur.isContentEditable || cur.matches?.(REGION_SKIP_SEL) || cur.closest?.(REGION_SKIP_SEL))) {
                 return true;
               }
-              if (cur.isContentEditable) return true;
+              if (
+                cur.isContentEditable ||
+                cur.matches?.(REGION_ANCESTOR_SKIP_SEL) ||
+                cur.closest?.(REGION_ANCESTOR_SKIP_SEL)
+              ) {
+                return true;
+              }
               if (
                 typeof cur.checkVisibility === 'function' &&
                 !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
@@ -2624,7 +2652,6 @@ async function executeBridgeRpc(method, params) {
               }
               if (cur === stopRoot) {
                 passedStop = true;
-                break;
               }
               const rn = cur.getRootNode?.();
               cur = cur.parentElement || (rn && rn.host ? rn.host : null);
@@ -3217,6 +3244,26 @@ async function executeBridgeRpc(method, params) {
           }
           return true;
         };
+        const SNAP_NESTED_EDITOR_OR_HIDDEN_SEL =
+          '.CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], [data-chrome-live-hud]';
+        const isNestedInsideEditorOrHidden = (elNode) => {
+          const seen = new Set();
+          const startRn = elNode?.getRootNode?.();
+          let cur = elNode?.assignedSlot || elNode?.parentElement || (startRn && startRn.host ? startRn.host : null);
+          while (cur && !seen.has(cur)) {
+            seen.add(cur);
+            if (cur.isContentEditable || cur.matches?.(SNAP_NESTED_EDITOR_OR_HIDDEN_SEL)) {
+              return true;
+            }
+            if (cur.assignedSlot) {
+              cur = cur.assignedSlot;
+              continue;
+            }
+            const rn = cur.getRootNode?.();
+            cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+          }
+          return false;
+        };
 
         const candidates = collectDeep(document, SELECTORS);
         const elements = [];
@@ -3224,7 +3271,7 @@ async function executeBridgeRpc(method, params) {
 
         for (const node of candidates) {
           if (idx >= limit) break;
-          if (safeClosest(node, '[data-chrome-live-hud]')) continue;
+          if (safeClosest(node, '[data-chrome-live-hud]') || isNestedInsideEditorOrHidden(node)) continue;
           if (!isElementFlatVisible(node)) continue;
           const style = window.getComputedStyle(node);
           const rect = node.getBoundingClientRect();
@@ -3260,6 +3307,8 @@ async function executeBridgeRpc(method, params) {
           // Never expose user-entered password/OTP/input values or nested editor draft text as element labels
           const SNAP_SKIP_SEL =
             'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
+          const SNAP_ANCESTOR_SKIP_SEL =
+            '[contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
           const isSnapSkipped = (n, stopRoot) => {
             const seen = new Set();
             let cur = n instanceof Element ? n : n?.assignedSlot || n?.parentElement;
@@ -3269,7 +3318,13 @@ async function executeBridgeRpc(method, params) {
               if (!passedStop && (cur.isContentEditable || cur.matches?.(SNAP_SKIP_SEL) || cur.closest?.(SNAP_SKIP_SEL))) {
                 return true;
               }
-              if (cur.isContentEditable) return true;
+              if (
+                cur.isContentEditable ||
+                cur.matches?.(SNAP_ANCESTOR_SKIP_SEL) ||
+                cur.closest?.(SNAP_ANCESTOR_SKIP_SEL)
+              ) {
+                return true;
+              }
               if (
                 typeof cur.checkVisibility === 'function' &&
                 !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
@@ -3293,7 +3348,6 @@ async function executeBridgeRpc(method, params) {
               }
               if (cur === stopRoot) {
                 passedStop = true;
-                break;
               }
               const rn = cur.getRootNode?.();
               cur = cur.parentElement || (rn && rn.host ? rn.host : null);
@@ -3401,6 +3455,8 @@ async function executeBridgeRpc(method, params) {
           if (aRect.width < 4 || aRect.height < 4) continue;
           const ALERT_SKIP_SEL =
             'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
+          const ALERT_ANCESTOR_SKIP_SEL =
+            '[contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
           const isAlertSkipped = (n, stopRoot) => {
             const seen = new Set();
             let cur = n instanceof Element ? n : n?.assignedSlot || n?.parentElement;
@@ -3410,7 +3466,13 @@ async function executeBridgeRpc(method, params) {
               if (!passedStop && (cur.isContentEditable || cur.matches?.(ALERT_SKIP_SEL) || cur.closest?.(ALERT_SKIP_SEL))) {
                 return true;
               }
-              if (cur.isContentEditable) return true;
+              if (
+                cur.isContentEditable ||
+                cur.matches?.(ALERT_ANCESTOR_SKIP_SEL) ||
+                cur.closest?.(ALERT_ANCESTOR_SKIP_SEL)
+              ) {
+                return true;
+              }
               if (
                 typeof cur.checkVisibility === 'function' &&
                 !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
@@ -3434,7 +3496,6 @@ async function executeBridgeRpc(method, params) {
               }
               if (cur === stopRoot) {
                 passedStop = true;
-                break;
               }
               const rn = cur.getRootNode?.();
               cur = cur.parentElement || (rn && rn.host ? rn.host : null);
@@ -3609,6 +3670,8 @@ async function executeBridgeRpc(method, params) {
 
         const CLICK_SKIP_SEL =
           'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
+        const CLICK_ANCESTOR_SKIP_SEL =
+          '[contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
         const isClickSkipped = (n, stopRoot) => {
           const seen = new Set();
           let cur = n instanceof Element ? n : n?.assignedSlot || n?.parentElement;
@@ -3618,7 +3681,13 @@ async function executeBridgeRpc(method, params) {
             if (!passedStop && (cur.isContentEditable || cur.matches?.(CLICK_SKIP_SEL) || cur.closest?.(CLICK_SKIP_SEL))) {
               return true;
             }
-            if (cur.isContentEditable) return true;
+            if (
+              cur.isContentEditable ||
+              cur.matches?.(CLICK_ANCESTOR_SKIP_SEL) ||
+              cur.closest?.(CLICK_ANCESTOR_SKIP_SEL)
+            ) {
+              return true;
+            }
             if (
               typeof cur.checkVisibility === 'function' &&
               !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
@@ -3642,7 +3711,6 @@ async function executeBridgeRpc(method, params) {
             }
             if (cur === stopRoot) {
               passedStop = true;
-              break;
             }
             const rn = cur.getRootNode?.();
             cur = cur.parentElement || (rn && rn.host ? rn.host : null);
@@ -4124,16 +4192,23 @@ async function executeBridgeRpc(method, params) {
               }
               const skipSel =
                 'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
+              const ancestorSkipSel =
+                '[contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
               const parts = [];
               const tw = document.createTreeWalker(lbl, NodeFilter.SHOW_TEXT);
               let tn;
               while ((tn = tw.nextNode())) {
                 let cur = tn.assignedSlot || tn.parentElement;
                 let blocked = false;
+                let passedRoot = false;
                 const seen = new Set();
                 while (cur && !seen.has(cur)) {
                   seen.add(cur);
-                  if (cur.isContentEditable || cur.matches?.(skipSel) || cur.closest?.(skipSel)) {
+                  if (!passedRoot && (cur.isContentEditable || cur.matches?.(skipSel) || cur.closest?.(skipSel))) {
+                    blocked = true;
+                    break;
+                  }
+                  if (cur.isContentEditable || cur.matches?.(ancestorSkipSel) || cur.closest?.(ancestorSkipSel)) {
                     blocked = true;
                     break;
                   }
@@ -4154,7 +4229,9 @@ async function executeBridgeRpc(method, params) {
                     cur = cur.assignedSlot;
                     continue;
                   }
-                  if (cur === lbl) break;
+                  if (cur === lbl) {
+                    passedRoot = true;
+                  }
                   const rn = cur.getRootNode?.();
                   cur = cur.parentElement || (rn && rn.host ? rn.host : null);
                 }
@@ -4356,16 +4433,23 @@ async function executeBridgeRpc(method, params) {
           if (!lblNode) return '';
           const skipSel =
             'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
+          const ancestorSkipSel =
+            '[contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
           const parts = [];
           const tw = document.createTreeWalker(lblNode, NodeFilter.SHOW_TEXT);
           let tn;
           while ((tn = tw.nextNode())) {
             let cur = tn.assignedSlot || tn.parentElement;
             let blocked = false;
+            let passedRoot = false;
             const seen = new Set();
             while (cur && !seen.has(cur)) {
               seen.add(cur);
-              if (cur.isContentEditable || cur.matches?.(skipSel) || cur.closest?.(skipSel)) {
+              if (!passedRoot && (cur.isContentEditable || cur.matches?.(skipSel) || cur.closest?.(skipSel))) {
+                blocked = true;
+                break;
+              }
+              if (cur.isContentEditable || cur.matches?.(ancestorSkipSel) || cur.closest?.(ancestorSkipSel)) {
                 blocked = true;
                 break;
               }
@@ -4386,7 +4470,9 @@ async function executeBridgeRpc(method, params) {
                 cur = cur.assignedSlot;
                 continue;
               }
-              if (cur === lblNode) break;
+              if (cur === lblNode) {
+                passedRoot = true;
+              }
               const rn = cur.getRootNode?.();
               cur = cur.parentElement || (rn && rn.host ? rn.host : null);
             }
@@ -4607,16 +4693,23 @@ async function executeBridgeRpc(method, params) {
             }
             const skipSel =
               'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
+            const ancestorSkipSel =
+              '[contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
             const out = [];
             const tw = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
             let tn;
             while ((tn = tw.nextNode())) {
               let cur = tn.assignedSlot || tn.parentElement;
               let blocked = false;
+              let passedRoot = false;
               const seen = new Set();
               while (cur && !seen.has(cur)) {
                 seen.add(cur);
-                if (cur.isContentEditable || cur.matches?.(skipSel) || cur.closest?.(skipSel)) {
+                if (!passedRoot && (cur.isContentEditable || cur.matches?.(skipSel) || cur.closest?.(skipSel))) {
+                  blocked = true;
+                  break;
+                }
+                if (cur.isContentEditable || cur.matches?.(ancestorSkipSel) || cur.closest?.(ancestorSkipSel)) {
                   blocked = true;
                   break;
                 }
@@ -4637,7 +4730,9 @@ async function executeBridgeRpc(method, params) {
                   cur = cur.assignedSlot;
                   continue;
                 }
-                if (cur === node) break;
+                if (cur === node) {
+                  passedRoot = true;
+                }
                 const rn = cur.getRootNode?.();
                 cur = cur.parentElement || (rn && rn.host ? rn.host : null);
               }
@@ -5079,14 +5174,15 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   }
 });
 
-chrome.debugger.onDetach.addListener((source, reason) => {
+chrome.debugger.onDetach.addListener(async (source, reason) => {
+  await ensureSwInitialized();
   const tabId = source?.tabId;
   if (tabId && managedTabs.has(tabId)) {
     const entry = managedTabs.get(tabId);
     entry.attachedCdp = false;
     entry.screencastActive = false;
     if (reason === 'canceled_by_user') {
-      detachManagedTab(tabId, 'Canceled by user in Chrome banner').catch(() => {});
+      await detachManagedTab(tabId, 'Canceled by user in Chrome banner').catch(() => {});
     }
   }
 });

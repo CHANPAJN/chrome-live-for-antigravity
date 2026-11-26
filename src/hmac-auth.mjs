@@ -80,7 +80,7 @@ export function verifySignedHttpResponse(token, statusCode, resHeaders, sentTs, 
   return timingSafeEqualToken(serverSig, expected);
 }
 
-export function createReplayProtectedVerifier(tokenOrProvider) {
+export function createReplayProtectedVerifier(tokenOrProvider, nowProvider = Date.now) {
   const seenNonces = new Map(); // nonce -> expiresAt
   const resolveToken = () =>
     typeof tokenOrProvider === 'function' ? String(tokenOrProvider() || '') : String(tokenOrProvider || '');
@@ -115,7 +115,7 @@ export function createReplayProtectedVerifier(tokenOrProvider) {
       return { ok: false, reason: 'Missing or malformed HMAC authentication headers' };
     }
     const tsNum = Number(tsRaw);
-    const now = Date.now();
+    const now = typeof nowProvider === 'function' ? nowProvider() : Date.now();
     if (!Number.isFinite(tsNum) || Math.abs(now - tsNum) > AUTH_MAX_SKEW_MS) {
       return { ok: false, reason: 'HMAC timestamp expired or out of skew window' };
     }
@@ -183,7 +183,7 @@ export function createReplayProtectedVerifier(tokenOrProvider) {
       return { ok: false, reason: 'Invalid HMAC request body signature' };
     }
 
-    seenNonces.set(nonce, now + AUTH_MAX_SKEW_MS * 2);
+    seenNonces.set(nonce, Math.max(now, Number(ts)) + AUTH_MAX_SKEW_MS + 2000);
     return { ok: true, ts, nonce };
   };
 

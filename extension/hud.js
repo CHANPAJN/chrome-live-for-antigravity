@@ -815,7 +815,8 @@
       };
 
       const onPauseClick = (ev) => {
-        if (!ev.isTrusted) return;
+        if (!ev.isTrusted || ev._cliveBtnDone) return;
+        ev._cliveBtnDone = true;
         ev.stopPropagation();
         if (selfDestructIfOrphan()) return;
         this._cancelHoldUnlock();
@@ -830,7 +831,8 @@
       };
 
       const onCloseAskClick = (ev) => {
-        if (!ev.isTrusted) return;
+        if (!ev.isTrusted || ev._cliveBtnDone) return;
+        ev._cliveBtnDone = true;
         ev.stopPropagation();
         if (selfDestructIfOrphan()) return;
         this._cancelHoldUnlock();
@@ -847,7 +849,8 @@
       };
 
       const onCancelConfirmClick = (ev) => {
-        if (!ev.isTrusted) return;
+        if (!ev.isTrusted || ev._cliveBtnDone) return;
+        ev._cliveBtnDone = true;
         ev.stopPropagation();
         if (selfDestructIfOrphan()) return;
         this._clearConfirmState();
@@ -855,7 +858,8 @@
       };
 
       const onConfirmReleaseClick = (ev) => {
-        if (!ev.isTrusted) return;
+        if (!ev.isTrusted || ev._cliveBtnDone) return;
+        ev._cliveBtnDone = true;
         ev.stopPropagation();
         if (selfDestructIfOrphan()) return;
         this._cancelHoldUnlock();
@@ -999,27 +1003,62 @@
         } catch {}
       };
 
+      const hitHudButton = (btn, visible) => {
+        if (!visible || !btn || typeof btn.getBoundingClientRect !== 'function') return false;
+        if (typeof evClientX !== 'number' || typeof evClientY !== 'number') return false;
+        const r = btn.getBoundingClientRect();
+        return (
+          r.width > 0 &&
+          r.height > 0 &&
+          evClientX >= r.left &&
+          evClientX <= r.right &&
+          evClientY >= r.top &&
+          evClientY <= r.bottom
+        );
+      };
+      let evClientX = null;
+      let evClientY = null;
+
       // Guard HUD host interactions in window capture phase so hostile page `window.addEventListener(..., e => e.stopPropagation(), true)`
-      // registered later cannot block the user's Pause / Release / 3s Hold-to-Unlock gestures!
+      // registered later cannot block the user's Pause / Release / 3s Hold-to-Unlock gestures (even across `mode: 'closed'` ShadowRoot retargeting)!
       const captureHostGuard = (ev) => {
         if (!ev || !ev.isTrusted || ev._cliveHandled || typeof ev.composedPath !== 'function') return;
         const pathNodes = ev.composedPath();
         if (!pathNodes || !pathNodes.includes(this.hostEl)) return;
         const topTarget = pathNodes[0];
+        evClientX = typeof ev.clientX === 'number' ? ev.clientX : null;
+        evClientY = typeof ev.clientY === 'number' ? ev.clientY : null;
+        const isConfirming = Boolean(this._state.confirmingDisconnect);
         if (ev.type === 'click') {
-          if (topTarget === this.pauseBtn || this.pauseBtn.contains(topTarget)) {
+          if (
+            !isConfirming &&
+            (topTarget === this.pauseBtn || this.pauseBtn.contains(topTarget) || hitHudButton(this.pauseBtn, true))
+          ) {
             ev._cliveHandled = true;
             ev.stopImmediatePropagation?.();
             onPauseClick(ev);
-          } else if (topTarget === this.closeBtn || this.closeBtn.contains(topTarget)) {
+          } else if (
+            !isConfirming &&
+            (topTarget === this.closeBtn || this.closeBtn.contains(topTarget) || hitHudButton(this.closeBtn, true))
+          ) {
             ev._cliveHandled = true;
             ev.stopImmediatePropagation?.();
             onCloseAskClick(ev);
-          } else if (topTarget === this.cancelConfirmBtn || this.cancelConfirmBtn.contains(topTarget)) {
+          } else if (
+            isConfirming &&
+            (topTarget === this.cancelConfirmBtn ||
+              this.cancelConfirmBtn.contains(topTarget) ||
+              hitHudButton(this.cancelConfirmBtn, true))
+          ) {
             ev._cliveHandled = true;
             ev.stopImmediatePropagation?.();
             onCancelConfirmClick(ev);
-          } else if (topTarget === this.confirmDisconnectBtn || this.confirmDisconnectBtn.contains(topTarget)) {
+          } else if (
+            isConfirming &&
+            (topTarget === this.confirmDisconnectBtn ||
+              this.confirmDisconnectBtn.contains(topTarget) ||
+              hitHudButton(this.confirmDisconnectBtn, true))
+          ) {
             ev._cliveHandled = true;
             ev.stopImmediatePropagation?.();
             onConfirmReleaseClick(ev);
