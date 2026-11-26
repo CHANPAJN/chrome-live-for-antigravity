@@ -75,40 +75,42 @@ function roundedBoxSdf(nx, ny, halfSize, radius) {
 }
 
 function samplePoint(nx, ny) {
-  // Normalized coordinates nx, ny in [-1, 1] — White Porcelain Viewfinder Tally Icon
+  // Normalized coordinates nx, ny in [-1, 1] — Full-Bleed Enlarged Viewfinder Tally Icon
   const bgDist = roundedBoxSdf(nx, ny, 0.8869, 0.24);
-  if (bgDist > 0) {
+  const fullDist = roundedBoxSdf(nx, ny, 0.96, 0.24);
+  if (fullDist > 0) {
     return [0, 0, 0, 0];
   }
 
-  // Crisp white porcelain surface (#ffffff -> #f8fafc) with slate border (#cbd5e1)
+  // Crisp white porcelain surface (#ffffff) with bold contrast border
   const t = (nx + ny + 2) / 4;
-  let r = Math.round(255 - t * 6);
-  let g = Math.round(255 - t * 4);
-  let b = Math.round(255 - t * 2);
+  let r = Math.round(255 - t * 4);
+  let g = Math.round(255 - t * 3);
+  let b = Math.round(255 - t * 1);
 
-  if (bgDist > -0.075) {
-    r = 186;
-    g = 198;
-    b = 214;
+  if (fullDist > -0.08 && bgDist > -0.16) {
+    r = 168;
+    g = 184;
+    b = 204;
   }
 
   const ax = Math.abs(nx);
   const ay = Math.abs(ny);
   const distCenter = Math.max(ax, ay);
 
-  // Four optical viewfinder corner reticles in Prussian engineering blue (#2563eb)
+  // Bold enlarged corner viewfinder brackets in Prussian blue (#2563eb)
   const ringDist = Math.abs(distCenter - 0.5017);
+  const outerBracket = Math.abs(distCenter - 0.62);
   const angle = Math.atan2(ny, nx);
-  const onDiagonalArm = ax >= 0.27 && ay >= 0.27 && Math.abs(Math.sin(angle - 0.6589)) <= 1.0;
-  if (onDiagonalArm && ringDist < 0.072) {
+  const onDiagonalArm = ax >= 0.28 && ay >= 0.28 && Math.abs(Math.sin(angle - 0.6589)) <= 1.0;
+  if (onDiagonalArm && (outerBracket < 0.095 || ringDist < 0.03)) {
     r = 37;
     g = 99;
     b = 235;
   }
 
-  // Center solid director tally square (#2563eb)
-  const coreDist = roundedBoxSdf(nx, ny, 0.205, 0.06);
+  // Enlarged center solid tally core (#2563eb)
+  const coreDist = roundedBoxSdf(nx, ny, 0.27, 0.08);
   if (distCenter < 0.2335) {
     const coreMix = Math.min(1, (0.2335 - distCenter) / 0.06);
     if (coreDist <= 0) {
@@ -116,6 +118,10 @@ function samplePoint(nx, ny) {
       g = Math.round(g * (1 - coreMix) + 99 * coreMix);
       b = Math.round(b * (1 - coreMix) + 235 * coreMix);
     }
+  } else if (coreDist <= 0) {
+    r = 37;
+    g = 99;
+    b = 235;
   }
 
   return [r, g, b, 255];

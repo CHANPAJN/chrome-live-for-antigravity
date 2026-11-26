@@ -4,7 +4,7 @@
   if (window.top !== window) return;
 
   const REGISTRY_SYMBOL = '__chromeLiveHudController__';
-  const CURRENT_HUD_REV = 11;
+  const CURRENT_HUD_REV = 13;
   const HOST_Z_MARKER = '2147483647';
 
   function isExtensionContextValid() {
@@ -23,7 +23,6 @@
   }
 
   let inheritedDock = '';
-  let inheritedTopPct = null;
   if (window[REGISTRY_SYMBOL]) {
     if (
       window[REGISTRY_SYMBOL]._hudRev === CURRENT_HUD_REV &&
@@ -35,7 +34,6 @@
     if (typeof window[REGISTRY_SYMBOL].destroy === 'function') {
       try {
         inheritedDock = window[REGISTRY_SYMBOL]._state?.dock || '';
-        inheritedTopPct = window[REGISTRY_SYMBOL]._state?.topPct ?? null;
         window[REGISTRY_SYMBOL].destroy();
       } catch {}
     }
@@ -51,29 +49,30 @@
     }
   } catch {}
 
-  const DBL_TAP_WINDOW_MS = 420;
-  const DBL_TAP_MAX_DIST_PX = 36;
+  const HOLD_UNLOCK_MS = 3000;
+  const RING_CIRCUMFERENCE = 2 * Math.PI * 20; // r = 20 -> ~125.66
   // Original rounded collaboration dart silhouette (zero overlap with classic OS arrow paths)
   const COLLAB_DART_PATH =
     'M2.4 2.4 L19.2 8.512 C20.9 9.1 21.0 11.573 19.3 12.2 L12.7 15.057 L9.9 21.647 C9.2 23.2 6.8 23.1 6.2 21.4 Z';
 
   const DICT = {
     zh: {
-      dragTip: '上下拖动调整侧栏高度，或拖至左/右边缘贴壁停靠',
-      ready: '待命就绪',
-      pausedByUser: '手动接管中',
-      resumed: '已恢复自动执行',
+      dragTip: '按住拖动可吸附至页面左下、右下、左上或右上角',
+      ready: '按住左键 3 秒解锁',
+      pausedByUser: '已解锁 · 手动操控中',
+      resumed: '已恢复防误触锁定',
       badgeLive: 'LIVE',
       badgeHold: 'HOLD',
       badgeShared: 'LIVE',
-      pauseTip: '点击立即切为手动模式（也可双击页面或按 Esc）',
-      resumeTip: '点击恢复 AI 自动操控',
+      pauseTip: '点击立即解锁切为手动（或在页面按住左键满 3 秒解锁）',
+      resumeTip: '点击恢复 AI 防误触锁定操控',
       disconnectLabel: '断开',
       closeTip: '释放此标签页控制权（不关闭网页）',
       confirmAsk: '断开此页受控？',
       cancelBtn: '取消',
       disconnectBtn: '确认断开',
-      lockedTapHint: '双击页面或按 Esc 立即切手动',
+      lockedTapHint: '已防误触锁定 · 按住左键 3 秒解锁',
+      holdingHint: '继续按住解锁',
       cursorClick: '点击',
       cursorType: '输入',
       cursorUpload: '上传',
@@ -81,21 +80,22 @@
       cursorMove: '定位'
     },
     en: {
-      dragTip: 'Drag vertically to reposition, or drag across to snap left/right edge',
-      ready: 'Ready',
-      pausedByUser: 'Manual mode',
-      resumed: 'Automation resumed',
+      dragTip: 'Drag to snap badge to bottom-left, bottom-right, top-left, or top-right corner',
+      ready: 'Hold left-click 3s to unlock',
+      pausedByUser: 'Unlocked · Manual mode',
+      resumed: 'Resumed locked control',
       badgeLive: 'LIVE',
       badgeHold: 'HOLD',
       badgeShared: 'LIVE',
-      pauseTip: 'Switch to manual control (or double-click page / press Esc)',
-      resumeTip: 'Resume AI control',
+      pauseTip: 'Click to unlock manual mode (or hold left-click 3s on page)',
+      resumeTip: 'Click to resume AI locked control',
       disconnectLabel: 'Detach',
       closeTip: 'Detach this tab without closing it',
       confirmAsk: 'Detach this tab?',
       cancelBtn: 'Cancel',
       disconnectBtn: 'Confirm',
-      lockedTapHint: 'Double-click page or press Esc for manual mode',
+      lockedTapHint: 'Page locked · Hold left-click 3s to unlock',
+      holdingHint: 'Hold to unlock',
       cursorClick: 'Click',
       cursorType: 'Type',
       cursorUpload: 'Upload',
@@ -116,17 +116,79 @@
       --spring-pop: 240ms cubic-bezier(0.22, 1, 0.36, 1);
     }
 
+    /* Original Circle-Slash Anti-Misclick Lock Shield */
     .lock-shield {
       position: fixed;
       inset: 0;
       pointer-events: none;
       background: transparent;
-      cursor: default;
+      cursor: not-allowed;
       display: none;
     }
     .lock-shield[data-locked="true"] {
       display: block;
       pointer-events: auto;
+    }
+
+    /* Enlarged 3-Second Hold-to-Unlock Circular Ring Progress Indicator */
+    .hold-badge {
+      position: fixed;
+      left: 0;
+      top: 0;
+      translate: -50% -124%;
+      scale: 0.9;
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 7px 15px 7px 9px;
+      border-radius: 9px;
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      box-shadow: 0 12px 28px rgba(15, 23, 42, 0.20), 0 2px 6px rgba(15, 23, 42, 0.08);
+      color: #18181b;
+      font-size: 13px;
+      font-weight: 600;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.14s ease, scale var(--spring-pop);
+      white-space: nowrap;
+    }
+    .hold-badge[data-active="true"] {
+      opacity: 1;
+      scale: 1;
+    }
+    .hold-ring-wrap {
+      position: relative;
+      width: 36px;
+      height: 36px;
+      display: grid;
+      place-items: center;
+      flex-shrink: 0;
+    }
+    .hold-ring-svg {
+      width: 36px;
+      height: 36px;
+      transform: rotate(-90deg);
+    }
+    .hold-ring-track {
+      fill: rgba(37, 99, 235, 0.07);
+      stroke: #dbeafe;
+      stroke-width: 3.6;
+    }
+    .hold-ring-bar {
+      fill: none;
+      stroke: #2563eb;
+      stroke-width: 3.6;
+      stroke-linecap: round;
+      stroke-dasharray: 125.66;
+      stroke-dashoffset: 125.66;
+    }
+    .hold-sec-num {
+      position: absolute;
+      font-size: 13.5px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: #1d4ed8;
     }
 
     /* Top 2.5px Solid Director Line (Zero 4-side blur glow) */
@@ -176,59 +238,71 @@
       100% { transform: translateX(285%); }
     }
 
-    /* B+C Fusion: Edge-Pinned Magnetic Two-Cell Tally Bookmark Strip */
+    /* Always-Open Bottom-Left Two-Cell Tally Badge with Enlarged Circle-Lock Icon */
     .edge-tally-dock {
       position: fixed;
-      right: 0;
-      top: 78%;
-      height: 32px;
+      left: 16px;
+      bottom: 16px;
+      height: 38px;
+      max-width: calc(100vw - 32px);
       display: inline-flex;
       align-items: stretch;
       background: #ffffff;
       color: #18181b;
       border: 1px solid #cbd5e1;
-      border-right: none;
-      border-radius: 6px 0 0 6px;
-      box-shadow: 0 6px 20px rgba(15, 23, 42, 0.12), 0 1px 3px rgba(15, 23, 42, 0.06);
-      font-size: 12px;
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.13), 0 1px 3px rgba(15, 23, 42, 0.06);
+      font-size: 13px;
       line-height: 1;
       pointer-events: auto;
       user-select: none;
       overflow: hidden;
-      will-change: transform, opacity;
-      transform: translate3d(var(--collapsed-shift, 0px), -50%, 0);
+      scale: 1;
+      will-change: width, scale, opacity;
       transition:
-        transform var(--spring-width),
+        width var(--spring-width),
+        scale var(--spring-pop),
         opacity 160ms ease,
         box-shadow 180ms ease;
     }
-    .edge-tally-dock[data-side="left"] {
-      right: auto;
-      left: 0;
-      border-right: 1px solid #cbd5e1;
-      border-left: none;
-      border-radius: 0 6px 6px 0;
-      flex-direction: row-reverse;
-      transform: translate3d(calc(-1 * var(--collapsed-shift, 0px)), -50%, 0);
+    .edge-tally-dock[data-dock="bottom-right"] {
+      left: auto;
+      right: 16px;
+      top: auto;
+      bottom: 16px;
     }
-    .edge-tally-dock[data-expanded="true"],
-    .edge-tally-dock:hover {
-      transform: translate3d(0, -50%, 0);
-      box-shadow: 0 10px 26px rgba(15, 23, 42, 0.16), 0 2px 6px rgba(15, 23, 42, 0.08);
+    .edge-tally-dock[data-dock="top-left"] {
+      left: 16px;
+      right: auto;
+      bottom: auto;
+      top: 14px;
+    }
+    .edge-tally-dock[data-dock="top-right"] {
+      left: auto;
+      right: 16px;
+      bottom: auto;
+      top: 14px;
     }
     .edge-tally-dock[data-hidden="true"] {
       opacity: 0;
+      scale: 0.9;
       pointer-events: none;
-      transform: translate3d(100%, -50%, 0);
-    }
-    .edge-tally-dock[data-side="left"][data-hidden="true"] {
-      transform: translate3d(-100%, -50%, 0);
     }
     .edge-tally-dock[data-pressing="true"] {
+      scale: 0.98;
       box-shadow: 0 12px 28px rgba(37, 99, 235, 0.22);
     }
 
-    /* Cell 1 (Always Exposed Tab Ear): Solid LIVE / HOLD Tally Switch */
+    .tally-track {
+      display: inline-flex;
+      align-items: stretch;
+      height: 38px;
+      width: max-content;
+      max-width: calc(100vw - 32px);
+      box-sizing: border-box;
+    }
+
+    /* Left Cell: Enlarged Circle-Lock Icon + Solid LIVE / HOLD Block */
     .tally-head-cell {
       display: inline-flex;
       align-items: stretch;
@@ -240,21 +314,21 @@
       border: none;
       margin: 0;
       height: 100%;
-      min-width: 50px;
-      padding: 0 9px;
+      padding: 0 13px 0 11px;
       background: #2563eb;
       color: #ffffff;
-      font: 700 11px/1 "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+      font: 700 12.5px/1 "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
       letter-spacing: 0.04em;
       font-variant-numeric: tabular-nums;
       cursor: pointer;
       display: inline-flex;
       align-items: center;
       justify-content: center;
+      gap: 7px;
       transition: background-color 150ms ease, filter 150ms ease;
     }
     .tally-mode-btn:hover {
-      filter: brightness(1.08);
+      filter: brightness(1.07);
     }
     .tally-mode-btn:active {
       filter: brightness(0.95);
@@ -268,45 +342,38 @@
     .tally-mode-btn[data-mode="confirm"] {
       background: #dc2626;
     }
-
-    .grip-handle {
-      width: 12px;
-      height: 100%;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      background: #f8fafc;
-      border-left: 1px solid #e2e8f0;
-      border-right: 1px solid #e2e8f0;
-      cursor: grab;
+    .tally-lock-svg {
+      width: 19px;
+      height: 19px;
+      display: block;
       flex-shrink: 0;
     }
-    .grip-handle:active {
-      cursor: grabbing;
-      background: #eff6ff;
-    }
-    .grip-dots {
-      width: 2px;
-      height: 12px;
-      border-radius: 1px;
-      background: #94a3b8;
-    }
 
-    /* Cell 2 (Slide-out Drawer Body): Crisp White Porcelain Status & Actions */
+    /* Right Cell: Always-Visible Crisp White Porcelain Status & Actions */
     .drawer-body {
       display: inline-flex;
       align-items: center;
-      gap: 8px;
+      gap: 10px;
       height: 100%;
-      padding: 0 8px 0 9px;
+      padding: 0 10px 0 12px;
       white-space: nowrap;
       background: #ffffff;
     }
+    .drag-grip {
+      display: inline-flex;
+      align-items: center;
+      height: 100%;
+      cursor: grab;
+      min-width: 0;
+    }
+    .drag-grip:active {
+      cursor: grabbing;
+    }
     .status-label {
-      color: #27272a;
-      font-size: 12px;
+      color: #18181b;
+      font-size: 12.5px;
       font-weight: 500;
-      max-width: 210px;
+      max-width: 240px;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -319,18 +386,18 @@
     .action-cluster {
       display: inline-flex;
       align-items: center;
-      gap: 4px;
+      gap: 5px;
       flex-shrink: 0;
     }
     .flat-btn {
       appearance: none;
       border: 1px solid #e4e4e7;
-      border-radius: 4px;
-      height: 22px;
-      padding: 0 8px;
+      border-radius: 5px;
+      height: 25px;
+      padding: 0 9px;
       background: #f8fafc;
-      color: #3f3f46;
-      font: 500 11px/1 "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+      color: #52525b;
+      font: 500 12px/1 "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
       cursor: pointer;
       display: inline-flex;
       align-items: center;
@@ -375,16 +442,16 @@
     }
     .coord-ring {
       position: absolute;
-      width: 24px;
-      height: 24px;
-      margin-left: -12px;
-      margin-top: -12px;
-      border-radius: 4px;
+      width: 26px;
+      height: 26px;
+      margin-left: -13px;
+      margin-top: -13px;
+      border-radius: 50%;
       border: 2px solid #2563eb;
       background: rgba(37, 99, 235, 0.08);
-      animation: expandSquare 0.38s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+      animation: expandRing 0.38s cubic-bezier(0.16, 1, 0.3, 1) forwards;
     }
-    @keyframes expandSquare {
+    @keyframes expandRing {
       0% { transform: scale(0.4); opacity: 0.95; }
       100% { transform: scale(1.65); opacity: 0; }
     }
@@ -417,8 +484,8 @@
       transform: scale(0.84);
     }
     .collab-dart-svg {
-      width: 22px;
-      height: 22px;
+      width: 24px;
+      height: 24px;
       display: block;
       filter: drop-shadow(0 2px 5px rgba(15, 23, 42, 0.28));
       transform: translate(-2px, -2px);
@@ -431,15 +498,15 @@
     }
     .collab-cursor-pill {
       position: absolute;
-      left: 15px;
-      top: 14px;
-      padding: 2px 7px;
-      border-radius: 4px;
+      left: 16px;
+      top: 15px;
+      padding: 2.5px 8px;
+      border-radius: 5px;
       background: #ffffff;
       border: 1px solid #2563eb;
       box-shadow: 0 3px 10px rgba(15, 23, 42, 0.16);
       color: #1d4ed8;
-      font-size: 11px;
+      font-size: 11.5px;
       font-weight: 600;
       white-space: nowrap;
     }
@@ -463,24 +530,27 @@
     }
   `;
 
+  // Crisp 20x20 Enlarged Circle-Lock SVG Paths (Locked Circle-Padlock vs Unlocked Open Shackle)
+  const LOCK_CLOSED_SVG_PATH =
+    'M10 1.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17ZM7.7 8.8V7.2a2.3 2.3 0 0 1 4.6 0v1.6M6.7 8.8h6.6a.8.8 0 0 1 .8.8v4a.8.8 0 0 1-.8.8H6.7a.8.8 0 0 1-.8-.8v-4a.8.8 0 0 1 .8-.8Z';
+  const LOCK_OPEN_SVG_PATH =
+    'M10 1.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17ZM7.7 8.8V7a2.3 2.3 0 0 1 4.3-1.1M6.7 8.8h6.6a.8.8 0 0 1 .8.8v4a.8.8 0 0 1-.8.8H6.7a.8.8 0 0 1-.8-.8v-4a.8.8 0 0 1 .8-.8Z';
+
+  const VALID_CORNERS = new Set(['bottom-left', 'bottom-right', 'top-left', 'top-right']);
+
   class ChromeLiveHud {
     constructor() {
       this._hudRev = CURRENT_HUD_REV;
       this._cleanups = [];
+      this._holdRaf = null;
       this._flashTimer = null;
       this._confirmTimer = null;
-      this._hoverCollapseTimer = null;
       this._cursorIdleTimer = null;
       this._cursorPressTimer = null;
       this._cursorPlaced = false;
       this._wasVisible = false;
-      this._pointerInsideDock = false;
       const defaultLang = /^zh\b/i.test(navigator.language || '') ? 'zh' : 'en';
-      const initSide = inheritedDock === 'left' ? 'left' : 'right';
-      const initTopPct =
-        typeof inheritedTopPct === 'number' && Number.isFinite(inheritedTopPct)
-          ? Math.min(90, Math.max(12, inheritedTopPct))
-          : 78;
+      const initDock = VALID_CORNERS.has(inheritedDock) ? inheritedDock : 'bottom-left';
       this._state = {
         lang: defaultLang,
         visible: false,
@@ -488,8 +558,7 @@
         activity: DICT[defaultLang].ready,
         flashText: '',
         confirmingDisconnect: false,
-        dock: initSide,
-        topPct: initTopPct,
+        dock: initDock,
         userActionQueue: []
       };
       this._mount();
@@ -542,38 +611,80 @@
       cursorInner.append(dartSvg, this.cursorPillEl);
       this.cursorEl.appendChild(cursorInner);
 
-      // B+C Edge-Pinned Magnetic Tally Strip
+      // Enlarged 3-second left-click hold unlock circular ring indicator
+      this.holdBadgeEl = document.createElement('div');
+      this.holdBadgeEl.className = 'hold-badge';
+      const ringWrap = document.createElement('div');
+      ringWrap.className = 'hold-ring-wrap';
+      const ringSvg = document.createElementNS(svgNs, 'svg');
+      ringSvg.setAttribute('viewBox', '0 0 48 48');
+      ringSvg.setAttribute('class', 'hold-ring-svg');
+      const trackCircle = document.createElementNS(svgNs, 'circle');
+      trackCircle.setAttribute('cx', '24');
+      trackCircle.setAttribute('cy', '24');
+      trackCircle.setAttribute('r', '20');
+      trackCircle.setAttribute('class', 'hold-ring-track');
+      this.holdBarCircle = document.createElementNS(svgNs, 'circle');
+      this.holdBarCircle.setAttribute('cx', '24');
+      this.holdBarCircle.setAttribute('cy', '24');
+      this.holdBarCircle.setAttribute('r', '20');
+      this.holdBarCircle.setAttribute('class', 'hold-ring-bar');
+      ringSvg.append(trackCircle, this.holdBarCircle);
+
+      this.holdSecEl = document.createElement('span');
+      this.holdSecEl.className = 'hold-sec-num';
+      this.holdSecEl.textContent = '3';
+      ringWrap.append(ringSvg, this.holdSecEl);
+
+      this.holdTextEl = document.createElement('span');
+      this.holdTextEl.textContent = this._t().holdingHint;
+      this.holdBadgeEl.append(ringWrap, this.holdTextEl);
+
+      // Always-Open Bottom-Left Two-Cell Tally Badge with Enlarged Circle-Lock Icon
       this.capsuleEl = document.createElement('div');
       this.capsuleEl.className = 'edge-tally-dock';
       this.capsuleEl.dataset.hidden = 'true';
-      this.capsuleEl.dataset.side = this._state.dock;
-      this.capsuleEl.dataset.expanded = 'false';
+      this.capsuleEl.dataset.dock = this._state.dock;
+
+      this.trackEl = document.createElement('div');
+      this.trackEl.className = 'tally-track';
 
       this.headCellEl = document.createElement('div');
       this.headCellEl.className = 'tally-head-cell';
 
-      // Exposed Tally Mode Button (`LIVE` / `HOLD`) acts directly as `pauseBtn` for 1-click toggle!
       this.pauseBtn = document.createElement('button');
       this.pauseBtn.type = 'button';
       this.pauseBtn.className = 'tally-mode-btn';
-      this.pauseBtn.textContent = this._t().badgeLive;
 
-      this.gripEl = document.createElement('div');
-      this.gripEl.className = 'grip-handle';
-      this.gripEl.title = this._t().dragTip;
-      const gripDots = document.createElement('span');
-      gripDots.className = 'grip-dots';
-      this.gripEl.appendChild(gripDots);
+      const lockSvg = document.createElementNS(svgNs, 'svg');
+      lockSvg.setAttribute('viewBox', '0 0 20 20');
+      lockSvg.setAttribute('fill', 'none');
+      lockSvg.setAttribute('stroke', 'currentColor');
+      lockSvg.setAttribute('stroke-width', '1.65');
+      lockSvg.setAttribute('stroke-linecap', 'round');
+      lockSvg.setAttribute('stroke-linejoin', 'round');
+      lockSvg.setAttribute('class', 'tally-lock-svg');
+      this.lockIconPath = document.createElementNS(svgNs, 'path');
+      this.lockIconPath.setAttribute('d', LOCK_CLOSED_SVG_PATH);
+      lockSvg.appendChild(this.lockIconPath);
 
-      this.headCellEl.append(this.pauseBtn, this.gripEl);
+      this.tallyTextSpan = document.createElement('span');
+      this.tallyTextSpan.textContent = this._t().badgeLive;
+      this.pauseBtn.append(lockSvg, this.tallyTextSpan);
+      this.headCellEl.appendChild(this.pauseBtn);
 
-      // Slide-out White Porcelain Drawer Body
+      // Always-Open White Porcelain Status & Action Cell
       this.drawerEl = document.createElement('div');
       this.drawerEl.className = 'drawer-body';
+
+      this.gripEl = document.createElement('div');
+      this.gripEl.className = 'drag-grip';
+      this.gripEl.title = this._t().dragTip;
 
       this.labelEl = document.createElement('span');
       this.labelEl.className = 'status-label';
       this.labelEl.textContent = this._t().ready;
+      this.gripEl.appendChild(this.labelEl);
 
       this.normalActionsEl = document.createElement('div');
       this.normalActionsEl.className = 'action-cluster';
@@ -600,8 +711,9 @@
       this.confirmDisconnectBtn.textContent = this._t().disconnectBtn;
 
       this.confirmActionsEl.append(this.cancelConfirmBtn, this.confirmDisconnectBtn);
-      this.drawerEl.append(this.labelEl, this.normalActionsEl, this.confirmActionsEl);
-      this.capsuleEl.append(this.headCellEl, this.drawerEl);
+      this.drawerEl.append(this.gripEl, this.normalActionsEl, this.confirmActionsEl);
+      this.trackEl.append(this.headCellEl, this.drawerEl);
+      this.capsuleEl.appendChild(this.trackEl);
 
       this.shadow.append(
         styleEl,
@@ -609,11 +721,21 @@
         this.borderEl,
         this.rippleLayer,
         this.cursorEl,
+        this.holdBadgeEl,
         this.capsuleEl
       );
 
       this._bindInteractions();
       (document.documentElement || document.body).appendChild(this.hostEl);
+    }
+
+    _cancelHoldUnlock() {
+      if (this._holdRaf !== null) {
+        cancelAnimationFrame(this._holdRaf);
+        this._holdRaf = null;
+      }
+      this.holdBadgeEl.dataset.active = 'false';
+      this.holdBarCircle.style.strokeDashoffset = String(RING_CIRCUMFERENCE);
     }
 
     _clearConfirmState() {
@@ -648,6 +770,7 @@
     }
 
     _switchToManualNow() {
+      this._cancelHoldUnlock();
       this._clearConfirmState();
       this._state.userPausedLock = true;
       this._state.mode = 'paused';
@@ -671,6 +794,7 @@
         ev._cliveBtnDone = true;
         ev.stopPropagation();
         if (selfDestructIfOrphan()) return;
+        this._cancelHoldUnlock();
         this._clearConfirmState();
         const nextPaused = this._state.mode !== 'paused';
         this._state.userPausedLock = nextPaused;
@@ -686,6 +810,7 @@
         ev._cliveBtnDone = true;
         ev.stopPropagation();
         if (selfDestructIfOrphan()) return;
+        this._cancelHoldUnlock();
         this._clearConfirmState();
         this._state.confirmingDisconnect = true;
         this._render();
@@ -712,6 +837,7 @@
         ev._cliveBtnDone = true;
         ev.stopPropagation();
         if (selfDestructIfOrphan()) return;
+        this._cancelHoldUnlock();
         this._clearConfirmState();
         this._state.userPausedLock = true;
         this._state.mode = 'paused';
@@ -720,10 +846,18 @@
         this._render();
       };
 
-      // Double-click anywhere on locked page OR press `Esc` -> instant manual takeover!
-      let lastTapAt = 0;
-      let lastTapX = 0;
-      let lastTapY = 0;
+      // Original Left-Click Hold 3s on Locked Page Shield to Unlock Manual Control
+      let holdStartAt = 0;
+      let holdingPointerId = null;
+
+      const placeHoldBadge = (cx, cy) => {
+        const vw = window.innerWidth || 1280;
+        const halfBound = Math.min(104, Math.floor(vw * 0.4));
+        const clampedX = Math.min(Math.max(halfBound, cx), Math.max(halfBound, vw - halfBound));
+        const clampedY = Math.max(68, cy);
+        this.holdBadgeEl.style.left = `${Math.round(clampedX)}px`;
+        this.holdBadgeEl.style.top = `${Math.round(clampedY)}px`;
+      };
 
       const onShieldPointerDown = (ev) => {
         if (!ev.isTrusted) return;
@@ -734,17 +868,57 @@
         ev.stopPropagation();
         if (ev.button !== 0 || this._state.mode !== 'working') return;
 
-        const now = performance.now();
-        const dist = Math.hypot(ev.clientX - lastTapX, ev.clientY - lastTapY);
-        if (lastTapAt > 0 && now - lastTapAt <= DBL_TAP_WINDOW_MS && dist <= DBL_TAP_MAX_DIST_PX) {
-          lastTapAt = 0;
-          this._switchToManualNow();
-          return;
+        holdingPointerId = ev.pointerId;
+        holdStartAt = performance.now();
+        try {
+          this.shieldEl.setPointerCapture(ev.pointerId);
+        } catch {}
+
+        placeHoldBadge(ev.clientX, ev.clientY);
+        this.holdTextEl.textContent = this._t().holdingHint;
+
+        const step = (now) => {
+          if (holdingPointerId === null) return;
+          const elapsed = now - holdStartAt;
+          if (elapsed >= 110) {
+            this.holdBadgeEl.dataset.active = 'true';
+          }
+          const ratio = Math.min(1, elapsed / HOLD_UNLOCK_MS);
+          const offset = RING_CIRCUMFERENCE * (1 - ratio);
+          this.holdBarCircle.style.strokeDashoffset = offset.toFixed(2);
+          const remainSec = Math.max(1, Math.ceil((HOLD_UNLOCK_MS - elapsed) / 1000));
+          this.holdSecEl.textContent = String(remainSec);
+
+          if (ratio >= 1) {
+            holdingPointerId = null;
+            this._switchToManualNow();
+            return;
+          }
+          this._holdRaf = requestAnimationFrame(step);
+        };
+
+        this._cancelHoldUnlock();
+        this._holdRaf = requestAnimationFrame(step);
+      };
+
+      const onShieldPointerMove = (ev) => {
+        if (holdingPointerId !== ev.pointerId) return;
+        placeHoldBadge(ev.clientX, ev.clientY);
+      };
+
+      const endShieldHold = (ev) => {
+        if (holdingPointerId === null) return;
+        const elapsed = performance.now() - holdStartAt;
+        try {
+          if (ev && typeof ev.pointerId === 'number') {
+            this.shieldEl.releasePointerCapture(ev.pointerId);
+          }
+        } catch {}
+        holdingPointerId = null;
+        this._cancelHoldUnlock();
+        if (elapsed < HOLD_UNLOCK_MS && this._state.mode === 'working') {
+          this._flashMessage(this._t().lockedTapHint, 2200);
         }
-        lastTapAt = now;
-        lastTapX = ev.clientX;
-        lastTapY = ev.clientY;
-        this._flashMessage(this._t().lockedTapHint, 2200);
       };
 
       const swallowLockedEvent = (ev) => {
@@ -765,28 +939,7 @@
         }
       };
 
-      // Hover slide-out & auto-collapse on edge dock
-      const onDockEnter = (ev) => {
-        if (ev && !ev.isTrusted) return;
-        if (this._hoverCollapseTimer) {
-          clearTimeout(this._hoverCollapseTimer);
-          this._hoverCollapseTimer = null;
-        }
-        this._pointerInsideDock = true;
-        this._render();
-      };
-
-      const onDockLeave = (ev) => {
-        if (ev && !ev.isTrusted) return;
-        this._pointerInsideDock = false;
-        if (this._hoverCollapseTimer) clearTimeout(this._hoverCollapseTimer);
-        this._hoverCollapseTimer = setTimeout(() => {
-          this._hoverCollapseTimer = null;
-          this._render();
-        }, 280);
-      };
-
-      // Vertical reposition & left/right edge snap via grip handle
+      // Drag badge to snap cleanly to any of the 4 corners (default: bottom-left; zero center notch positions)
       let dragging = false;
       let dragPointerId = null;
       let dragStartX = 0;
@@ -805,14 +958,6 @@
         } catch {}
       };
 
-      const onGripMove = (ev) => {
-        if (!dragging || (dragPointerId !== null && ev.pointerId !== dragPointerId)) return;
-        const vh = Math.max(200, window.innerHeight || 800);
-        const pct = Math.min(90, Math.max(12, (ev.clientY / vh) * 100));
-        this._state.topPct = Math.round(pct * 10) / 10;
-        this.capsuleEl.style.top = `${this._state.topPct}%`;
-      };
-
       const onGripUp = (ev) => {
         if (!dragging || (dragPointerId !== null && ev.pointerId !== dragPointerId)) return;
         dragging = false;
@@ -821,13 +966,14 @@
         try {
           this.gripEl.releasePointerCapture(ev.pointerId);
         } catch {}
-        if (Math.hypot(ev.clientX - dragStartX, ev.clientY - dragStartY) < 6) {
+        if (Math.hypot(ev.clientX - dragStartX, ev.clientY - dragStartY) < 8) {
           return;
         }
         const vw = Math.max(320, window.innerWidth || 1280);
         const vh = Math.max(200, window.innerHeight || 800);
-        this._state.dock = ev.clientX < vw * 0.45 ? 'left' : 'right';
-        this._state.topPct = Math.round(Math.min(90, Math.max(12, (ev.clientY / vh) * 100)) * 10) / 10;
+        const isTop = ev.clientY < vh * 0.45;
+        const isRight = ev.clientX > vw * 0.52;
+        this._state.dock = `${isTop ? 'top' : 'bottom'}-${isRight ? 'right' : 'left'}`;
         this._render();
       };
 
@@ -858,21 +1004,29 @@
       let evClientX = null;
       let evClientY = null;
 
-      // Guard HUD host interactions in window capture phase (via `document_start` slot 0 when available)
-      // so hostile page `window.addEventListener(..., e => e.stopImmediatePropagation(), true)` can never lock out
-      // LIVE/HOLD mode switch, Detach confirmation, dock drag, or double-click unlock!
       const captureHostGuard = (ev) => {
         if (!ev || !ev.isTrusted || ev._cliveHandled) return;
         const evtType = ev.type;
         if (evtType === 'pointermove') {
+          if (holdingPointerId !== null && ev.pointerId === holdingPointerId) {
+            ev._cliveHandled = true;
+            ev.stopImmediatePropagation?.();
+            onShieldPointerMove(ev);
+            return;
+          }
           if (dragging && dragPointerId !== null && ev.pointerId === dragPointerId) {
             ev._cliveHandled = true;
             ev.stopImmediatePropagation?.();
-            onGripMove(ev);
           }
           return;
         }
         if (evtType === 'pointerup' || evtType === 'pointercancel') {
+          if (holdingPointerId !== null && ev.pointerId === holdingPointerId) {
+            ev._cliveHandled = true;
+            ev.stopImmediatePropagation?.();
+            endShieldHold(ev);
+            return;
+          }
           if (dragging && dragPointerId !== null && ev.pointerId === dragPointerId) {
             ev._cliveHandled = true;
             ev.stopImmediatePropagation?.();
@@ -1011,24 +1165,25 @@
       }
 
       window.addEventListener('keydown', onEscKeyDown, true);
-      this.capsuleEl.addEventListener('pointerenter', onDockEnter);
-      this.capsuleEl.addEventListener('pointerleave', onDockLeave);
+      window.addEventListener('blur', endShieldHold);
       this.pauseBtn.addEventListener('click', onPauseClick);
       this.closeBtn.addEventListener('click', onCloseAskClick);
       this.cancelConfirmBtn.addEventListener('click', onCancelConfirmClick);
       this.confirmDisconnectBtn.addEventListener('click', onConfirmReleaseClick);
       this.shieldEl.addEventListener('pointerdown', onShieldPointerDown, true);
+      this.shieldEl.addEventListener('pointermove', onShieldPointerMove, true);
+      this.shieldEl.addEventListener('pointerup', endShieldHold, true);
+      this.shieldEl.addEventListener('pointercancel', endShieldHold, true);
       this.shieldEl.addEventListener('contextmenu', swallowLockedEvent, true);
       this.shieldEl.addEventListener('wheel', swallowLockedEvent, { passive: false, capture: true });
       this.gripEl.addEventListener('pointerdown', onGripDown, true);
-      this.gripEl.addEventListener('pointermove', onGripMove, true);
       this.gripEl.addEventListener('pointerup', onGripUp, true);
       this.gripEl.addEventListener('pointercancel', onGripCancel, true);
 
       this._cleanups.push(() => {
+        this._cancelHoldUnlock();
         this._clearConfirmState();
         if (this._flashTimer) clearTimeout(this._flashTimer);
-        if (this._hoverCollapseTimer) clearTimeout(this._hoverCollapseTimer);
         if (this._cursorIdleTimer) clearTimeout(this._cursorIdleTimer);
         if (this._cursorPressTimer) clearTimeout(this._cursorPressTimer);
         if (usedEarlyGuard && typeof window.__CLIVE_SET_CAPTURE_GUARD__ === 'function') {
@@ -1039,26 +1194,35 @@
           }
         }
         window.removeEventListener('keydown', onEscKeyDown, true);
-        this.capsuleEl.removeEventListener('pointerenter', onDockEnter);
-        this.capsuleEl.removeEventListener('pointerleave', onDockLeave);
+        window.removeEventListener('blur', endShieldHold);
         this.pauseBtn.removeEventListener('click', onPauseClick);
         this.closeBtn.removeEventListener('click', onCloseAskClick);
         this.cancelConfirmBtn.removeEventListener('click', onCancelConfirmClick);
         this.confirmDisconnectBtn.removeEventListener('click', onConfirmReleaseClick);
         this.shieldEl.removeEventListener('pointerdown', onShieldPointerDown, true);
+        this.shieldEl.removeEventListener('pointermove', onShieldPointerMove, true);
+        this.shieldEl.removeEventListener('pointerup', endShieldHold, true);
+        this.shieldEl.removeEventListener('pointercancel', endShieldHold, true);
         this.shieldEl.removeEventListener('contextmenu', swallowLockedEvent, true);
         this.shieldEl.removeEventListener('wheel', swallowLockedEvent, true);
         this.gripEl.removeEventListener('pointerdown', onGripDown, true);
-        this.gripEl.removeEventListener('pointermove', onGripMove, true);
         this.gripEl.removeEventListener('pointerup', onGripUp, true);
         this.gripEl.removeEventListener('pointercancel', onGripCancel, true);
       });
     }
 
-    _syncCollapsedShift() {
-      const drawerW = Math.ceil(this.drawerEl.offsetWidth || 0);
-      if (drawerW > 0) {
-        this.capsuleEl.style.setProperty('--collapsed-shift', `${drawerW}px`);
+    _syncDockWidth(instant = false) {
+      const maxW = Math.max(220, (window.innerWidth || 1280) - 32);
+      const naturalW = Math.min(maxW, Math.ceil(this.trackEl.offsetWidth));
+      if (naturalW <= 0) return;
+      if (instant) {
+        const prev = this.capsuleEl.style.transition;
+        this.capsuleEl.style.transition = 'none';
+        this.capsuleEl.style.width = `${naturalW}px`;
+        void this.capsuleEl.offsetWidth;
+        this.capsuleEl.style.transition = prev;
+      } else {
+        this.capsuleEl.style.width = `${naturalW}px`;
       }
     }
 
@@ -1070,11 +1234,13 @@
       this.gripEl.title = t.dragTip;
       this.closeBtn.textContent = t.disconnectLabel;
       this.closeBtn.title = t.closeTip;
+      this.holdTextEl.textContent = t.holdingHint;
       this.cancelConfirmBtn.textContent = t.cancelBtn;
       this.confirmDisconnectBtn.textContent = t.disconnectBtn;
 
       if (!this._state.visible) {
         this._wasVisible = false;
+        this._cancelHoldUnlock();
         this._clearConfirmState();
         this.capsuleEl.dataset.hidden = 'true';
         this.cursorEl.dataset.visible = 'false';
@@ -1086,13 +1252,19 @@
       const isLockedWorking = this._state.mode === 'working';
       const isPaused = this._state.mode === 'paused';
       this.shieldEl.dataset.locked = String(isLockedWorking);
+      if (!isLockedWorking) {
+        this._cancelHoldUnlock();
+      }
 
-      const side = this._state.dock === 'left' ? 'left' : 'right';
-      this.capsuleEl.dataset.side = side;
-      this.capsuleEl.style.top = `${this._state.topPct}%`;
+      this.capsuleEl.dataset.dock = VALID_CORNERS.has(this._state.dock) ? this._state.dock : 'bottom-left';
       this.borderEl.dataset.state = this._state.mode;
 
-      this.pauseBtn.textContent = isPaused ? t.badgeHold : this._state.mode === 'shared' ? t.badgeShared : t.badgeLive;
+      this.tallyTextSpan.textContent = isPaused
+        ? t.badgeHold
+        : this._state.mode === 'shared'
+          ? t.badgeShared
+          : t.badgeLive;
+      this.lockIconPath.setAttribute('d', isPaused ? LOCK_OPEN_SVG_PATH : LOCK_CLOSED_SVG_PATH);
       this.pauseBtn.title = isPaused ? t.resumeTip : t.pauseTip;
       this.pauseBtn.dataset.mode = this._state.confirmingDisconnect ? 'confirm' : this._state.mode;
 
@@ -1108,13 +1280,9 @@
         this.confirmActionsEl.classList.add('hidden-el');
       }
 
-      const shouldExpand = Boolean(
-        this._pointerInsideDock || this._state.confirmingDisconnect || this._state.flashText
-      );
-      this.capsuleEl.dataset.expanded = String(shouldExpand);
-
+      const firstAppear = !this._wasVisible;
       this._wasVisible = true;
-      this._syncCollapsedShift();
+      this._syncDockWidth(firstAppear);
       this.capsuleEl.dataset.hidden = 'false';
     }
 
@@ -1139,7 +1307,7 @@
         this._state.activity = payload.activity;
         this._state.flashText = '';
       }
-      if (payload.dock === 'left' || payload.dock === 'right') {
+      if (VALID_CORNERS.has(payload.dock)) {
         this._state.dock = payload.dock;
       }
       this._render();
