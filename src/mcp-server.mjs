@@ -461,6 +461,20 @@ export function startMcpStdioServer({ callDaemon }) {
     rawBuffer = rawBuffer.length === 0 ? chunk : Buffer.concat([rawBuffer, chunk]);
 
     while (rawBuffer.length > 0) {
+      // Handle ongoing oversized-line discard FIRST before stripping inter-frame CR/LF whitespace
+      // so a chunk-split trailing `\n` is never consumed as leading whitespace (which would drop the next valid RPC)!
+      if (lockedFramingMode === 'line' && discardingOversizedLine) {
+        const discardNlIdx = rawBuffer.indexOf(0x0a);
+        if (discardNlIdx === -1) {
+          rawBuffer = Buffer.alloc(0);
+          return;
+        }
+        rawBuffer = rawBuffer.subarray(discardNlIdx + 1);
+        discardingOversizedLine = false;
+        writeMessage({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Message exceeds maximum byte limit' } });
+        continue;
+      }
+
       // Strip leading UTF-8 BOM (0xEF 0xBB 0xBF) and CR/LF/whitespace between frames
       let leadIdx = 0;
       while (leadIdx < rawBuffer.length) {

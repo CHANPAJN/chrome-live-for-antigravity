@@ -200,11 +200,24 @@ export function sanitizeRouteUrl(rawUrl, customBlockedDomains = []) {
   }
 
   for (const [key, val] of Array.from(u.searchParams.entries())) {
+    let decVal = val;
+    for (let r = 0; r < 4 && decVal.includes('%'); r++) {
+      try {
+        const next = decodeURIComponent(decVal);
+        if (next === decVal) break;
+        decVal = next;
+      } catch {
+        break;
+      }
+    }
     if (
       STRIP_QUERY_PATTERNS.some((rx) => rx.test(key)) ||
       AUDIT_SENSITIVE_PARAM_RX.test(key) ||
+      (val === '' && isHighEntropyPathToken(key, { splitMatrix: false })) ||
       isHighEntropyPathToken(val, { splitMatrix: false }) ||
-      /https?:\/\/|[?#=]/i.test(val)
+      isHighEntropyPathToken(decVal, { splitMatrix: false }) ||
+      AUDIT_SENSITIVE_PARAM_RX.test(decVal) ||
+      /https?:\/\/|[?#=&]/i.test(decVal)
     ) {
       u.searchParams.delete(key);
     }

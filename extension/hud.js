@@ -999,20 +999,49 @@
         } catch {}
       };
 
+      // Guard HUD host interactions in window capture phase so hostile page `window.addEventListener(..., e => e.stopPropagation(), true)`
+      // registered later cannot block the user's Pause / Release / 3s Hold-to-Unlock gestures!
+      const captureHostGuard = (ev) => {
+        if (!ev || !ev.isTrusted || ev._cliveHandled || typeof ev.composedPath !== 'function') return;
+        const pathNodes = ev.composedPath();
+        if (!pathNodes || !pathNodes.includes(this.hostEl)) return;
+        const topTarget = pathNodes[0];
+        if (ev.type === 'click') {
+          if (topTarget === this.pauseBtn || this.pauseBtn.contains(topTarget)) {
+            ev._cliveHandled = true;
+            ev.stopImmediatePropagation?.();
+            onPauseClick(ev);
+          } else if (topTarget === this.closeBtn || this.closeBtn.contains(topTarget)) {
+            ev._cliveHandled = true;
+            ev.stopImmediatePropagation?.();
+            onCloseAskClick(ev);
+          } else if (topTarget === this.cancelConfirmBtn || this.cancelConfirmBtn.contains(topTarget)) {
+            ev._cliveHandled = true;
+            ev.stopImmediatePropagation?.();
+            onCancelConfirmClick(ev);
+          } else if (topTarget === this.confirmDisconnectBtn || this.confirmDisconnectBtn.contains(topTarget)) {
+            ev._cliveHandled = true;
+            ev.stopImmediatePropagation?.();
+            onConfirmReleaseClick(ev);
+          }
+        }
+      };
+      window.addEventListener('click', captureHostGuard, true);
+
       this.pauseBtn.addEventListener('click', onPauseClick);
       this.closeBtn.addEventListener('click', onCloseAskClick);
       this.cancelConfirmBtn.addEventListener('click', onCancelConfirmClick);
       this.confirmDisconnectBtn.addEventListener('click', onConfirmReleaseClick);
-      this.shieldEl.addEventListener('pointerdown', onShieldPointerDown);
-      this.shieldEl.addEventListener('pointermove', onShieldPointerMove);
-      this.shieldEl.addEventListener('pointerup', endShieldHold);
-      this.shieldEl.addEventListener('pointercancel', endShieldHold);
-      this.shieldEl.addEventListener('contextmenu', swallowLockedEvent);
-      this.shieldEl.addEventListener('wheel', swallowLockedEvent, { passive: false });
+      this.shieldEl.addEventListener('pointerdown', onShieldPointerDown, true);
+      this.shieldEl.addEventListener('pointermove', onShieldPointerMove, true);
+      this.shieldEl.addEventListener('pointerup', endShieldHold, true);
+      this.shieldEl.addEventListener('pointercancel', endShieldHold, true);
+      this.shieldEl.addEventListener('contextmenu', swallowLockedEvent, true);
+      this.shieldEl.addEventListener('wheel', swallowLockedEvent, { passive: false, capture: true });
       window.addEventListener('blur', endShieldHold);
-      this.gripEl.addEventListener('pointerdown', onGripDown);
-      this.gripEl.addEventListener('pointerup', onGripUp);
-      this.gripEl.addEventListener('pointercancel', onGripCancel);
+      this.gripEl.addEventListener('pointerdown', onGripDown, true);
+      this.gripEl.addEventListener('pointerup', onGripUp, true);
+      this.gripEl.addEventListener('pointercancel', onGripCancel, true);
 
       this._cleanups.push(() => {
         this._cancelHoldUnlock();
@@ -1020,19 +1049,20 @@
         if (this._flashTimer) clearTimeout(this._flashTimer);
         if (this._cursorIdleTimer) clearTimeout(this._cursorIdleTimer);
         if (this._cursorPressTimer) clearTimeout(this._cursorPressTimer);
+        window.removeEventListener('click', captureHostGuard, true);
         this.pauseBtn.removeEventListener('click', onPauseClick);
         this.closeBtn.removeEventListener('click', onCloseAskClick);
         this.cancelConfirmBtn.removeEventListener('click', onCancelConfirmClick);
         this.confirmDisconnectBtn.removeEventListener('click', onConfirmReleaseClick);
-        this.shieldEl.removeEventListener('pointerdown', onShieldPointerDown);
-        this.shieldEl.removeEventListener('pointermove', onShieldPointerMove);
-        this.shieldEl.removeEventListener('pointerup', endShieldHold);
-        this.shieldEl.removeEventListener('pointercancel', endShieldHold);
-        this.shieldEl.removeEventListener('contextmenu', swallowLockedEvent);
-        this.shieldEl.removeEventListener('wheel', swallowLockedEvent);
+        this.shieldEl.removeEventListener('pointerdown', onShieldPointerDown, true);
+        this.shieldEl.removeEventListener('pointermove', onShieldPointerMove, true);
+        this.shieldEl.removeEventListener('pointerup', endShieldHold, true);
+        this.shieldEl.removeEventListener('pointercancel', endShieldHold, true);
+        this.shieldEl.removeEventListener('contextmenu', swallowLockedEvent, true);
+        this.shieldEl.removeEventListener('wheel', swallowLockedEvent, true);
         window.removeEventListener('blur', endShieldHold);
-        this.gripEl.removeEventListener('pointerdown', onGripDown);
-        this.gripEl.removeEventListener('pointerup', onGripUp);
+        this.gripEl.removeEventListener('pointerdown', onGripDown, true);
+        this.gripEl.removeEventListener('pointerup', onGripUp, true);
         this.gripEl.removeEventListener('pointercancel', onGripCancel);
       });
     }

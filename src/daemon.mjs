@@ -29,6 +29,7 @@ import {
   ensureAuthToken,
   ensureSecureDirSync,
   getStateDir,
+  tightenFileAclSync,
   timingSafeEqualToken
 } from './token-store.mjs';
 import { upgradeHttpToWebSocket } from './ws-codec.mjs';
@@ -505,6 +506,7 @@ export function createDaemonServer(options = {}) {
         }
         const exactBuf = offset === buf.length ? buf : buf.subarray(0, offset);
         fs.writeFileSync(privateCopyPath, exactBuf, { mode: 0o600 });
+        tightenFileAclSync(privateCopyPath);
 
         resolvedFiles.push(privateCopyPath);
         totalBytes += exactBuf.length;
@@ -1133,8 +1135,7 @@ export function createDaemonServer(options = {}) {
         return;
       }
       if (peer._tokenDigest !== sha256Hex(resolveAuthToken())) {
-        activeExtensionOrigin = null;
-        peer.close(4001, 'Auth token rotated');
+        evictStaleTokenPeers();
         return;
       }
       if (pathname === '/ws/extension') {
@@ -1220,6 +1221,12 @@ export function createDaemonServer(options = {}) {
     }
   }
 
+  // Promptly evict stale WebSocket sessions within ~1s whenever auth.token rotates on disk
+  const tokenWatchTimer = setInterval(() => {
+    evictStaleTokenPeers();
+  }, 1000);
+  tokenWatchTimer.unref();
+
   const heartbeatTimer = setInterval(() => {
     evictStaleTokenPeers();
     if (extensionPeer && !extensionPeer.closed) {
@@ -1235,6 +1242,7 @@ export function createDaemonServer(options = {}) {
   function closeDaemonGracefully() {
     if (closed) return Promise.resolve();
     closed = true;
+    clearInterval(tokenWatchTimer);
     clearInterval(heartbeatTimer);
     if (extensionPeer && !extensionPeer.closed) {
       extensionPeer.close(1001, 'Daemon shutting down');
@@ -1289,6 +1297,7 @@ if (isDirectEntry) {
     .then((boundPort) => {
       ensureSecureDirSync(getStateDir());
       fs.writeFileSync(pidFile, `${process.pid}\n`, { encoding: 'utf8', mode: 0o600 });
+      tightenFileAclSync(pidFile);
       process.stdout.write(
         `[chrome-live] Listening on http://${DEFAULT_HOST}:${boundPort} (PID ${process.pid})\n`
       );

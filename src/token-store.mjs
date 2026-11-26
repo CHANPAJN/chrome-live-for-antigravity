@@ -18,11 +18,12 @@ export function getStateDir() {
 
 export function ensureSecureDirSync(dirPath) {
   const resolved = path.resolve(dirPath);
+  const existedBefore = fs.existsSync(resolved);
   fs.mkdirSync(resolved, { recursive: true, mode: 0o700 });
   try {
     if (process.platform !== 'win32') {
       fs.chmodSync(resolved, 0o700);
-    } else if (!hardenedDirs.has(resolved)) {
+    } else if (!existedBefore || !hardenedDirs.has(resolved)) {
       hardenedDirs.add(resolved);
       const username = os.userInfo().username;
       if (username && !/["\r\n]/.test(username)) {

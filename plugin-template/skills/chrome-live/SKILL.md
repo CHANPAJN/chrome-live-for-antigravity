@@ -41,8 +41,8 @@ node "__CHROME_LIVE_CLI_PATH__" scroll down 600
 # 6. Concurrent multi-URL text & image extraction
 node "__CHROME_LIVE_CLI_PATH__" extract "https://example.com/a" "https://example.com/b"
 
-# 7. Opt-in local Site Playbooks (1-step jump to deep admin routes & UI widget workarounds)
-node "__CHROME_LIVE_CLI_PATH__" playbook on
+# 7. Opt-in local Site Playbooks (inspect status; only run `playbook on` when explicitly requested by the user)
+node "__CHROME_LIVE_CLI_PATH__" playbook status
 node "__CHROME_LIVE_CLI_PATH__" playbook save example.com --route "Orders=https://example.com/admin/orders" --tip "Date input is read-only; click calendar cell"
 
 # 8. Finish task & release debugger (closes temporary worker tabs; keeps shared tabs open)
@@ -63,4 +63,5 @@ node "__CHROME_LIVE_CLI_PATH__" release --all
 
 - Payment gateways, retail banking, cloud billing consoles, and `/checkout`, `/pay`, `/billing` routes are blocked locally by default; never attempt to bypass financial guardrails.
 - File uploads are restricted by default to `~/.chrome-live-antigravity/uploads` (or `CHROME_LIVE_UPLOAD_DIR`); copy user-approved upload assets into that staging directory first rather than pointing at arbitrary desktop/document paths.
+- Site Playbooks are strictly opt-in (`false` by default); never run `playbook on` unless the user explicitly asks to enable them.
 - When a tab is paused by the user (`paused: true`), stop attempting browser actions until the user resumes inside Chrome.

@@ -370,9 +370,11 @@ function renderCurrentPageHero(act) {
       const parsed = new URL(act.url);
       if (parsed.pathname && parsed.pathname !== '/' && parsed.pathname.length > 1) {
         const sensitiveRx =
-          /(?:^utm_|^fbclid$|^gclid$|^spm$|^from$|^ref$|^_t$|^t$|^ts$|^timestamp$|^nonce$|token|secret|passw|pwd|apikey|api[-_]?key|access[-_]?key|private[-_]?key|auth|code|state|sig|jwt|bearer|ticket|session|sid|csrf|xsrf|otp|credential)/i;
-        for (const key of Array.from(parsed.searchParams.keys())) {
-          if (sensitiveRx.test(key)) parsed.searchParams.delete(key);
+          /(?:^utm_|^fbclid$|^gclid$|^spm$|^from$|^ref$|^_t$|^t$|^ts$|^timestamp$|^nonce$|token|secret|passw|pwd|apikey|api[-_]?key|access[-_]?key|private[-_]?key|auth|code|state|sig|jwt|bearer|ticket|session|sid|csrf|xsrf|otp|credential|hmac|(?:^|[-_.])(?:key|pass|pin|hash)(?:$|[-_.]))/i;
+        for (const [key, val] of Array.from(parsed.searchParams.entries())) {
+          if (sensitiveRx.test(key) || val.length >= 32 || /https?:\/\/|[?#=&%]/i.test(val)) {
+            parsed.searchParams.delete(key);
+          }
         }
         els.pbKeyInput.value = (act.title || parsed.pathname).split(/\s+[-|·—]\s+/)[0].trim().slice(0, 36);
         els.pbTipInput.value = `${parsed.pathname}${parsed.search}`;

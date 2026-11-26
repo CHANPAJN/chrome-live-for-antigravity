@@ -167,7 +167,7 @@ function canonicalizeRouteForGuardrail(rawSegment, splitRawQuery = false) {
       return { ok: false, rawPath: '', path: '' };
     }
   }
-  const normalized = decoded.replace(/\\/g, '/');
+  const normalized = decoded.replace(/\\/g, '/').replace(/^[/]*!+/, '/');
   const rawPieces = [];
   const stack = [];
   for (const seg of normalized.split('/')) {
@@ -392,6 +392,9 @@ async function signedDaemonFetch(routePath, method = 'GET', bodyObj = null) {
     JSON.stringify(['chrome-live:http-res:v2', resp.status, ts, nonce])
   );
   if (!constantTimeHexEqual(serverSig, expectedServerSig)) {
+    try {
+      resp.body?.cancel?.().catch(() => {});
+    } catch {}
     throw new Error('Unverified local service response signature');
   }
   return resp;
@@ -400,6 +403,7 @@ async function signedDaemonFetch(routePath, method = 'GET', bodyObj = null) {
 // tabId -> { tabId, substate: 'shared'|'worker', uiMode: string, attachedCdp: boolean, screencastActive: boolean, paused: boolean, title: string, url: string, activity: string, idleTimer: any }
 const managedTabs = new Map();
 const hudSyncLocks = new Map();
+const activeExtractTabIds = new Set();
 let liveTabGroupId = null;
 let extractWindowId = null;
 let extractWindowPromise = null;
@@ -427,12 +431,28 @@ function scrubLocalMatrixSegment(seg) {
   let changed = head !== pieces[0];
   for (let i = 1; i < pieces.length; i++) {
     const eqIdx = pieces[i].indexOf('=');
-    if (eqIdx === -1) continue;
+    if (eqIdx === -1) {
+      if (isHighEntropyPathSegment(pieces[i], { splitMatrix: false })) {
+        pieces[i] = 'REDACTED';
+        changed = true;
+      }
+      continue;
+    }
     const mk = pieces[i].slice(0, eqIdx);
     const mv = pieces[i].slice(eqIdx + 1);
-    if (LOCAL_AUDIT_SENSITIVE_PARAM_RX.test(mk) || isHighEntropyPathSegment(mv, { splitMatrix: false })) {
+    let decMk = mk;
+    try {
+      decMk = decodeURIComponent(mk.replace(/\+/g, ' '));
+    } catch {}
+    if (LOCAL_AUDIT_SENSITIVE_PARAM_RX.test(decMk)) {
       pieces[i] = `${mk}=REDACTED`;
       changed = true;
+    } else {
+      const nestedMv = scrubLocalNestedValue(mv, 0);
+      if (nestedMv.changed) {
+        pieces[i] = `${mk}=${nestedMv.value}`;
+        changed = true;
+      }
     }
   }
   pieces[0] = head;
@@ -440,35 +460,48 @@ function scrubLocalMatrixSegment(seg) {
 }
 
 function scrubLocalNestedValue(rawV, depth = 0) {
-  if (!rawV || depth > 3) return { value: rawV, changed: false };
+  if (!rawV || depth > 4) return { value: rawV, changed: false };
   if (isHighEntropyPathSegment(rawV, { splitMatrix: false })) {
     return { value: 'REDACTED', changed: true };
   }
   let decV = rawV;
-  let wasEncoded = false;
-  if (rawV.includes('%')) {
+  let decodeLayers = 0;
+  for (let round = 0; round < 4; round++) {
+    if (!decV.includes('%')) break;
     try {
-      decV = decodeURIComponent(rawV);
-      wasEncoded = decV !== rawV;
+      const next = decodeURIComponent(decV);
+      if (next === decV) break;
+      decV = next;
+      decodeLayers++;
     } catch {
-      return { value: rawV, changed: false };
+      break;
     }
+  }
+  const reencodeLayers = (str) => {
+    let out = str;
+    for (let r = 0; r < decodeLayers; r++) {
+      out = encodeURIComponent(out);
+    }
+    return out;
+  };
+  if (isHighEntropyPathSegment(decV, { splitMatrix: false })) {
+    return { value: 'REDACTED', changed: true };
   }
   if (/^https?:\/\//i.test(decV.trim())) {
     const redUrl = redactAuditUrl(decV.trim(), depth + 1);
     if (redUrl !== decV.trim()) {
-      return { value: wasEncoded ? encodeURIComponent(redUrl) : redUrl, changed: true };
+      return { value: reencodeLayers(redUrl), changed: true };
     }
   } else if (/https?:\/\//i.test(decV)) {
     const redTxt = redactUrlsInTextLocal(decV);
     if (redTxt !== decV) {
-      return { value: wasEncoded ? encodeURIComponent(redTxt) : redTxt, changed: true };
+      return { value: reencodeLayers(redTxt), changed: true };
     }
   } else if (decV.includes('=') || decV.includes('&') || decV.includes('#')) {
     const subScrub = scrubLocalQueryString(`?${decV}`, depth + 1);
     if (subScrub.changed) {
       const inner = subScrub.text.slice(1);
-      return { value: wasEncoded ? encodeURIComponent(inner) : inner, changed: true };
+      return { value: reencodeLayers(inner), changed: true };
     }
   }
   return { value: rawV, changed: false };
@@ -543,29 +576,10 @@ function redactAuditUrl(rawUrl, depth = 0) {
       }
     }
     if (parsed.search) {
-      for (const [k, v] of Array.from(parsed.searchParams.entries())) {
-        if (LOCAL_AUDIT_SENSITIVE_PARAM_RX.test(k) || isHighEntropyPathSegment(v, { splitMatrix: false })) {
-          parsed.searchParams.set(k, 'REDACTED');
-          changed = true;
-        } else if (/^https?:\/\//i.test(v.trim())) {
-          const redNested = redactAuditUrl(v.trim(), depth + 1);
-          if (redNested !== v.trim()) {
-            parsed.searchParams.set(k, redNested);
-            changed = true;
-          }
-        } else if (/https?:\/\//i.test(v)) {
-          const redTxt = redactUrlsInTextLocal(v);
-          if (redTxt !== v) {
-            parsed.searchParams.set(k, redTxt);
-            changed = true;
-          }
-        } else if (v.includes('=') || v.includes('&') || v.includes('#')) {
-          const subScrub = scrubLocalQueryString(`?${v}`, depth + 1);
-          if (subScrub.changed) {
-            parsed.searchParams.set(k, subScrub.text.slice(1));
-            changed = true;
-          }
-        }
+      const scrubbedSearch = scrubLocalQueryString(parsed.search, depth);
+      if (scrubbedSearch.changed) {
+        parsed.search = scrubbedSearch.text;
+        changed = true;
       }
     }
     if (parsed.hash) {
@@ -640,12 +654,41 @@ function redactAuditUrl(rawUrl, depth = 0) {
   }
 }
 
+function splitLocalBalancedUrlSuffix(rawMatch) {
+  let end = rawMatch.length;
+  while (end > 0) {
+    const ch = rawMatch[end - 1];
+    if (/[.,;:!?]/.test(ch)) {
+      end--;
+      continue;
+    }
+    if (ch === ')') {
+      const sub = rawMatch.slice(0, end);
+      const opens = (sub.match(/\(/g) || []).length;
+      const closes = (sub.match(/\)/g) || []).length;
+      if (closes > opens) {
+        end--;
+        continue;
+      }
+    }
+    if (ch === ']') {
+      const sub = rawMatch.slice(0, end);
+      const opens = (sub.match(/\[/g) || []).length;
+      const closes = (sub.match(/\]/g) || []).length;
+      if (closes > opens) {
+        end--;
+        continue;
+      }
+    }
+    break;
+  }
+  return { coreUrl: rawMatch.slice(0, end), suffix: rawMatch.slice(end) };
+}
+
 function redactUrlsInTextLocal(rawText) {
   if (typeof rawText !== 'string' || !/https?:\/\//i.test(rawText)) return rawText;
-  return rawText.replace(/https?:\/\/[^\s"'<>)\]]+/gi, (match) => {
-    const punctMatch = match.match(/([.,;:!?]+)$/);
-    const coreUrl = punctMatch ? match.slice(0, -punctMatch[1].length) : match;
-    const suffix = punctMatch ? punctMatch[1] : '';
+  return rawText.replace(/https?:\/\/[^\s"'<>]+/gi, (match) => {
+    const { coreUrl, suffix } = splitLocalBalancedUrlSuffix(match);
     return redactAuditUrl(coreUrl) + suffix;
   });
 }
@@ -708,16 +751,28 @@ function checkTabUrlAllowed(rawUrl) {
   if (!canonPath.ok) {
     return { allowed: false, reason: 'Malformed percent-encoding in URL pathname' };
   }
-  const rawHash = parsed.hash ? parsed.hash.replace(/^#+!?/, '') : '';
-  const canonHash = rawHash ? canonicalizeRouteForGuardrail(rawHash, true) : { ok: true, rawPath: '', path: '' };
-  if (!canonHash.ok) {
-    return { allowed: false, reason: 'Malformed percent-encoding in URL fragment' };
+  let hashMatchedCheckout = false;
+  if (parsed.hash && parsed.hash.length > 1) {
+    const subChunks = parsed.hash.slice(1).split('#');
+    for (const chunk of subChunks) {
+      const cleanChunk = chunk.replace(/^!+/, '');
+      if (!cleanChunk) continue;
+      const canonChunk = canonicalizeRouteForGuardrail(cleanChunk, true);
+      if (!canonChunk.ok) {
+        return { allowed: false, reason: 'Malformed percent-encoding in URL fragment' };
+      }
+      if (
+        (canonChunk.rawPath && CHECKOUT_SEGMENT_RX.test(canonChunk.rawPath)) ||
+        (canonChunk.path && CHECKOUT_SEGMENT_RX.test(canonChunk.path))
+      ) {
+        hashMatchedCheckout = true;
+      }
+    }
   }
   if (
     CHECKOUT_SEGMENT_RX.test(canonPath.rawPath) ||
     CHECKOUT_SEGMENT_RX.test(canonPath.path) ||
-    (canonHash.rawPath && CHECKOUT_SEGMENT_RX.test(canonHash.rawPath)) ||
-    (canonHash.path && CHECKOUT_SEGMENT_RX.test(canonHash.path))
+    hashMatchedCheckout
   ) {
     return { allowed: false, reason: 'Protected checkout/payment route' };
   }
@@ -1118,6 +1173,8 @@ async function reconcileHudAfterStartup() {
       if (!checkTabUrlAllowed(tab.url || '').allowed) continue;
       const entry = managedTabs.get(tab.id);
       if (entry) {
+        await pollHudUserEvents(tab.id, entry);
+        if (!managedTabs.has(tab.id)) continue;
         await syncHud(tab.id, {
           visible: true,
           mode: entry.paused ? 'paused' : entry.uiMode || 'working',
@@ -1281,15 +1338,18 @@ async function captureQuickFrame(tabId, entry, timeoutMs = 1200) {
     entry.title = liveTab.title || entry.title;
     entry.url = liveTab.url || entry.url;
     const urlSafety = checkTabUrlAllowed(entry.url || '');
-    if (!urlSafety.allowed) {
-      await detachManagedTab(tabId, urlSafety.reason, true);
+    const pendingSafety = liveTab.pendingUrl ? checkTabUrlAllowed(liveTab.pendingUrl) : { allowed: true, reason: '' };
+    if (!urlSafety.allowed || !pendingSafety.allowed) {
+      const tripUrl = !urlSafety.allowed ? entry.url : liveTab.pendingUrl;
+      const tripReason = !urlSafety.allowed ? urlSafety.reason : pendingSafety.reason;
+      await detachManagedTab(tabId, tripReason, true);
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(
           JSON.stringify({
             type: 'guardrail_trip',
             tabId,
-            url: redactAuditUrl(entry.url),
-            reason: urlSafety.reason
+            url: redactAuditUrl(tripUrl),
+            reason: tripReason
           })
         );
       }
@@ -1330,6 +1390,22 @@ async function captureQuickFrame(tabId, entry, timeoutMs = 1200) {
       await stopCdpForTab(tabId, entry);
       return null;
     }
+    // Re-verify liveTab.url AND pendingUrl AFTER captureScreenshot completes to defeat mid-navigation checkout race!
+    const postShotTab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!postShotTab) return null;
+    const postUrlCheck = checkTabUrlAllowed(postShotTab.url || '');
+    const postPendingCheck = postShotTab.pendingUrl ? checkTabUrlAllowed(postShotTab.pendingUrl) : { allowed: true, reason: '' };
+    if (!postUrlCheck.allowed || !postPendingCheck.allowed) {
+      const pReason = !postUrlCheck.allowed ? postUrlCheck.reason : postPendingCheck.reason;
+      const pUrl = !postUrlCheck.allowed ? postShotTab.url : postShotTab.pendingUrl;
+      await detachManagedTab(tabId, pReason, true);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'guardrail_trip', tabId, url: redactAuditUrl(pUrl || ''), reason: pReason }));
+      }
+      return null;
+    }
+    entry.title = postShotTab.title || entry.title;
+    entry.url = postShotTab.url || entry.url;
     if (shot && shot.data) {
       ws.send(
         JSON.stringify({
@@ -1364,6 +1440,10 @@ async function syncLiveTabGroups() {
 
       for (const t of tabsInGroup) {
         if (typeof t.id !== 'number') continue;
+        if (activeExtractTabIds.has(t.id)) {
+          activeManagedInGroup.push({ tabId: t.id, paused: false, uiMode: 'working' });
+          continue;
+        }
         const entry = managedTabs.get(t.id);
         if (!entry) {
           orphanTabIds.push(t.id);
@@ -1454,11 +1534,26 @@ async function shareTab(tab, toggleIfAlreadyShared = false) {
     return;
   }
 
-  const safety = checkTabUrlAllowed(tab.url || '');
+  let safety = checkTabUrlAllowed(tab.url || '');
   if (!safety.allowed) {
     pushLocalAudit('share_tab', { tabId: tab.id, url: tab.url, reason: safety.reason }, 'blocked');
     notifyPanelAndDaemon();
     return;
+  }
+
+  // Wake discarded background tabs before inspecting embedded sub-frames so Alt+Shift+L sharing succeeds cleanly
+  if (tab.discarded) {
+    await chrome.tabs.reload(tab.id).catch(() => {});
+    await waitForTabComplete(tab.id, 9000);
+    const reloaded = await chrome.tabs.get(tab.id).catch(() => null);
+    if (!reloaded) return;
+    tab = reloaded;
+    safety = checkTabUrlAllowed(tab.url || '');
+    if (!safety.allowed) {
+      pushLocalAudit('share_tab', { tabId: tab.id, url: tab.url, reason: safety.reason }, 'blocked');
+      notifyPanelAndDaemon();
+      return;
+    }
   }
 
   const embeddedSafety = await inspectEmbeddedFramesSafety(tab.id);
@@ -1854,6 +1949,21 @@ async function inspectEmbeddedFramesSafety(tabId) {
               if (frame.contentDocument) collectFrames(frame.contentDocument, depth + 1);
             } catch {}
           }
+          for (const plug of root.querySelectorAll('object, embed')) {
+            const st = winObj.getComputedStyle(plug);
+            const rc = plug.getBoundingClientRect();
+            const isVis =
+              st.display !== 'none' &&
+              st.visibility !== 'hidden' &&
+              st.opacity !== '0' &&
+              rc.width >= 24 &&
+              rc.height >= 24;
+            if (isVis) {
+              const rawPlugUrl = safeAttr(plug, 'data') || safeAttr(plug, 'src');
+              const absPlug = resolveAbsHttpUrl(rawPlugUrl, plug.ownerDocument);
+              if (absPlug) urls.push(absPlug);
+            }
+          }
           for (const el of root.querySelectorAll('*')) {
             if (el.shadowRoot) collectFrames(el.shadowRoot, depth + 1);
           }
@@ -1959,19 +2069,22 @@ async function assertTabReadyForAction(entry) {
   entry.title = liveTab.title || '';
   entry.url = liveTab.url || '';
   const safety = checkTabUrlAllowed(entry.url);
-  if (!safety.allowed) {
-    await detachManagedTab(entry.tabId, safety.reason, true);
+  const pendingSafety = liveTab.pendingUrl ? checkTabUrlAllowed(liveTab.pendingUrl) : { allowed: true, reason: '' };
+  if (!safety.allowed || !pendingSafety.allowed) {
+    const failReason = !safety.allowed ? safety.reason : pendingSafety.reason;
+    const failUrl = !safety.allowed ? entry.url : liveTab.pendingUrl;
+    await detachManagedTab(entry.tabId, failReason, true);
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(
         JSON.stringify({
           type: 'guardrail_trip',
           tabId: entry.tabId,
-          url: redactAuditUrl(entry.url),
-          reason: safety.reason
+          url: redactAuditUrl(failUrl || ''),
+          reason: failReason
         })
       );
     }
-    throw new Error(`[GUARDRAIL] Detached tab because it navigated to ${safety.reason}`);
+    throw new Error(`[GUARDRAIL] Detached tab because it navigated to ${failReason}`);
   }
 
   const subCheck = await inspectEmbeddedFramesSafety(entry.tabId);
@@ -2280,6 +2393,9 @@ async function executeBridgeRpc(method, params) {
           const harvestNodeHints = (node, hop = 0) => {
             if (!node || typeof node.getAttribute !== 'function' || visitedNodes.has(node)) return;
             visitedNodes.add(node);
+            if (node.tagName && String(node.tagName).includes('-')) {
+              metaTokens.push(String(node.tagName));
+            }
             autoTokens.push(node.getAttribute('autocomplete') || '');
             metaTokens.push(
               node.getAttribute('name'),
@@ -2302,20 +2418,40 @@ async function executeBridgeRpc(method, params) {
                 docObj.getElementById(lid);
               if (lNode) metaTokens.push(readTextWithSlots(lNode));
             }
-            // Capture light-DOM slotted labels on Web Component hosts (`<x-field><span slot="label">验证码</span></x-field>`)
-            if (node.shadowRoot && node.children && typeof node.children[Symbol.iterator] === 'function') {
-              for (const child of node.children) {
-                const slotName = String(child.getAttribute?.('slot') || '').toLowerCase();
-                if (slotName.includes('label') || String(child.tagName || '').toLowerCase() === 'label') {
-                  const cTxt = String(child.textContent || '').trim();
-                  if (cTxt.length > 0 && cTxt.length <= 64) metaTokens.push(cTxt);
+            // Capture named & unnamed light-DOM slotted labels on Web Component hosts (`<otp-input><span>短信验证码</span></otp-input>`)
+            if (node.shadowRoot) {
+              if (typeof node.shadowRoot.querySelectorAll === 'function') {
+                for (const sl of node.shadowRoot.querySelectorAll('slot')) {
+                  if (typeof sl.assignedNodes === 'function') {
+                    for (const an of sl.assignedNodes({ flatten: true })) {
+                      const hasCtrl =
+                        typeof an?.querySelector === 'function' &&
+                        Boolean(an.querySelector('input, textarea, select, [contenteditable="true"]'));
+                      if (!hasCtrl) {
+                        const sTxt = String(an?.textContent || '').trim();
+                        if (sTxt.length > 0 && sTxt.length <= 64) metaTokens.push(sTxt);
+                      }
+                    }
+                  }
+                }
+              }
+              const hostKids = node.childNodes || node.children;
+              if (hostKids && typeof hostKids[Symbol.iterator] === 'function') {
+                for (const child of hostKids) {
+                  const hasCtrl =
+                    typeof child?.querySelector === 'function' &&
+                    Boolean(child.querySelector('input, textarea, select, [contenteditable="true"]'));
+                  if (!hasCtrl) {
+                    const cTxt = String(child?.textContent || '').trim();
+                    if (cTxt.length > 0 && cTxt.length <= 64) metaTokens.push(cTxt);
+                  }
                 }
               }
             }
             // Harvest adjacent preceding label siblings inside UI form rows (AntD / ElementPlus / Tailwind) without bleeding from prior input rows
             if (hop <= 4) {
               let sib = node.previousElementSibling;
-              for (let sHop = 0; sHop < 2 && sib; sHop++, sib = sib.previousElementSibling) {
+              for (let sHop = 0; sHop < 4 && sib; sHop++, sib = sib.previousElementSibling) {
                 const hasOtherInput =
                   typeof sib.querySelector === 'function' &&
                   Boolean(sib.querySelector('input, textarea, select, [contenteditable="true"]'));
@@ -2467,12 +2603,27 @@ async function executeBridgeRpc(method, params) {
           // Never read user-typed .value, nested <textarea>/contenteditable/editor drafts, or hidden text across Shadow DOM
           const REGION_SKIP_SEL =
             'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
-          const isInsideSkipped = (node) => {
+          const isInsideSkipped = (node, stopRoot) => {
             let cur = node instanceof Element ? node : node?.parentElement;
             while (cur) {
               if (cur.isContentEditable || cur.matches?.(REGION_SKIP_SEL) || cur.closest?.(REGION_SKIP_SEL)) return true;
+              if (typeof cur.checkVisibility === 'function' && !cur.checkVisibility({ checkVisibilityCSS: true })) {
+                return true;
+              }
+              const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
+              const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue?.('-webkit-text-security') || '').toLowerCase();
+              if (
+                cs.display === 'none' ||
+                cs.visibility === 'hidden' ||
+                cs.visibility === 'collapse' ||
+                cs.opacity === '0' ||
+                (tSec && tSec !== 'none')
+              ) {
+                return true;
+              }
+              if (cur === stopRoot) break;
               const rn = cur.getRootNode?.();
-              cur = rn && rn instanceof ShadowRoot ? rn.host : null;
+              cur = cur.parentElement || (rn && rn.host ? rn.host : null);
             }
             return false;
           };
@@ -2483,7 +2634,7 @@ async function executeBridgeRpc(method, params) {
             let tn;
             while ((tn = tw.nextNode())) {
               const p = tn.parentElement;
-              if (p && !isInsideSkipped(p)) {
+              if (p && !isInsideSkipped(p, rootNode)) {
                 outParts.push(tn.nodeValue || '');
               }
             }
@@ -2726,6 +2877,9 @@ async function executeBridgeRpc(method, params) {
               url: targetUrl,
               active: false
             });
+            if (typeof workerTab.id === 'number') {
+              activeExtractTabIds.add(workerTab.id);
+            }
             if (hostWindowId !== extractWindowId && typeof workerTab.id === 'number') {
               await placeInBackgroundTabGroup(workerTab.id, workerTab.windowId);
             }
@@ -2858,6 +3012,7 @@ async function executeBridgeRpc(method, params) {
             return extractedItem;
           } finally {
             if (workerTab && typeof workerTab.id === 'number') {
+              activeExtractTabIds.delete(workerTab.id);
               await chrome.tabs.remove(workerTab.id).catch(() => {});
             }
           }
@@ -3021,12 +3176,27 @@ async function executeBridgeRpc(method, params) {
           // Never expose user-entered password/OTP/input values or nested editor draft text as element labels
           const SNAP_SKIP_SEL =
             'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
-          const isSnapSkipped = (n) => {
+          const isSnapSkipped = (n, stopRoot) => {
             let cur = n instanceof Element ? n : n?.parentElement;
             while (cur) {
               if (cur.isContentEditable || cur.matches?.(SNAP_SKIP_SEL) || cur.closest?.(SNAP_SKIP_SEL)) return true;
+              if (typeof cur.checkVisibility === 'function' && !cur.checkVisibility({ checkVisibilityCSS: true })) {
+                return true;
+              }
+              const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
+              const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue?.('-webkit-text-security') || '').toLowerCase();
+              if (
+                cs.display === 'none' ||
+                cs.visibility === 'hidden' ||
+                cs.visibility === 'collapse' ||
+                cs.opacity === '0' ||
+                (tSec && tSec !== 'none')
+              ) {
+                return true;
+              }
+              if (cur === stopRoot) break;
               const rn = cur.getRootNode?.();
-              cur = rn && rn instanceof ShadowRoot ? rn.host : null;
+              cur = cur.parentElement || (rn && rn.host ? rn.host : null);
             }
             return false;
           };
@@ -3037,7 +3207,7 @@ async function executeBridgeRpc(method, params) {
             let tn;
             while ((tn = tw.nextNode())) {
               const p = tn.parentElement;
-              if (p && !isSnapSkipped(p)) {
+              if (p && !isSnapSkipped(p, rootNode)) {
                 outParts.push(tn.nodeValue || '');
               }
             }
@@ -3130,12 +3300,27 @@ async function executeBridgeRpc(method, params) {
           if (aRect.width < 4 || aRect.height < 4) continue;
           const ALERT_SKIP_SEL =
             'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
-          const isAlertSkipped = (n) => {
+          const isAlertSkipped = (n, stopRoot) => {
             let cur = n instanceof Element ? n : n?.parentElement;
             while (cur) {
               if (cur.isContentEditable || cur.matches?.(ALERT_SKIP_SEL) || cur.closest?.(ALERT_SKIP_SEL)) return true;
+              if (typeof cur.checkVisibility === 'function' && !cur.checkVisibility({ checkVisibilityCSS: true })) {
+                return true;
+              }
+              const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
+              const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue?.('-webkit-text-security') || '').toLowerCase();
+              if (
+                cs.display === 'none' ||
+                cs.visibility === 'hidden' ||
+                cs.visibility === 'collapse' ||
+                cs.opacity === '0' ||
+                (tSec && tSec !== 'none')
+              ) {
+                return true;
+              }
+              if (cur === stopRoot) break;
               const rn = cur.getRootNode?.();
-              cur = rn && rn instanceof ShadowRoot ? rn.host : null;
+              cur = cur.parentElement || (rn && rn.host ? rn.host : null);
             }
             return false;
           };
@@ -3144,7 +3329,7 @@ async function executeBridgeRpc(method, params) {
           let aTn;
           while ((aTn = aWalker.nextNode())) {
             const ap = aTn.parentElement;
-            if (ap && !isAlertSkipped(ap)) {
+            if (ap && !isAlertSkipped(ap, aNode)) {
               cleanAlertParts.push(aTn.nodeValue || '');
             }
           }
@@ -3273,12 +3458,27 @@ async function executeBridgeRpc(method, params) {
 
         const CLICK_SKIP_SEL =
           'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
-        const isClickSkipped = (n) => {
+        const isClickSkipped = (n, stopRoot) => {
           let cur = n instanceof Element ? n : n?.parentElement;
           while (cur) {
             if (cur.isContentEditable || cur.matches?.(CLICK_SKIP_SEL) || cur.closest?.(CLICK_SKIP_SEL)) return true;
+            if (typeof cur.checkVisibility === 'function' && !cur.checkVisibility({ checkVisibilityCSS: true })) {
+              return true;
+            }
+            const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
+            const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue?.('-webkit-text-security') || '').toLowerCase();
+            if (
+              cs.display === 'none' ||
+              cs.visibility === 'hidden' ||
+              cs.visibility === 'collapse' ||
+              cs.opacity === '0' ||
+              (tSec && tSec !== 'none')
+            ) {
+              return true;
+            }
+            if (cur === stopRoot) break;
             const rn = cur.getRootNode?.();
-            cur = rn && rn instanceof ShadowRoot ? rn.host : null;
+            cur = cur.parentElement || (rn && rn.host ? rn.host : null);
           }
           return false;
         };
@@ -3290,7 +3490,7 @@ async function executeBridgeRpc(method, params) {
           let tn;
           while ((tn = tw.nextNode())) {
             const p = tn.parentElement;
-            if (p && !isClickSkipped(p)) {
+            if (p && !isClickSkipped(p, rootNode)) {
               outParts.push(tn.nodeValue || '');
             }
           }
@@ -3702,8 +3902,28 @@ async function executeBridgeRpc(method, params) {
               const tw = document.createTreeWalker(lbl, NodeFilter.SHOW_TEXT);
               let tn;
               while ((tn = tw.nextNode())) {
-                const p = tn.parentElement;
-                if (p && typeof p.closest === 'function' && p.closest(skipSel)) continue;
+                let cur = tn.parentElement;
+                let blocked = false;
+                while (cur) {
+                  if (cur.isContentEditable || cur.matches?.(skipSel) || cur.closest?.(skipSel)) {
+                    blocked = true;
+                    break;
+                  }
+                  if (typeof cur.checkVisibility === 'function' && !cur.checkVisibility({ checkVisibilityCSS: true })) {
+                    blocked = true;
+                    break;
+                  }
+                  const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
+                  const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue?.('-webkit-text-security') || '').toLowerCase();
+                  if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0' || (tSec && tSec !== 'none')) {
+                    blocked = true;
+                    break;
+                  }
+                  if (cur === lbl) break;
+                  const rn = cur.getRootNode?.();
+                  cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+                }
+                if (blocked) continue;
                 if (tn.nodeValue) parts.push(tn.nodeValue);
               }
               return parts.join(' ');
@@ -3799,6 +4019,9 @@ async function executeBridgeRpc(method, params) {
         const collectFromNode = (node, hop = 0) => {
           if (!node || typeof node.getAttribute !== 'function' || seenAncestors.has(node)) return;
           seenAncestors.add(node);
+          if (node.tagName && String(node.tagName).includes('-')) {
+            elLabelPush(String(node.tagName));
+          }
           elAutoBucket.push(node.getAttribute('autocomplete') || '');
           elMetaBucket.push(
             node.getAttribute('name'),
@@ -3820,20 +4043,40 @@ async function executeBridgeRpc(method, params) {
               document.getElementById(lid);
             if (lNode) elLabelPush(readNodeTextAndSlots(lNode));
           }
-          // Capture light-DOM slotted labels on Web Component hosts (`<x-field><span slot="label">短信验证码</span></x-field>`)
-          if (node.shadowRoot && node.children && typeof node.children[Symbol.iterator] === 'function') {
-            for (const child of node.children) {
-              const slotName = String(child.getAttribute?.('slot') || '').toLowerCase();
-              if (slotName.includes('label') || String(child.tagName || '').toLowerCase() === 'label') {
-                const cTxt = String(child.textContent || '').trim();
-                if (cTxt.length > 0 && cTxt.length <= 64) elLabelPush(cTxt);
+          // Capture named & unnamed light-DOM slotted labels on Web Component hosts (`<otp-input><span>短信验证码</span></otp-input>`)
+          if (node.shadowRoot) {
+            if (typeof node.shadowRoot.querySelectorAll === 'function') {
+              for (const sl of node.shadowRoot.querySelectorAll('slot')) {
+                if (typeof sl.assignedNodes === 'function') {
+                  for (const an of sl.assignedNodes({ flatten: true })) {
+                    const hasCtrl =
+                      typeof an?.querySelector === 'function' &&
+                      Boolean(an.querySelector('input, textarea, select, [contenteditable="true"]'));
+                    if (!hasCtrl) {
+                      const sTxt = String(an?.textContent || '').trim();
+                      if (sTxt.length > 0 && sTxt.length <= 64) elLabelPush(sTxt);
+                    }
+                  }
+                }
+              }
+            }
+            const hostKids = node.childNodes || node.children;
+            if (hostKids && typeof hostKids[Symbol.iterator] === 'function') {
+              for (const child of hostKids) {
+                const hasCtrl =
+                  typeof child?.querySelector === 'function' &&
+                  Boolean(child.querySelector('input, textarea, select, [contenteditable="true"]'));
+                if (!hasCtrl) {
+                  const cTxt = String(child?.textContent || '').trim();
+                  if (cTxt.length > 0 && cTxt.length <= 64) elLabelPush(cTxt);
+                }
               }
             }
           }
           // Harvest adjacent preceding label siblings inside UI form rows (AntD / ElementPlus / Tailwind) without bleeding from prior input rows
           if (hop <= 4) {
             let sib = node.previousElementSibling;
-            for (let sHop = 0; sHop < 2 && sib; sHop++, sib = sib.previousElementSibling) {
+            for (let sHop = 0; sHop < 4 && sib; sHop++, sib = sib.previousElementSibling) {
               const hasOtherInput =
                 typeof sib.querySelector === 'function' &&
                 Boolean(sib.querySelector('input, textarea, select, [contenteditable="true"]'));
@@ -4233,8 +4476,28 @@ async function executeBridgeRpc(method, params) {
             const tw = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
             let tn;
             while ((tn = tw.nextNode())) {
-              const p = tn.parentElement;
-              if (p && typeof p.closest === 'function' && p.closest(skipSel)) continue;
+              let cur = tn.parentElement;
+              let blocked = false;
+              while (cur) {
+                if (cur.isContentEditable || cur.matches?.(skipSel) || cur.closest?.(skipSel)) {
+                  blocked = true;
+                  break;
+                }
+                if (typeof cur.checkVisibility === 'function' && !cur.checkVisibility({ checkVisibilityCSS: true })) {
+                  blocked = true;
+                  break;
+                }
+                const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
+                const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue?.('-webkit-text-security') || '').toLowerCase();
+                if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0' || (tSec && tSec !== 'none')) {
+                  blocked = true;
+                  break;
+                }
+                if (cur === node) break;
+                const rn = cur.getRootNode?.();
+                cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+              }
+              if (blocked) continue;
               if (tn.nodeValue) out.push(tn.nodeValue);
             }
             return out.join(' ');
@@ -4624,7 +4887,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     chrome.debugger
       .sendCommand({ tabId }, 'Page.screencastFrameAck', { sessionId: params.sessionId })
       .catch(() => {});
-    if (entry.paused) {
+    if (entry.paused || entry.detached || !checkTabUrlAllowed(entry.url || '').allowed) {
       stopCdpForTab(tabId, entry).catch(() => {});
       return;
     }
@@ -4657,8 +4920,25 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 });
 
 async function handleWebNavGuardrail(details) {
+  if (!details || typeof details.tabId !== 'number') return;
+  // Synchronous pre-await kill switch for already-loaded managedTabs so concurrent `Page.screencastFrame` drops at 0us!
+  if (
+    managedTabs.has(details.tabId) &&
+    details.url &&
+    details.url !== 'about:blank' &&
+    !(details.frameId !== 0 && isPassiveTelemetrySubframeUrl(details.url))
+  ) {
+    const syncCheck = checkTabUrlAllowed(details.url);
+    if (!syncCheck.allowed) {
+      const curEntry = managedTabs.get(details.tabId);
+      if (curEntry) {
+        curEntry.detached = true;
+        curEntry.paused = true;
+      }
+    }
+  }
   await ensureSwInitialized();
-  if (!details || typeof details.tabId !== 'number' || !managedTabs.has(details.tabId)) return;
+  if (!managedTabs.has(details.tabId)) return;
   if (!details.url || details.url === 'about:blank') return;
   if (details.frameId !== 0 && isPassiveTelemetrySubframeUrl(details.url)) return;
   const safety = checkTabUrlAllowed(details.url);
@@ -4681,6 +4961,9 @@ async function handleWebNavGuardrail(details) {
   }
 }
 
+if (chrome.webNavigation?.onBeforeNavigate) {
+  chrome.webNavigation.onBeforeNavigate.addListener(handleWebNavGuardrail);
+}
 if (chrome.webNavigation?.onCommitted) {
   chrome.webNavigation.onCommitted.addListener(handleWebNavGuardrail);
 }
@@ -4692,6 +4975,17 @@ if (chrome.webNavigation?.onReferenceFragmentUpdated) {
 }
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  // Synchronous pre-await kill switch on URL / pendingUrl changes before async storage await
+  if (managedTabs.has(tabId)) {
+    const candidateSyncUrl = changeInfo.url || tab?.pendingUrl || tab?.url || '';
+    if (candidateSyncUrl && !checkTabUrlAllowed(candidateSyncUrl).allowed) {
+      const syncEntry = managedTabs.get(tabId);
+      if (syncEntry) {
+        syncEntry.detached = true;
+        syncEntry.paused = true;
+      }
+    }
+  }
   await ensureSwInitialized();
   // Always notify the open side panel when an active tab navigates from chrome://newtab/ to a web URL
   if (tab?.active && (changeInfo.url || changeInfo.title || changeInfo.status === 'complete')) {
@@ -4699,19 +4993,22 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   }
   if (!managedTabs.has(tabId)) return;
   const entry = managedTabs.get(tabId);
-  if (changeInfo.url || changeInfo.status === 'complete') {
+  if (changeInfo.url || tab?.pendingUrl || changeInfo.status === 'complete') {
     entry.title = tab.title || entry.title;
     entry.url = tab.url || entry.url;
     const safety = checkTabUrlAllowed(entry.url);
-    if (!safety.allowed) {
-      await detachManagedTab(tabId, safety.reason, true);
+    const pendSafety = tab?.pendingUrl ? checkTabUrlAllowed(tab.pendingUrl) : { allowed: true, reason: '' };
+    if (!safety.allowed || !pendSafety.allowed) {
+      const tripReason = !safety.allowed ? safety.reason : pendSafety.reason;
+      const tripUrl = !safety.allowed ? entry.url : tab.pendingUrl;
+      await detachManagedTab(tabId, tripReason, true);
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(
           JSON.stringify({
             type: 'guardrail_trip',
             tabId,
-            url: redactAuditUrl(entry.url),
-            reason: safety.reason
+            url: redactAuditUrl(tripUrl || ''),
+            reason: tripReason
           })
         );
       }
@@ -4993,7 +5290,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({
         ok: true,
         lang: currentLang,
-        wsConnected: Boolean(ws && ws.readyState === WebSocket.OPEN),
+        wsConnected: Boolean(ws && ws.readyState === WebSocket.OPEN && wsAuthed),
         port: bridgeConfig.port,
         token: bridgeConfig.token,
         currentActiveTab,
@@ -5098,6 +5395,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === 'panel:toggle_pause_tab') {
       if (typeof msg.tabId === 'number' && managedTabs.has(msg.tabId)) {
         const entry = managedTabs.get(msg.tabId);
+        await pollHudUserEvents(entry.tabId, entry);
+        if (!managedTabs.has(msg.tabId)) {
+          sendResponse({ ok: true });
+          return;
+        }
         entry.paused = !entry.paused;
         entry.uiMode = entry.paused ? 'paused' : 'working';
         if (entry.paused) {
@@ -5118,6 +5420,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         });
         await syncLiveTabGroups();
         notifyPanelAndDaemon();
+        await persistSessionState();
       }
       sendResponse({ ok: true });
       return;
@@ -5170,9 +5473,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true;
 });
 
-swInitPromise = loadBootstrapAndStorage();
-swInitPromise.then(() => {
-  reconcileHudAfterStartup();
-  syncLiveTabGroups();
+swInitPromise = loadBootstrapAndStorage().then(async () => {
+  await reconcileHudAfterStartup();
+  await syncLiveTabGroups();
+  notifyPanelAndDaemon();
   connectWebSocket();
 });

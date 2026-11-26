@@ -117,12 +117,28 @@ function redactMatrixParamsInSegment(seg) {
   let changed = head !== pieces[0];
   for (let i = 1; i < pieces.length; i++) {
     const eqIdx = pieces[i].indexOf('=');
-    if (eqIdx === -1) continue;
+    if (eqIdx === -1) {
+      if (isHighEntropyPathToken(pieces[i], { splitMatrix: false })) {
+        pieces[i] = 'REDACTED';
+        changed = true;
+      }
+      continue;
+    }
     const mk = pieces[i].slice(0, eqIdx);
     const mv = pieces[i].slice(eqIdx + 1);
-    if (AUDIT_SENSITIVE_PARAM_RX.test(mk) || isHighEntropyPathToken(mv, { splitMatrix: false })) {
+    let decMk = mk;
+    try {
+      decMk = decodeURIComponent(mk.replace(/\+/g, ' '));
+    } catch {}
+    if (AUDIT_SENSITIVE_PARAM_RX.test(decMk)) {
       pieces[i] = `${mk}=REDACTED`;
       changed = true;
+    } else {
+      const nestedMv = scrubNestedParamValue(mv, 0);
+      if (nestedMv.changed) {
+        pieces[i] = `${mk}=${nestedMv.value}`;
+        changed = true;
+      }
     }
   }
   pieces[0] = head;
@@ -130,35 +146,48 @@ function redactMatrixParamsInSegment(seg) {
 }
 
 function scrubNestedParamValue(rawV, depth = 0) {
-  if (!rawV || depth > 3) return { value: rawV, changed: false };
+  if (!rawV || depth > 4) return { value: rawV, changed: false };
   if (isHighEntropyPathToken(rawV, { splitMatrix: false })) {
     return { value: 'REDACTED', changed: true };
   }
   let decV = rawV;
-  let wasEncoded = false;
-  if (rawV.includes('%')) {
+  let decodeLayers = 0;
+  for (let round = 0; round < 4; round++) {
+    if (!decV.includes('%')) break;
     try {
-      decV = decodeURIComponent(rawV);
-      wasEncoded = decV !== rawV;
+      const next = decodeURIComponent(decV);
+      if (next === decV) break;
+      decV = next;
+      decodeLayers++;
     } catch {
-      return { value: rawV, changed: false };
+      break;
     }
+  }
+  const reencodeLayers = (str) => {
+    let out = str;
+    for (let r = 0; r < decodeLayers; r++) {
+      out = encodeURIComponent(out);
+    }
+    return out;
+  };
+  if (isHighEntropyPathToken(decV, { splitMatrix: false })) {
+    return { value: 'REDACTED', changed: true };
   }
   if (/^https?:\/\//i.test(decV.trim())) {
     const redUrl = redactUrlForAudit(decV.trim(), depth + 1);
     if (redUrl !== decV.trim()) {
-      return { value: wasEncoded ? encodeURIComponent(redUrl) : redUrl, changed: true };
+      return { value: reencodeLayers(redUrl), changed: true };
     }
   } else if (/https?:\/\//i.test(decV)) {
     const redTxt = redactUrlsInText(decV);
     if (redTxt !== decV) {
-      return { value: wasEncoded ? encodeURIComponent(redTxt) : redTxt, changed: true };
+      return { value: reencodeLayers(redTxt), changed: true };
     }
   } else if (decV.includes('=') || decV.includes('&') || decV.includes('#')) {
     const subScrub = scrubQueryStringTokens(`?${decV}`, depth + 1);
     if (subScrub.changed) {
       const inner = subScrub.text.slice(1);
-      return { value: wasEncoded ? encodeURIComponent(inner) : inner, changed: true };
+      return { value: reencodeLayers(inner), changed: true };
     }
   }
   return { value: rawV, changed: false };
@@ -251,7 +280,8 @@ function canonicalizePathForGuardrail(rawSegment, splitRawQuery = false) {
       return { ok: false, rawPath: '', path: '' };
     }
   }
-  const normalizedSlashes = decodedPath.replace(/\\/g, '/');
+  // Strip leading hashbang `!` AFTER percent-decoding so `#%21checkout` -> `/checkout` cannot bypass!
+  const normalizedSlashes = decodedPath.replace(/\\/g, '/').replace(/^[/]*!+/, '/');
   const rawPieces = [];
   const stack = [];
   for (const rawPiece of normalizedSlashes.split('/')) {
@@ -303,29 +333,10 @@ export function redactUrlForAudit(rawUrl, depth = 0) {
       }
     }
     if (parsed.search) {
-      for (const [k, v] of Array.from(parsed.searchParams.entries())) {
-        if (AUDIT_SENSITIVE_PARAM_RX.test(k) || isHighEntropyPathToken(v, { splitMatrix: false })) {
-          parsed.searchParams.set(k, 'REDACTED');
-          mutated = true;
-        } else if (/^https?:\/\//i.test(v.trim())) {
-          const redNested = redactUrlForAudit(v.trim(), depth + 1);
-          if (redNested !== v.trim()) {
-            parsed.searchParams.set(k, redNested);
-            mutated = true;
-          }
-        } else if (/https?:\/\//i.test(v)) {
-          const redTxt = redactUrlsInText(v);
-          if (redTxt !== v) {
-            parsed.searchParams.set(k, redTxt);
-            mutated = true;
-          }
-        } else if (v.includes('=') || v.includes('&') || v.includes('#')) {
-          const subScrub = scrubQueryStringTokens(`?${v}`, depth + 1);
-          if (subScrub.changed) {
-            parsed.searchParams.set(k, subScrub.text.slice(1));
-            mutated = true;
-          }
-        }
+      const scrubbedSearch = scrubQueryStringTokens(parsed.search, depth);
+      if (scrubbedSearch.changed) {
+        parsed.search = scrubbedSearch.text;
+        mutated = true;
       }
     }
     if (parsed.hash) {
@@ -401,12 +412,41 @@ export function redactUrlForAudit(rawUrl, depth = 0) {
   }
 }
 
+function splitBalancedUrlSuffix(rawMatch) {
+  let end = rawMatch.length;
+  while (end > 0) {
+    const ch = rawMatch[end - 1];
+    if (/[.,;:!?]/.test(ch)) {
+      end--;
+      continue;
+    }
+    if (ch === ')') {
+      const sub = rawMatch.slice(0, end);
+      const opens = (sub.match(/\(/g) || []).length;
+      const closes = (sub.match(/\)/g) || []).length;
+      if (closes > opens) {
+        end--;
+        continue;
+      }
+    }
+    if (ch === ']') {
+      const sub = rawMatch.slice(0, end);
+      const opens = (sub.match(/\[/g) || []).length;
+      const closes = (sub.match(/\]/g) || []).length;
+      if (closes > opens) {
+        end--;
+        continue;
+      }
+    }
+    break;
+  }
+  return { coreUrl: rawMatch.slice(0, end), suffix: rawMatch.slice(end) };
+}
+
 export function redactUrlsInText(rawText) {
   if (typeof rawText !== 'string' || !/https?:\/\//i.test(rawText)) return rawText;
-  return rawText.replace(/https?:\/\/[^\s"'<>)\]]+/gi, (match) => {
-    const punctMatch = match.match(/([.,;:!?]+)$/);
-    const coreUrl = punctMatch ? match.slice(0, -punctMatch[1].length) : match;
-    const suffix = punctMatch ? punctMatch[1] : '';
+  return rawText.replace(/https?:\/\/[^\s"'<>]+/gi, (match) => {
+    const { coreUrl, suffix } = splitBalancedUrlSuffix(match);
     return redactUrlForAudit(coreUrl) + suffix;
   });
 }
@@ -478,18 +518,30 @@ export function evaluateUrlSafety(rawUrl, customBlockedDomains = []) {
   if (!canonPath.ok) {
     return { allowed: false, code: 'MALFORMED_URL', reason: 'Malformed percent-encoding in URL pathname' };
   }
-  const rawHashBody = parsed.hash ? parsed.hash.replace(/^#+!?/, '') : '';
-  const canonHash = rawHashBody ? canonicalizePathForGuardrail(rawHashBody, true) : { ok: true, rawPath: '', path: '' };
-  if (!canonHash.ok) {
-    return { allowed: false, code: 'MALFORMED_URL', reason: 'Malformed percent-encoding in URL fragment' };
+  let hashMatchedCheckout = false;
+  if (parsed.hash && parsed.hash.length > 1) {
+    const subChunks = parsed.hash.slice(1).split('#');
+    for (const chunk of subChunks) {
+      const cleanChunk = chunk.replace(/^!+/, '');
+      if (!cleanChunk) continue;
+      const canonChunk = canonicalizePathForGuardrail(cleanChunk, true);
+      if (!canonChunk.ok) {
+        return { allowed: false, code: 'MALFORMED_URL', reason: 'Malformed percent-encoding in URL fragment' };
+      }
+      if (
+        (canonChunk.rawPath && CHECKOUT_SEGMENT_RX.test(canonChunk.rawPath)) ||
+        (canonChunk.path && CHECKOUT_SEGMENT_RX.test(canonChunk.path))
+      ) {
+        hashMatchedCheckout = true;
+      }
+    }
   }
 
-  // Inspect BOTH uncollapsed and dot-collapsed routes so `/checkout/..;x=1`, `/cashier%2f..`, and `#!checkout` cannot bypass!
+  // Inspect BOTH uncollapsed and dot-collapsed routes so `/checkout/..;x=1`, `/cashier%2f..`, `#%21checkout`, and `#?step=1#/%63heckout` cannot bypass!
   if (
     CHECKOUT_SEGMENT_RX.test(canonPath.rawPath) ||
     CHECKOUT_SEGMENT_RX.test(canonPath.path) ||
-    (canonHash.rawPath && CHECKOUT_SEGMENT_RX.test(canonHash.rawPath)) ||
-    (canonHash.path && CHECKOUT_SEGMENT_RX.test(canonHash.path))
+    hashMatchedCheckout
   ) {
     // Never echo raw parsed.hash into error messages to avoid leaking #access_token=... fragments
     return {

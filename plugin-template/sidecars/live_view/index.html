@@ -159,7 +159,7 @@
       </div>
 
       <div class="toolbar">
-        <span class="url-label" id="urlLabel">127.0.0.1:28196</span>
+        <span class="url-label" id="urlLabel">127.0.0.1:__CHROME_LIVE_PORT__</span>
         <div class="btn-group">
           <button type="button" id="refreshBtn">Refresh</button>
           <button type="button" id="releaseBtn">Release</button>
@@ -179,7 +179,7 @@
         const IS_ZH = /^zh\b/i.test(navigator.language || '');
         const TXT = IS_ZH
           ? {
-              waking: '正在唤醒本地 28196 桥接服务...',
+              waking: '正在唤醒本地 __CHROME_LIVE_PORT__ 桥接服务...',
               extOffline: '等待 Chrome 扩展连接（在 chrome://extensions 点一下重新加载 ↻）',
               connectedIdle: '主 Chrome 已在线 · 按 Alt+Shift+L 共享标签页或直接发任务',
               emptyHint: '已连接主 Chrome！即使浏览器最小化收在任务栏，执行网页任务时也会在此实时同步画面。',
@@ -189,7 +189,7 @@
               tabsSuffix: '个受控页'
             }
           : {
-              waking: 'Starting local bridge on port 28196...',
+              waking: 'Starting local bridge on port __CHROME_LIVE_PORT__...',
               extOffline: 'Waiting for Chrome extension (click Reload ↻ in chrome://extensions)',
               connectedIdle: 'Chrome Connected · Press Alt+Shift+L to share a tab',
               emptyHint: 'Connected to Chrome! Live screencast frames appear here automatically during tasks.',
@@ -315,7 +315,7 @@
               lastCapturedAt = 0;
               displayedFrameTabId = null;
               statusTitle.textContent = TXT.connectedIdle;
-              urlLabel.textContent = '127.0.0.1:28196';
+              urlLabel.textContent = '127.0.0.1:__CHROME_LIVE_PORT__';
               liveImg.removeAttribute('src');
               liveImg.style.display = 'none';
               emptyMsg.textContent =
@@ -327,7 +327,7 @@
             }
 
             statusTitle.textContent = target.activity || TXT.connectedIdle;
-            urlLabel.textContent = target.url || target.title || '127.0.0.1:28196';
+            urlLabel.textContent = target.url || target.title || '127.0.0.1:__CHROME_LIVE_PORT__';
 
             if (target.paused) {
               lastCapturedAt = 0;

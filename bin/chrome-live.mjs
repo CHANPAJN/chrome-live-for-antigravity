@@ -108,7 +108,7 @@ async function ensureDaemonRunning() {
     // Daemon is offline; check cooldown before spawning a background process.
   }
 
-  fs.mkdirSync(getStateDir(), { recursive: true, mode: 0o700 });
+  ensureSecureDirSync(getStateDir());
   try {
     const st = fs.statSync(SPAWN_LOCK_FILE);
     if (Date.now() - st.mtimeMs < SPAWN_COOLDOWN_MS) {
@@ -118,7 +118,8 @@ async function ensureDaemonRunning() {
     }
   } catch {}
 
-  fs.writeFileSync(SPAWN_LOCK_FILE, `${Date.now()}\n`, 'utf8');
+  fs.writeFileSync(SPAWN_LOCK_FILE, `${Date.now()}\n`, { encoding: 'utf8', mode: 0o600 });
+  tightenFileAclSync(SPAWN_LOCK_FILE);
   const child = spawn(process.execPath, [DAEMON_ENTRY], {
     cwd: REPO_ROOT,
     detached: true,
@@ -579,7 +580,12 @@ async function main() {
     if (positional.length === 0) {
       throw new Error('Usage: chrome-live upload [index|selector] <file1> [file2...] [--tab <id>]');
     }
-    let target = typeof flags.target === 'string' ? flags.target : 'auto';
+    let target =
+      typeof flags.target === 'string'
+        ? /^\d+$/.test(flags.target.trim())
+          ? Number.parseInt(flags.target.trim(), 10)
+          : flags.target
+        : 'auto';
     let fileArgs = positional;
 
     if (flags.target === undefined && positional.length >= 2) {
