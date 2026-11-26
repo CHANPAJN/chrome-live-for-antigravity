@@ -3,6 +3,9 @@ const STORAGE_CONFIG_KEY = 'chromeLive.config';
 const STORAGE_GUARDRAILS_KEY = 'chromeLive.customBlockedDomains';
 const STORAGE_LANG_KEY = 'chromeLive.lang';
 const SESSION_STATE_KEY = 'chromeLive.sessionState';
+const SESSION_LOADED_BUNDLE_KEY = 'chromeLive.sessionBundleHash';
+const STORAGE_BUNDLE_RELOAD_KEY = 'chromeLive.bundleReloadMeta';
+const BUNDLE_RELOAD_COOLDOWN_MS = 15000;
 const CDP_IDLE_DETACH_MS = 18000;
 const KEEPALIVE_ALARM = 'chrome-live-keepalive';
 
@@ -1061,6 +1064,10 @@ async function connectWebSocket(forceManual = false) {
         sock.close(4003, 'Expected auth_challenge');
         return;
       }
+      if (msg.type === 'bundle_sync' && typeof msg.bundleHash === 'string') {
+        await handleDaemonBundleSync(msg.bundleHash);
+        return;
+      }
       if (msg.type === 'rpc_request' && msg.id) {
         try {
           const result = await executeBridgeRpc(msg.method, msg.params || {});
@@ -1380,6 +1387,83 @@ async function stopCdpForTab(tabId, entryOverride = null) {
   // Always attempt stopScreencast + detach unconditionally so mid-attach cancellations never leave an orphan debugger
   await chrome.debugger.sendCommand({ tabId }, 'Page.stopScreencast').catch(() => {});
   await chrome.debugger.detach({ tabId }).catch(() => {});
+  flushPendingBundleReloadIfIdle();
+}
+
+let pendingBundleReloadHash = '';
+let bundleSyncInFlight = false;
+
+function hasBusyAutomationTab() {
+  for (const item of managedTabs.values()) {
+    if (item && !item.paused && item.uiMode === 'working' && item.attachedCdp) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function triggerExtensionSelfReload(targetHash, isAuto = true) {
+  await persistSessionState();
+  if (targetHash) {
+    await chrome.storage.local
+      .set({
+        [STORAGE_BUNDLE_RELOAD_KEY]: {
+          lastAttemptedHash: targetHash,
+          lastAttemptTs: Date.now()
+        }
+      })
+      .catch(() => {});
+  }
+  pushLocalAudit('reload_extension', { auto: isAuto });
+  setTimeout(() => {
+    try {
+      chrome.runtime.reload();
+    } catch {}
+  }, 60);
+}
+
+async function handleDaemonBundleSync(rawHash) {
+  if (typeof rawHash !== 'string' || !/^[0-9a-f]{64}$/i.test(rawHash) || bundleSyncInFlight) return;
+  const nextHash = rawHash.toLowerCase();
+  bundleSyncInFlight = true;
+  try {
+    const sessObj = await chrome.storage.session.get(SESSION_LOADED_BUNDLE_KEY).catch(() => ({}));
+    const loadedHash =
+      typeof sessObj?.[SESSION_LOADED_BUNDLE_KEY] === 'string' ? sessObj[SESSION_LOADED_BUNDLE_KEY] : '';
+    if (!loadedHash) {
+      // Freshly loaded or just-reloaded SW instance: record baseline in session storage (cleared on runtime.reload)
+      await chrome.storage.session.set({ [SESSION_LOADED_BUNDLE_KEY]: nextHash }).catch(() => {});
+      pendingBundleReloadHash = '';
+      return;
+    }
+    if (loadedHash === nextHash) {
+      pendingBundleReloadHash = '';
+      return;
+    }
+    const metaObj = await chrome.storage.local.get(STORAGE_BUNDLE_RELOAD_KEY).catch(() => ({}));
+    const meta = metaObj?.[STORAGE_BUNDLE_RELOAD_KEY] || {};
+    if (
+      meta.lastAttemptedHash === nextHash ||
+      Date.now() - (Number(meta.lastAttemptTs) || 0) < BUNDLE_RELOAD_COOLDOWN_MS
+    ) {
+      return;
+    }
+    if (hasBusyAutomationTab()) {
+      pendingBundleReloadHash = nextHash;
+      return;
+    }
+    pendingBundleReloadHash = '';
+    await triggerExtensionSelfReload(nextHash, true);
+  } finally {
+    bundleSyncInFlight = false;
+  }
+}
+
+function flushPendingBundleReloadIfIdle() {
+  if (!pendingBundleReloadHash || hasBusyAutomationTab()) return;
+  const target = pendingBundleReloadHash;
+  pendingBundleReloadHash = '';
+  handleDaemonBundleSync(target).catch(() => {});
 }
 
 async function captureQuickFrame(tabId, entry, timeoutMs = 1200) {
@@ -3275,6 +3359,11 @@ async function executeBridgeRpc(method, params) {
       preservedSharedTabs,
       summary
     };
+  }
+
+  if (method === 'reload_extension') {
+    await triggerExtensionSelfReload('', false);
+    return { reloaded: true, version: EXT_VERSION };
   }
 
   const entry = resolveTargetEntry(params.tabId);

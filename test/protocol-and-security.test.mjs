@@ -4241,3 +4241,146 @@ test('24. Linear O(N) hash/bracket URL redaction, Document/Element prototype saf
   assert.match(earlyGuardSource, /'mouseup'/);
   assert.match(hudSource, /z-index:2147483647/);
 });
+
+test('25. Hot-reload lifecycle: mtime-cached extension bundle hash, zero-loop auto-reload on disk update & CLI reload_extension RPC', async () => {
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-hotreload-'));
+  const fakeExtDir = path.join(tmpDir, 'extension');
+  fs.mkdirSync(path.join(fakeExtDir, 'panel'), { recursive: true });
+  for (const [rel, body] of [
+    ['manifest.json', '{"manifest_version":3,"version":"1.0.0"}'],
+    ['service-worker.js', '// v1'],
+    ['hud-early-guard.js', '// early v1'],
+    ['hud.js', '// hud v1'],
+    ['panel/index.html', '<!doctype html>'],
+    ['panel/panel.js', '// panel v1'],
+    ['panel/panel.css', 'body{}']
+  ]) {
+    fs.writeFileSync(path.join(fakeExtDir, rel), body, 'utf8');
+  }
+
+  const tok = crypto.randomBytes(32).toString('hex');
+  const daemon = createDaemonServer({
+    host: '127.0.0.1',
+    port: 0,
+    token: tok,
+    stateDir: tmpDir,
+    extensionDir: fakeExtDir
+  });
+  const port = await daemon.listen();
+  let extWs = null;
+
+  try {
+    const syncHashes = [];
+    const snap1 = daemon.getSnapshot();
+    assert.match(snap1.extensionBundleHash, /^[0-9a-f]{64}$/);
+
+    extWs = await connectTestWsClient(port, '/ws/extension', tok);
+    extWs.on('message', (txt) => {
+      const m = JSON.parse(txt);
+      if (m.type === 'bundle_sync') syncHashes.push(m.bundleHash);
+      if (m.type === 'rpc_request' && m.method === 'reload_extension') {
+        extWs.sendMaskedJson({ type: 'rpc_response', id: m.id, ok: true, result: { reloaded: true, version: '1.0.0' } });
+      }
+      if (m.type === 'rpc_request' && m.method === 'batch') {
+        // Delegate real batch guardrail assertion check below via SW source
+      }
+    });
+
+    await new Promise((r) => setTimeout(r, 40));
+    // Mutate one extension file on disk (bump mtime by +2000ms so mtimeMs cache invalidates deterministically)
+    const swFile = path.join(fakeExtDir, 'service-worker.js');
+    fs.writeFileSync(swFile, '// v2 updated on disk\n', 'utf8');
+    const futureSec = Math.floor(Date.now() / 1000) + 5;
+    fs.utimesSync(swFile, futureSec, futureSec);
+
+    assert.equal(daemon.syncBundle(), true, 'syncBundle must push updated bundle_sync when disk file changes');
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(syncHashes.length >= 1, true);
+    const hashV2 = daemon.getSnapshot().extensionBundleHash;
+    assert.notEqual(hashV2, snap1.extensionBundleHash);
+    assert.equal(syncHashes[syncHashes.length - 1], hashV2);
+    assert.equal(daemon.syncBundle(), false, 'Unchanged bundle must not re-send duplicate bundle_sync');
+
+    // Verify explicit `reload_extension` RPC works end-to-end
+    const reloadRes = await httpJson(
+      port,
+      'POST',
+      '/api/command',
+      { token: tok },
+      { method: 'reload_extension', params: {} }
+    );
+    assert.equal(reloadRes.statusCode, 200);
+    assert.equal(reloadRes.json?.result?.reloaded, true);
+
+    // Verify SW `handleDaemonBundleSync` state machine in VM: baseline -> 1x reload on update -> 0x loop on repeat!
+    const syncBlockMatch = swSource.match(
+      /let pendingBundleReloadHash = '';[\s\S]*?function flushPendingBundleReloadIfIdle\(\) \{[\s\S]*?\n\}/
+    );
+    assert.ok(syncBlockMatch, 'Expected bundle auto-reload block in service-worker.js');
+
+    let sessStore = {};
+    let localStore = {};
+    let reloadCount = 0;
+    let busyTabs = false;
+    const vmApi = vm.runInNewContext(
+      `(function() {
+        const SESSION_LOADED_BUNDLE_KEY = 'chromeLive.sessionBundleHash';
+        const STORAGE_BUNDLE_RELOAD_KEY = 'chromeLive.bundleReloadMeta';
+        const BUNDLE_RELOAD_COOLDOWN_MS = 15000;
+        const managedTabs = { values: () => (isBusy() ? [{ paused: false, uiMode: 'working', attachedCdp: true }] : []) };
+        const persistSessionState = async () => {};
+        const pushLocalAudit = () => {};
+        ${syncBlockMatch[0]}
+        return { handleDaemonBundleSync, flushPendingBundleReloadIfIdle };
+      })()`,
+      {
+        Date,
+        Number,
+        setTimeout: (fn) => fn(),
+        isBusy: () => busyTabs,
+        chrome: {
+          runtime: {
+            reload() {
+              reloadCount += 1;
+            }
+          },
+          storage: {
+            session: {
+              get: async (k) => ({ [k]: sessStore[k] }),
+              set: async (obj) => Object.assign(sessStore, obj)
+            },
+            local: {
+              get: async (k) => ({ [k]: localStore[k] }),
+              set: async (obj) => Object.assign(localStore, obj)
+            }
+          }
+        }
+      }
+    );
+
+    const h1 = '1'.repeat(64);
+    const h2 = '2'.repeat(64);
+    await vmApi.handleDaemonBundleSync(h1);
+    assert.equal(reloadCount, 0, 'Initial baseline sync on fresh SW start must NOT reload');
+
+    // If tab is busy, defer reload until idle
+    busyTabs = true;
+    await vmApi.handleDaemonBundleSync(h2);
+    assert.equal(reloadCount, 0, 'Must defer auto-reload while an automation tab is actively working');
+    busyTabs = false;
+    vmApi.flushPendingBundleReloadIfIdle();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(reloadCount, 1, 'Must trigger chrome.runtime.reload() once tab becomes idle');
+
+    // Sending h2 again (even if session storage was not updated, e.g. mismatched directory) MUST NOT loop!
+    await vmApi.handleDaemonBundleSync(h2);
+    assert.equal(reloadCount, 1, 'Loop guard must block repeated reload for the same target hash');
+  } finally {
+    try {
+      extWs?.socket?.destroy();
+    } catch {}
+    await daemon.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

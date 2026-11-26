@@ -106,6 +106,7 @@ node ./bin/chrome-live.mjs install --with-plugin
 
 ```bash
 node ./bin/chrome-live.mjs health                           # 查看守护进程与扩展连接状态
+node ./bin/chrome-live.mjs reload                           # 后台热重载本地扩展（本地文件更新后也会自动无感热更，免开扩展页点刷新）
 node ./bin/chrome-live.mjs open "https://example.com"       # 在后台青色折叠标签组静默打开网页
 node ./bin/chrome-live.mjs snapshot                         # 提取带编号元素 [0],[1] 与正文
 node ./bin/chrome-live.mjs click 0                          # 按序号、CSS 选择器或按钮文字点击

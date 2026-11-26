@@ -323,6 +323,7 @@ chrome-live-for-antigravity — Zero-dependency Chrome MV3 bridge, CLI & MCP ser
 Usage:
   chrome-live setup                      Generate local pairing token & extension bootstrap config
   chrome-live start                      Start the local background bridge daemon
+  chrome-live reload                     Hot-reload the unpacked Chrome extension in background
   chrome-live install [--with-plugin]    Opt-in install of Antigravity plugin (Skill + Live Sidecar)
   chrome-live health                     Check daemon & Chrome extension status
   chrome-live tabs                       List shared & controlled browser tabs
@@ -393,6 +394,24 @@ async function main() {
         `[Info] Global ~/.gemini/config was NOT modified (opt-in by default). Pass --with-plugin to install the Antigravity Skill & Live Sidecar.\n`
       );
     }
+    if (cmd === 'install') {
+      // If a local daemon is already running, restart it seamlessly so updated daemon code & extension bundle hash sync immediately
+      try {
+        await requestDaemon('POST', '/api/shutdown', {}, 1500);
+        await new Promise((r) => setTimeout(r, 250));
+        await ensureDaemonRunning();
+        process.stdout.write(`[OK] Restarted local daemon; connected Chrome extension will hot-reload automatically.\n`);
+      } catch {}
+    }
+    return;
+  }
+
+  if (cmd === 'reload') {
+    const res = await callDaemonWithAutoStart('POST', '/api/command', {
+      method: 'reload_extension',
+      params: {}
+    });
+    process.stdout.write(`${JSON.stringify(res.result, null, 2)}\n`);
     return;
   }
 

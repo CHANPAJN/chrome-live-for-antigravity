@@ -106,6 +106,7 @@ Or mount manually as a standard `stdio` MCP server:
 
 ```bash
 node ./bin/chrome-live.mjs health                           # Inspect daemon & extension connection status
+node ./bin/chrome-live.mjs reload                           # Hot-reload unpacked extension (also auto-runs when local extension files update)
 node ./bin/chrome-live.mjs open "https://example.com"       # Open URL inside collapsed background tab group
 node ./bin/chrome-live.mjs snapshot                         # Capture indexed elements [0],[1] & page text
 node ./bin/chrome-live.mjs click 0                          # Click by index, CSS selector, or visible label

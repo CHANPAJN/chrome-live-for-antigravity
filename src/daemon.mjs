@@ -167,6 +167,57 @@ export function createDaemonServer(options = {}) {
       : options.token
         ? String(options.token)
         : ensureAuthToken();
+  const extensionDir = options.extensionDir
+    ? path.resolve(String(options.extensionDir))
+    : path.join(REPO_ROOT_DIR, 'extension');
+
+  const EXTENSION_BUNDLE_FILES = [
+    'manifest.json',
+    'service-worker.js',
+    'hud-early-guard.js',
+    'hud.js',
+    'panel/index.html',
+    'panel/panel.js',
+    'panel/panel.css'
+  ];
+  let cachedBundleMtimeSig = '';
+  let cachedBundleHash = '';
+
+  function computeExtensionBundleHash() {
+    try {
+      const sigParts = [];
+      for (const rel of EXTENSION_BUNDLE_FILES) {
+        const fp = path.join(extensionDir, rel);
+        const st = fs.statSync(fp);
+        sigParts.push(`${rel}:${st.size}:${Math.trunc(st.mtimeMs)}`);
+      }
+      const nextSig = sigParts.join('|');
+      if (nextSig === cachedBundleMtimeSig && cachedBundleHash) {
+        return cachedBundleHash;
+      }
+      const h = crypto.createHash('sha256');
+      for (const rel of EXTENSION_BUNDLE_FILES) {
+        const fp = path.join(extensionDir, rel);
+        const txt = fs.readFileSync(fp, 'utf8').replace(/\r\n/g, '\n');
+        h.update(`${rel}\0${txt}\0`, 'utf8');
+      }
+      cachedBundleMtimeSig = nextSig;
+      cachedBundleHash = h.digest('hex');
+      return cachedBundleHash;
+    } catch {
+      return '';
+    }
+  }
+
+  function syncExtensionBundleIfChanged(peer, force = false) {
+    if (!peer || peer.closed) return false;
+    const bundleHash = computeExtensionBundleHash();
+    if (!bundleHash) return false;
+    if (!force && peer._lastSentBundleHash === bundleHash) return false;
+    peer._lastSentBundleHash = bundleHash;
+    peer.sendJson({ type: 'bundle_sync', bundleHash });
+    return true;
+  }
 
   // Sweep any orphan `.upload-snapshots` left behind by an abruptly terminated prior daemon process
   try {
@@ -325,6 +376,7 @@ export function createDaemonServer(options = {}) {
       port: server.address()?.port ?? requestedPort,
       extensionConnected: state.extensionConnected && Boolean(extensionPeer && !extensionPeer.closed),
       extensionVersion: state.extensionVersion,
+      extensionBundleHash: computeExtensionBundleHash(),
       connectedAt: state.connectedAt,
       updatedAt: state.updatedAt,
       activeTabId: state.activeTabId,
@@ -1084,6 +1136,7 @@ export function createDaemonServer(options = {}) {
         } else {
           broadcastToLivePeers({ type: 'state', snapshot: buildPublicSnapshot() });
         }
+        syncExtensionBundleIfChanged(peer, true);
 
         peer.on('close', () => {
           if (extensionPeer === peer) {
@@ -1283,6 +1336,7 @@ export function createDaemonServer(options = {}) {
   const heartbeatTimer = setInterval(() => {
     evictStaleTokenPeers();
     if (extensionPeer && !extensionPeer.closed) {
+      syncExtensionBundleIfChanged(extensionPeer, false);
       extensionPeer.ping();
     }
     for (const peer of liveViewPeers) {
@@ -1325,6 +1379,7 @@ export function createDaemonServer(options = {}) {
     },
     getSnapshot: buildPublicSnapshot,
     dispatchExtensionRpc,
+    syncBundle: () => syncExtensionBundleIfChanged(extensionPeer, false),
     listen() {
       return new Promise((resolve, reject) => {
         server.once('error', reject);
