@@ -3339,7 +3339,7 @@ test('Blind-audit round-7 regressions: MV3 dormancy HUD state sync, UNC path NTL
 
   // 7. Multi-tab `done` without explicit `tabId` closes temporary worker tabs while preserving user-shared tabs!
   const doneBlockMatch = swSource.match(
-    /if \(method === 'done'\) \{([\s\S]*?)\n  \}\n\n  const entry = resolveTargetEntry\(params\.tabId\);/
+    /if \(method === 'done'\) \{([\s\S]*?)\r?\n  \}\r?\n\r?\n  (?:if \(method === 'reload_extension'\) \{[\s\S]*?\r?\n  \}\r?\n\r?\n  )?const entry = resolveTargetEntry\(params\.tabId\);/
   );
   assert.ok(doneBlockMatch, 'Must handle method==="done" before resolveTargetEntry');
   const multiManaged = new Map([
