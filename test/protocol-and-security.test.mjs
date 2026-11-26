@@ -3138,7 +3138,10 @@ test('Sub-frame guardrail allows passive 0x0 Stripe anti-fraud beacons on commun
   assert.ok(fnMatch, 'Expected isPassiveTelemetrySubframeUrl in service-worker.js');
   const isPassive = vm.runInNewContext(`(${fnMatch[0]})`, { URL });
 
-  // Passive Discourse / forum background SDK beacons MUST be exempted on sub-frames
+  // Passive Discourse / forum background SDK beacons and HTML5 about:srcdoc sub-frames MUST be exempted on sub-frames
+  assert.equal(isPassive('about:srcdoc'), true);
+  assert.equal(isPassive('about:blank#blocked'), true);
+  assert.equal(isPassive('about:config'), false, 'Browser internal about:config must never be exempted');
   assert.equal(isPassive('https://js.stripe.com/v3/m-outer-3437aaddcdf6922d623e172c2d6f9278.html'), true);
   assert.equal(isPassive('https://js.stripe.com/v3/controller-abc123def456.html'), true);
   assert.equal(isPassive('https://m.stripe.network/inner.html'), true);

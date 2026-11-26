@@ -1608,13 +1608,18 @@ function assertStillActiveAndUnpaused(entry) {
   }
 }
 
-// Passive 0x0 SDK anti-fraud/telemetry beacons loaded globally on non-payment community sites (e.g. Discourse / linux.do).
-// Only applied to non-top-level sub-frames (frameId !== 0); interactive payment inputs (elements-inner-*, checkout.*, hooks.*) remain strictly blocked.
+// Passive 0x0 SDK anti-fraud/telemetry beacons and standard HTML5 `about:srcdoc` / `about:blank` sub-frames
+// loaded on community sites (e.g. Discourse / linux.do). Only applied to non-top-level sub-frames (frameId !== 0);
+// interactive payment inputs (elements-inner-*, checkout.*, hooks.*) and `javascript:`/`data:`/`chrome:` frames remain blocked.
 function isPassiveTelemetrySubframeUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') return false;
+  const trimmed = rawUrl.trim();
+  if (/^about:(?:blank|srcdoc)(?:[?#]|$)/i.test(trimmed)) {
+    return true;
+  }
   let parsed;
   try {
-    parsed = new URL(rawUrl.trim());
+    parsed = new URL(trimmed);
   } catch {
     return false;
   }
