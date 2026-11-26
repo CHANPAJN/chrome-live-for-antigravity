@@ -4557,4 +4557,48 @@ test('27. Top-50 security & real-world forum hardening: cloud metadata/0.0.0.0 S
   );
 });
 
+test('23. Collapsed background tab CDP deadlock & worker lifecycle regressions: isTabTrulyForeground gating, _hudRev parity, guardrailed worker cleanup & collapsed group enforcement', async () => {
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+  const hudSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'hud.js'), 'utf8');
+  const mcpSource = fs.readFileSync(path.join(REPO_ROOT, 'src', 'mcp-server.mjs'), 'utf8');
+
+  // 1. `_hudRev` in syncHudNow fast-path MUST match `CURRENT_HUD_REV` in `hud.js` so HUD is never torn down & re-injected on every action
+  const hudRevDecl = hudSource.match(/const CURRENT_HUD_REV = (\d+);/);
+  const swRevCheck = swSource.match(/ctrl\._hudRev === (\d+)/);
+  assert.ok(hudRevDecl && swRevCheck, 'Both CURRENT_HUD_REV and ctrl._hudRev check must exist');
+  assert.equal(swRevCheck[1], hudRevDecl[1], 'service-worker.js _hudRev fast-path must match hud.js CURRENT_HUD_REV');
+
+  // 2. `isTabTrulyForeground` prevents `Page.startScreencast` (`document.hidden === false` override) from dispatching blocking CDP mouse events to collapsed background tabs
+  const fgFnMatch = swSource.match(/async function isTabTrulyForeground\(tabId\)[\s\S]*?\n\}/);
+  assert.ok(fgFnMatch, 'Expected isTabTrulyForeground helper in service-worker.js');
+  const runIsFg = vm.runInNewContext(`(${fgFnMatch[0]})`, {
+    chrome: {
+      tabs: {
+        get: async (id) =>
+          id === 1 ? { id: 1, active: false, windowId: 10 } : id === 2 ? { id: 2, active: true, windowId: 20 } : { id: 3, active: true, windowId: 10 }
+      },
+      windows: {
+        get: async (wid) => (wid === 20 ? { id: 20, state: 'minimized' } : { id: 10, state: 'normal' })
+      }
+    }
+  });
+  assert.equal(await runIsFg(1), false, 'Collapsed/inactive background tab must NOT be treated as foreground');
+  assert.equal(await runIsFg(2), false, 'Active tab in minimized window must NOT be treated as foreground');
+  assert.equal(await runIsFg(3), true, 'Active tab in normal window must be treated as foreground');
+
+  assert.match(swSource, /const clickTabForeground = await isTabTrulyForeground\(entry\.tabId\);/);
+  assert.match(swSource, /const typeTabForeground = await isTabTrulyForeground\(entry\.tabId\);/);
+  assert.match(swSource, /const scrollTabForeground = await isTabTrulyForeground\(entry\.tabId\);/);
+  assert.match(swSource, /const remoteTabForeground = await isTabTrulyForeground\(entry\.tabId\);/);
+
+  // 3. `detachManagedTab` automatically closes temporary `worker` tabs on guardrail trips instead of dumping ungrouped orphan tabs onto the tab strip
+  assert.match(swSource, /shouldCloseGuardrailedWorker[\s\S]*?await chrome\.tabs\.remove\(tabId\)/);
+  assert.match(swSource, /allWorkersInBackground \? \{ collapsed: true \} : \{\}/);
+
+  // 4. `mcp-server.mjs` relays worker-to-worker stream rotation during polling while preserving `release_tab` isolation
+  assert.match(mcpSource, /workerSuccessor/);
+  assert.match(mcpSource, /act !== 'release_tab'/);
+});
+
+
 

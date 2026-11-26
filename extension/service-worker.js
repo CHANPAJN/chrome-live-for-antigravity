@@ -1312,7 +1312,7 @@ async function syncHudNow(tabId, payload) {
           }
         };
         const ctrl = window.__chromeLiveHudController__;
-        if (ctrl && ctrl._hudRev === 10 && typeof ctrl.ping === 'function' && ctrl.ping()) {
+        if (ctrl && ctrl._hudRev === 18 && typeof ctrl.ping === 'function' && ctrl.ping()) {
           if (data.visible === false) sweepOrphans(ctrl.hostEl);
           ctrl.update(data);
           return { updated: true };
@@ -1525,10 +1525,28 @@ async function stopCdpForTab(tabId, entryOverride = null) {
     entry.screencastActive = false;
     entry.attachedCdp = false;
   }
-  // Always attempt stopScreencast + detach unconditionally so mid-attach cancellations never leave an orphan debugger
-  await chrome.debugger.sendCommand({ tabId }, 'Page.stopScreencast').catch(() => {});
-  await chrome.debugger.detach({ tabId }).catch(() => {});
+  // Always attempt stopScreencast + detach with bounded timeouts so stalled background renderers never hang teardown
+  await Promise.race([
+    chrome.debugger.sendCommand({ tabId }, 'Page.stopScreencast').catch(() => {}),
+    new Promise((resolve) => setTimeout(resolve, 700))
+  ]);
+  await Promise.race([
+    chrome.debugger.detach({ tabId }).catch(() => {}),
+    new Promise((resolve) => setTimeout(resolve, 700))
+  ]);
   flushPendingBundleReloadIfIdle();
+}
+
+// `Page.startScreencast` forces `document.hidden === false` inside hidden/collapsed background tabs in Chromium.
+// Always check real tab activation & window state before dispatching hardware CDP `Input.dispatchMouseEvent` or sleeping on page timers!
+async function isTabTrulyForeground(tabId) {
+  const t = await chrome.tabs.get(tabId).catch(() => null);
+  if (!t || !t.active) return false;
+  if (typeof t.windowId === 'number') {
+    const w = await chrome.windows.get(t.windowId).catch(() => null);
+    if (w && w.state === 'minimized') return false;
+  }
+  return true;
 }
 
 let pendingBundleReloadHash = '';
@@ -1761,12 +1779,15 @@ async function syncLiveTabGroups() {
         nextColor = 'cyan';
       }
 
-      await chrome.tabGroups
-        .update(g.id, {
-          title: nextTitle,
-          color: nextColor
-        })
-        .catch(() => {});
+      const allWorkersInBackground =
+        activeManagedInGroup.every((e) => e.substate === 'worker' && !e.paused) &&
+        tabsInGroup.every((t) => !t.active);
+      const groupUpdateProps = {
+        title: nextTitle,
+        color: nextColor,
+        ...(allWorkersInBackground ? { collapsed: true } : {})
+      };
+      await chrome.tabGroups.update(g.id, groupUpdateProps).catch(() => {});
     }
   } catch {}
 }
@@ -1787,6 +1808,9 @@ function rememberDetachedTab(tabId, reason = '', isGuardrail = false) {
 
 async function detachManagedTab(tabId, reason = '', isGuardrail = false) {
   const entry = managedTabs.get(tabId);
+  const shouldCloseGuardrailedWorker = Boolean(
+    isGuardrail && entry && entry.substate === 'worker' && !entry.relayPopoutWinId
+  );
   if (entry) {
     entry.detached = true;
     entry.paused = true;
@@ -1795,6 +1819,13 @@ async function detachManagedTab(tabId, reason = '', isGuardrail = false) {
   await stopCdpForTab(tabId, entry);
   managedTabs.delete(tabId);
   rememberDetachedTab(tabId, reason, isGuardrail);
+  if (shouldCloseGuardrailedWorker) {
+    await chrome.tabs.ungroup?.(tabId)?.catch(() => {});
+    await chrome.tabs.remove(tabId).catch(() => {});
+    await syncLiveTabGroups();
+    notifyPanelAndDaemon();
+    return;
+  }
   await syncHud(tabId, { visible: false, activity: reason || tr().released });
   // Ungroup tab from the Live group immediately upon release
   try {
@@ -2541,7 +2572,8 @@ async function executeBridgeRpc(method, params) {
 
       let hitViaCdp = false;
       let cdpFailedWhileDetached = false;
-      if (!vp.hidden) {
+      const remoteTabForeground = await isTabTrulyForeground(entry.tabId);
+      if (remoteTabForeground && !vp.hidden) {
         try {
           await ensureCdpForTab(entry.tabId, entry);
           await chrome.debugger.sendCommand({ tabId: entry.tabId }, 'Input.dispatchMouseEvent', {
@@ -4394,11 +4426,12 @@ async function executeBridgeRpc(method, params) {
       await ensureCdpForTab(entry.tabId, entry).catch(() => {});
     }
 
+    const clickTabForeground = await isTabTrulyForeground(entry.tabId);
     let clickTimedOutOnDialog = false;
     let clickTimer = null;
     const execRes = await Promise.race([
       chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
-      func: async (tgt) => {
+      func: async (tgt, isTabActiveFg) => {
         function getOpenShadow(n) {
           if (!n) return null;
           try {
@@ -4817,10 +4850,13 @@ async function executeBridgeRpc(method, params) {
         const cx = Math.round((rect.left + rect.width / 2 + g1 * safeSpanX) * 10) / 10;
         const cy = Math.round((rect.top + rect.height / 2 + g2 * safeSpanY) * 10) / 10;
 
+        const isVisibleForeground = Boolean(isTabActiveFg) && !document.hidden && rect.width >= 4 && rect.height >= 4;
         const ctrl = window.__chromeLiveHudController__;
         if (ctrl && typeof ctrl.moveCursor === 'function') {
           ctrl.moveCursor({ x: cx, y: cy, kind: 'click', press: true });
-          await new Promise((r) => setTimeout(r, 210 + Math.floor(Math.random() * 65)));
+          if (isVisibleForeground) {
+            await new Promise((r) => setTimeout(r, 210 + Math.floor(Math.random() * 65)));
+          }
         }
 
         function deriveStableSelector(node) {
@@ -4846,7 +4882,6 @@ async function executeBridgeRpc(method, params) {
         const learnedSelector = elIsSensitive ? '' : deriveStableSelector(el);
         const label = safeElemLabel(42);
 
-        const isVisibleForeground = !document.hidden && rect.width >= 4 && rect.height >= 4;
         if (isVisibleForeground) {
           el.__cliveTrustedReceived = false;
           el.addEventListener(
@@ -4884,7 +4919,7 @@ async function executeBridgeRpc(method, params) {
           learnedSelector
         };
       },
-      args: [target]
+      args: [target, clickTabForeground]
     }),
       new Promise((resolve) => {
         clickTimer = setTimeout(() => {
@@ -5078,8 +5113,9 @@ async function executeBridgeRpc(method, params) {
     await syncHud(entry.tabId, { visible: true, mode: 'working', activity: entry.activity });
     await verifyEntryStillControllable(entry);
 
+    const typeTabForeground = await isTabTrulyForeground(entry.tabId);
     const execRes = await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
-      func: async (tgt, val, shouldSubmit) => {
+      func: async (tgt, val, shouldSubmit, isTabActiveFg) => {
         function getOpenShadow(n) {
           if (!n) return null;
           try {
@@ -5386,10 +5422,13 @@ async function executeBridgeRpc(method, params) {
         const cx = rect.left + rect.width / 2 + jx;
         const cy = rect.top + rect.height / 2 + jy;
 
+        const isVisibleTypeFg = Boolean(isTabActiveFg) && !document.hidden;
         const ctrl = window.__chromeLiveHudController__;
         if (ctrl && typeof ctrl.moveCursor === 'function') {
           ctrl.moveCursor({ x: cx, y: cy, kind: 'type', press: true });
-          await new Promise((r) => setTimeout(r, 210 + Math.floor(Math.random() * 60)));
+          if (isVisibleTypeFg) {
+            await new Promise((r) => setTimeout(r, 210 + Math.floor(Math.random() * 60)));
+          }
         }
         const isHudAborted = () => Boolean(ctrl && (ctrl._state?.visible === false || ctrl._state?.mode === 'paused'));
         if (isHudAborted()) {
@@ -5409,7 +5448,7 @@ async function executeBridgeRpc(method, params) {
 
         // Humanized non-uniform keystroke cadence for visible short queries (<= 28 chars)
         const chars = Array.from(val);
-        const useCadence = !document.hidden && chars.length > 0 && chars.length <= 28;
+        const useCadence = isVisibleTypeFg && chars.length > 0 && chars.length <= 28;
         if (safeIsCE(el)) {
           el.textContent = '';
           if (useCadence) {
@@ -5605,7 +5644,7 @@ async function executeBridgeRpc(method, params) {
         }
         return { ok: true, x: cx, y: cy, learnedSelector, learnedName, cmTargetToken };
       },
-      args: [target, String(text ?? ''), Boolean(submit)]
+      args: [target, String(text ?? ''), Boolean(submit), typeTabForeground]
     });
 
     const out = execRes?.[0]?.result;
@@ -6095,8 +6134,10 @@ async function executeBridgeRpc(method, params) {
     await syncHud(entry.tabId, { visible: true, mode: 'working', activity: entry.activity });
     await verifyEntryStillControllable(entry);
 
+    const scrollTabForeground = await isTabTrulyForeground(entry.tabId);
     const execRes = await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
-      func: async (dir, px) => {
+      func: async (dir, px, isTabActiveFg) => {
+        const isScrollFg = Boolean(isTabActiveFg) && !document.hidden;
         const ctrl = window.__chromeLiveHudController__;
         const isAborted = () => Boolean(ctrl && (!ctrl._state?.visible || ctrl._state?.mode === 'paused'));
         if (isAborted()) {
@@ -6111,17 +6152,17 @@ async function executeBridgeRpc(method, params) {
           });
         }
         if (dir === 'top') {
-          window.scrollTo({ top: 0, behavior: document.hidden ? 'instant' : 'smooth' });
+          window.scrollTo({ top: 0, behavior: isScrollFg ? 'smooth' : 'instant' });
         } else if (dir === 'bottom') {
           window.scrollTo({
             top: document.documentElement.scrollHeight,
-            behavior: document.hidden ? 'instant' : 'smooth'
+            behavior: isScrollFg ? 'smooth' : 'instant'
           });
         } else {
           // Natural ±11% wheel stride jitter + multi-pulse inertial scroll when visible
           const jitterFactor = 0.89 + Math.random() * 0.22;
           const totalDelta = (dir === 'up' ? -1 : 1) * Math.round(Math.abs(px) * jitterFactor);
-          if (document.hidden) {
+          if (!isScrollFg) {
             window.scrollBy({ top: totalDelta, behavior: 'instant' });
           } else {
             const slices = [0.42, 0.35, 0.23];
@@ -6136,7 +6177,7 @@ async function executeBridgeRpc(method, params) {
         }
         return { ok: true, scrollY: Math.round(window.scrollY), innerHeight: window.innerHeight };
       },
-      args: [direction, amount]
+      args: [direction, amount, scrollTabForeground]
     });
 
     const sOut = execRes?.[0]?.result;

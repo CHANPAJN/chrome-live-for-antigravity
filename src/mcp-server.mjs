@@ -638,21 +638,31 @@ export function startMcpStdioServer({ callDaemon }) {
   });
 }
 
-async function buildMonitorStructuredState(callDaemon, lastFrameTs = 0, targetTabId = undefined, forceSnap = false) {
+async function buildMonitorStructuredState(
+  callDaemon,
+  lastFrameTs = 0,
+  targetTabId = undefined,
+  forceSnap = false,
+  allowWorkerRelay = true
+) {
   const hasExplicitTab = typeof targetTabId === 'number' && Number.isInteger(targetTabId);
   const baseState = await callDaemon('GET', '/api/state');
   const tabs = Array.isArray(baseState?.tabs) ? baseState.tabs : [];
   // Never silently fall back to capturing a different shared tab when an explicit tabId was closed or released,
-  // EXCEPT when the user closed a standalone relay popout window and `autoMergeClosedRelayTab` created its direct `paused: true` successor (`replacedTabId === targetTabId`).
+  // EXCEPT when the user closed a standalone relay popout window (`replacedTabId === targetTabId`) or an ephemeral
+  // automation `worker` tab rotated to a new active `worker` tab during background polling.
   let effectiveRequestedId = targetTabId;
   let resolvedPrimary = null;
   if (hasExplicitTab) {
     resolvedPrimary = tabs.find((t) => t.tabId === targetTabId) || null;
     if (!resolvedPrimary) {
       const relaySuccessor = tabs.find((t) => t.replacedTabId === targetTabId) || null;
-      if (relaySuccessor) {
-        resolvedPrimary = relaySuccessor;
-        effectiveRequestedId = relaySuccessor.tabId;
+      const workerSuccessor =
+        !relaySuccessor && allowWorkerRelay ? tabs.find((t) => t.substate === 'worker' && !t.paused) || null : null;
+      const successor = relaySuccessor || workerSuccessor;
+      if (successor) {
+        resolvedPrimary = successor;
+        effectiveRequestedId = successor.tabId;
       }
     }
   } else {
@@ -763,7 +773,7 @@ async function executeMonitorAppAction(args, callDaemon) {
   // Keep explicit `args.tabId` even after `release_tab` so multi-tab sessions return `requestedTabMissing: true`
   // instead of silently attaching debugger & capturing a screenshot of another shared tab!
   const followUpTabId = typeof args?.tabId === 'number' ? args.tabId : undefined;
-  const sc = await buildMonitorStructuredState(callDaemon, 0, followUpTabId, false);
+  const sc = await buildMonitorStructuredState(callDaemon, 0, followUpTabId, false, act !== 'release_tab');
   if (regionResult && sc && typeof sc === 'object') {
     sc.regionResult = regionResult;
   }
