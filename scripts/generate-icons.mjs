@@ -76,7 +76,7 @@ function roundedBoxSdf(nx, ny, halfSize, radius) {
 
 function samplePoint(nx, ny) {
   // Normalized coordinates nx, ny in [-1, 1]
-  const bgDist = roundedBoxSdf(nx, ny, 0.88, 0.24);
+  const bgDist = roundedBoxSdf(nx, ny, 0.8869, 0.24);
   if (bgDist > 0) {
     return [0, 0, 0, 0];
   }
@@ -90,9 +90,9 @@ function samplePoint(nx, ny) {
   const distCenter = Math.hypot(nx, ny);
 
   // Outer dual-arc broadcast ring
-  const ringDist = Math.abs(distCenter - 0.50);
+  const ringDist = Math.abs(distCenter - 0.5017);
   const angle = Math.atan2(ny, nx);
-  const inGap = Math.abs(Math.sin(angle - 0.65)) < 0.22;
+  const inGap = Math.abs(Math.sin(angle - 0.6589)) < 0.22;
   if (!inGap && ringDist < 0.085) {
     const glow = 1 - ringDist / 0.085;
     r = Math.round(r * (1 - glow) + 14 * glow);
@@ -101,8 +101,8 @@ function samplePoint(nx, ny) {
   }
 
   // Inner bright cyan live core
-  if (distCenter < 0.23) {
-    const coreMix = Math.min(1, (0.23 - distCenter) / 0.06);
+  if (distCenter < 0.2335) {
+    const coreMix = Math.min(1, (0.2335 - distCenter) / 0.06);
     r = Math.round(r * (1 - coreMix) + 240 * coreMix);
     g = Math.round(g * (1 - coreMix) + 249 * coreMix);
     b = Math.round(b * (1 - coreMix) + 255 * coreMix);

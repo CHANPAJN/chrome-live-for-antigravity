@@ -53,7 +53,7 @@
   const RING_CIRCUMFERENCE = 2 * Math.PI * 20; // r = 20 -> ~125.66
   // Original rounded collaboration dart silhouette (zero overlap with classic OS arrow paths)
   const COLLAB_DART_PATH =
-    'M2.4 2.4 L19.2 8.5 C20.9 9.1 21.0 11.5 19.3 12.2 L12.7 15.0 L9.9 21.6 C9.2 23.2 6.8 23.1 6.2 21.4 Z';
+    'M2.4 2.4 L19.2 8.512 C20.9 9.1 21.0 11.573 19.3 12.2 L12.7 15.057 L9.9 21.647 C9.2 23.2 6.8 23.1 6.2 21.4 Z';
 
   const DICT = {
     zh: {
@@ -104,7 +104,7 @@
       z-index: 2147483647;
       pointer-events: none;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
-      --spring-width: 440ms linear(0, 0.44, 0.88, 1.055, 1.018, 0.998, 1);
+      --spring-width: 440ms linear(0, 0.4479, 0.8864, 1.055, 1.018, 0.998, 1);
       --spring-pop: 360ms cubic-bezier(0.34, 1.46, 0.64, 1);
     }
 

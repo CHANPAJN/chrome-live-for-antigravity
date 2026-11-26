@@ -4924,10 +4924,10 @@ async function executeBridgeRpc(method, params) {
         const ctrlX = Math.round((out.startX + out.x) / 2 + (Math.random() - 0.5) * 28);
         const ctrlY = Math.round((out.startY + out.y) / 2 - (10 + Math.random() * 18));
         const bezierSchedule = [
-          [0.18, 9],
-          [0.38, 10],
-          [0.58, 12],
-          [0.76, 15],
+          [0.1819, 9],
+          [0.3826, 10],
+          [0.5877, 12],
+          [0.7661, 15],
           [0.90, 19],
           [1.0, 22]
         ];

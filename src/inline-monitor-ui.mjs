@@ -427,7 +427,7 @@ export function buildInlineMonitorHtml() {
       </div>
       <div class="btn-row">
         <button id="remoteBtn" type="button" disabled title="Click, scroll, or type directly on the live stream">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.2 2.8l9.2 4.4-4 1.4-1.4 4-3.8-9.8z"/></svg>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.288 2.8l9.2 4.4-4 1.4-1.4 4-3.8-9.8z"/></svg>
           <span class="lbl">Control</span>
         </button>
         <button id="regionBtn" type="button" disabled title="Click or drag to pick page elements and extract selectors">
@@ -435,7 +435,7 @@ export function buildInlineMonitorHtml() {
           <span class="lbl">Pick</span>
         </button>
         <button id="attachBtn" type="button" disabled style="display:none" title="Attach the current page title and URL to the next prompt">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.1 4.9L6.1 8.9a1.35 1.35 0 0 0 1.9 1.9l4.3-4.3a2.7 2.7 0 0 0-3.8-3.8L4.1 7.1a4.05 4.05 0 0 0 5.7 5.7l3.5-3.5"/></svg>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.126 4.9L6.1 8.9a1.35 1.35 0 0 0 1.9 1.9l4.3-4.3a2.7 2.7 0 0 0-3.8-3.8L4.1 7.1a4.05 4.05 0 0 0 5.7 5.7l3.5-3.5"/></svg>
           <span class="lbl">Attach</span>
         </button>
         <span class="btn-sep"></span>
@@ -444,11 +444,11 @@ export function buildInlineMonitorHtml() {
           <span class="lbl">Popout</span>
         </button>
         <button id="snapBtn" type="button" title="Capture a fresh frame now">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.1 8a5.1 5.1 0 1 1-1.4-3.5M13.1 2.8v2.6h-2.6"/></svg>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.164 8a5.1 5.1 0 1 1-1.4-3.5M13.1 2.8v2.6h-2.6"/></svg>
           <span class="lbl">Refresh</span>
         </button>
         <button id="releaseBtn" type="button" disabled title="Release AI control while keeping this tab open">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.2 2.8H3.8a1.3 1.3 0 0 0-1.3 1.3v7.8a1.3 1.3 0 0 0 1.3 1.3h2.4M10.5 10.8L13.5 8l-3-2.8M13.3 8H6.5"/></svg>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.273 2.8H3.8a1.3 1.3 0 0 0-1.3 1.3v7.8a1.3 1.3 0 0 0 1.3 1.3h2.4M10.5 10.8L13.5 8l-3-2.8M13.3 8H6.5"/></svg>
           <span class="lbl">Release</span>
         </button>
       </div>
