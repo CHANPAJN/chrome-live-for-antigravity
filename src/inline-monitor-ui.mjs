@@ -740,29 +740,55 @@ export function buildInlineMonitorHtml() {
         setTimeout(() => dot.remove(), 440);
       }
 
+      let tabPillEls = [];
+
       function renderTabStrip(tabs) {
         if (tabs.length === 0 || (tabs.length === 1 && currentTab && tabs[0].tabId === currentTab.tabId)) {
           tabStrip.style.display = 'none';
+          tabPillEls = [];
           tabStrip.replaceChildren();
           return;
         }
         tabStrip.style.display = 'flex';
+        const sameOrder =
+          tabPillEls.length === tabs.length &&
+          tabPillEls.every((btn, idx) => Number(btn.dataset.tabId) === tabs[idx].tabId);
+
+        if (sameOrder) {
+          for (let i = 0; i < tabs.length; i++) {
+            const t = tabs[i];
+            const btn = tabPillEls[i];
+            btn.dataset.active = String(Boolean(currentTab && t.tabId === currentTab.tabId));
+            const nextText = (t.title || t.url || ('#' + t.tabId)).slice(0, 22);
+            if (btn.textContent !== nextText) btn.textContent = nextText;
+          }
+          return;
+        }
+
         tabStrip.replaceChildren();
+        tabPillEls = [];
         for (const t of tabs) {
           const b = document.createElement('button');
           b.type = 'button';
           b.className = 'tab-pill';
+          b.dataset.tabId = String(t.tabId);
           b.dataset.active = String(Boolean(currentTab && t.tabId === currentTab.tabId));
           b.textContent = (t.title || t.url || ('#' + t.tabId)).slice(0, 22);
           b.addEventListener('click', async () => {
-            selectedTabId = t.tabId;
+            const targetId = t.tabId;
+            selectedTabId = targetId;
             pinnedTabClosed = false;
             lastFrameTs = 0;
-            await callAppAction(
-              { action: 'screenshot', tabId: t.tabId },
+            for (const sib of tabPillEls) {
+              sib.dataset.active = String(Number(sib.dataset.tabId) === targetId);
+            }
+            const res = await callAppAction(
+              { action: 'screenshot', tabId: targetId },
               IS_ZH ? '正在切换标签页画面...' : 'Switching tab stream...'
             );
+            if (res) showStatus('');
           });
+          tabPillEls.push(b);
           tabStrip.appendChild(b);
         }
       }
