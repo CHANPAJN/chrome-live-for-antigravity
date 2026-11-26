@@ -28,8 +28,8 @@ node "__CHROME_LIVE_CLI_PATH__" open "https://example.com" --label "Reading docu
 # 3. Capture indexed interactive DOM elements [0], [1], [2]...
 node "__CHROME_LIVE_CLI_PATH__" snapshot
 
-# 4. Single-roundtrip multi-step pipeline (type -> submit/click -> wait -> snapshot in one call!)
-node "__CHROME_LIVE_CLI_PATH__" batch '[{"action":"open","url":"https://example.com"},{"action":"wait","ms":500},{"action":"snapshot","maxItems":20}]' --compact
+# 4. Single-roundtrip multi-step pipeline (prefer the `chrome_live_batch` MCP tool directly; in PowerShell CLI, pass JSON via stdin `-` or `@steps.json` to avoid quote stripping!)
+node "__CHROME_LIVE_CLI_PATH__" batch @steps.json --compact
 
 # 5. Interact step-by-step by element index, selector, or visible label
 node "__CHROME_LIVE_CLI_PATH__" click 0
@@ -55,7 +55,8 @@ node "__CHROME_LIVE_CLI_PATH__" release --all
 
 ## Concurrency & Anti-Loop Rules (Important)
 
-- **Complex interactive publishing/forms -> run serially, not multi-agent concurrent:** Use `extract` for concurrent read-only scraping across many URLs. For multi-site rich-text posting (login flows, tag dropdowns, category switches, publish modals), run one site at a time rather than spawning parallel subagents against the same Chrome instance.
+- **Complex interactive publishing/forms -> run serially, not multi-agent concurrent:** Use `extract` (up to 8 URLs in one parallel call) for read-only article/documentation lookups rather than chaining slow sequential `batch` waits. For multi-site rich-text posting (login flows, tag dropdowns, category switches, publish modals), run one site at a time rather than spawning parallel subagents against the same Chrome instance.
+- **Cloudflare / Anti-Bot Challenges (`botChallenge: true` or challenge alert):** Do not loop or wait on background challenge pages and never attempt to solve/bypass bot challenges; instead, ask the user to press `Alt+Shift+L` on an already-verified Chrome tab (or pop out via `relay popout` for the user to complete verification).
 - **Read `snapshot` state & alerts first:** `snapshot` reports `{DISABLED}`, `checked=true/false`, `selected`, `expanded`, and page `Alerts:` (form validation errors). Inspect those before retrying clicks or taking screenshots.
 - **Hard circuit-breaker for subagents:** Never read bridge source files (`chrome-live.mjs`, `service-worker.js`) or write ad-hoc `.mjs` workaround scripts during normal browsing tasks. Cap screenshots at 2 per page; if a page flow fails twice or exceeds 8 turns without reaching the target state, stop immediately and report the exact blocker.
 

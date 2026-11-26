@@ -2698,6 +2698,16 @@ async function executeBridgeRpc(method, params) {
         };
         const safeCheckVis = (n) => {
           if (!n) return false;
+          const win = n.ownerDocument?.defaultView || (typeof window !== 'undefined' ? window : null);
+          const cs = win && typeof win.getComputedStyle === 'function' ? win.getComputedStyle(n) : null;
+          if (cs && cs.display === 'contents') {
+            return (
+              cs.visibility !== 'hidden' &&
+              cs.visibility !== 'collapse' &&
+              cs.opacity !== '0' &&
+              cs.contentVisibility !== 'hidden'
+            );
+          }
           if (_visFn && typeof Element !== 'undefined' && n instanceof Element) {
             return _visFn.call(n, { checkVisibilityCSS: true, checkOpacity: true });
           }
@@ -3118,12 +3128,21 @@ async function executeBridgeRpc(method, params) {
 
             const injected = await chrome.scripting.executeScript({ target: { tabId: workerTab.id  }, injectImmediately: true,
               func: async (steps) => {
-                for (let i = 0; i < steps; i++) {
-                  window.scrollBy(0, Math.round(window.innerHeight * 0.85));
-                  await new Promise((r) => setTimeout(r, 320));
+                const isBotChallenge =
+                  /^(?:Just a moment|请稍候|Attention Required! \| Cloudflare|Checking your browser)/i.test(
+                    String(document.title || '').trim()
+                  ) ||
+                  Boolean(
+                    document.querySelector(
+                      '#challenge-running, #cf-challenge-running, iframe[src*="challenges.cloudflare.com"]'
+                    )
+                  );
+                if (!isBotChallenge) {
+                  for (let i = 0; i < steps; i++) {
+                    window.scrollBy(0, Math.round(window.innerHeight * 0.85));
+                    await new Promise((r) => setTimeout(r, 320));
+                  }
                 }
-                const root =
-                  document.querySelector('article, main, [role="main"]') || document.body;
                 const SKIP_TAGS = new Set([
                   'STYLE',
                   'SCRIPT',
@@ -3139,6 +3158,7 @@ async function executeBridgeRpc(method, params) {
                 const _tsGet = Object.getOwnPropertyDescriptor(Text.prototype, 'assignedSlot')?.get;
                 const _tagGet = Object.getOwnPropertyDescriptor(Element.prototype, 'tagName')?.get;
                 const _ceGet = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'isContentEditable')?.get;
+                const _srGet = Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get;
                 const _rootFn = Node.prototype.getRootNode;
                 const _matchFn = Element.prototype.matches;
                 const _closeFn = Element.prototype.closest;
@@ -3155,6 +3175,16 @@ async function executeBridgeRpc(method, params) {
                 const sRoot = (x) => (x && _rootFn && x instanceof Node ? _rootFn.call(x) : null);
                 const sTag = (x) => (x && _tagGet && x instanceof Element ? String(_tagGet.call(x) || '').toUpperCase() : '');
                 const sIsCE = (x) => Boolean(x && _ceGet && x instanceof HTMLElement && _ceGet.call(x));
+                const sOpenShadow = (x) => {
+                  if (!x) return null;
+                  try {
+                    if (_srGet && x instanceof Element) {
+                      const sr = _srGet.call(x);
+                      if (sr) return sr;
+                    }
+                  } catch {}
+                  return x.shadowRoot && typeof x.shadowRoot.querySelectorAll === 'function' ? x.shadowRoot : null;
+                };
 
                 const SKIP_CLOSEST =
                   'style, script, noscript, template, textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], [data-chrome-live-hud]';
@@ -3185,8 +3215,15 @@ async function executeBridgeRpc(method, params) {
                   if (visCache.has(el)) return visCache.get(el);
                   const cs = window.getComputedStyle(el);
                   const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue('-webkit-text-security') || '').toLowerCase();
-                  let v = (!tSec || tSec === 'none') && cs.opacity !== '0' && cs.display !== 'none' && cs.visibility !== 'hidden' && cs.visibility !== 'collapse';
-                  if (v && typeof _visFn === 'function' && el instanceof Element) {
+                  let v =
+                    (!tSec || tSec === 'none') &&
+                    cs.opacity !== '0' &&
+                    cs.display !== 'none' &&
+                    cs.visibility !== 'hidden' &&
+                    cs.visibility !== 'collapse' &&
+                    cs.contentVisibility !== 'hidden';
+                  // `display: contents` wrappers (<react-app>, Svelte .contents, Lit hosts) generate no layout box so checkVisibility() returns false even when children are visible!
+                  if (v && cs.display !== 'contents' && typeof _visFn === 'function' && el instanceof Element) {
                     v = _visFn.call(el, { checkVisibilityCSS: true, checkOpacity: true });
                   }
                   visCache.set(el, v);
@@ -3208,33 +3245,80 @@ async function executeBridgeRpc(method, params) {
                   }
                   return true;
                 };
-                let text = '';
-                if (root) {
+                const createSafeWalker =
+                  typeof Document !== 'undefined' && document instanceof Document
+                    ? Document.prototype.createTreeWalker.bind(document)
+                    : document.createTreeWalker.bind(document);
+
+                const collectVisibleTextFromRoot = (candidateRoot, maxChars) => {
+                  if (!candidateRoot) return '';
                   const parts = [];
                   let accLen = 0;
-                  const walker = (typeof Document !== 'undefined' && document instanceof Document ? Document.prototype.createTreeWalker.bind(document) : document.createTreeWalker)(root, NodeFilter.SHOW_TEXT);
-                  let node;
-                  while ((node = walker.nextNode())) {
-                    const p = sParent(node); const _nSl = sSlot(node); if (!_nSl && p && Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(p)) continue;
-                    const startEl = _nSl || p;
-                    if (!startEl) continue;
-                    if ((p && SKIP_TAGS.has(sTag(p))) || isInsideSkipped(startEl) || !isFlatVisible(startEl)) {
-                      continue;
+                  const rootsQueue = [candidateRoot];
+                  const visitedRoots = new Set();
+                  while (rootsQueue.length > 0 && accLen < maxChars) {
+                    const curSubRoot = rootsQueue.shift();
+                    if (!curSubRoot || visitedRoots.has(curSubRoot)) continue;
+                    visitedRoots.add(curSubRoot);
+
+                    if (typeof curSubRoot.querySelectorAll === 'function' && visitedRoots.size <= 64) {
+                      for (const el of curSubRoot.querySelectorAll('*')) {
+                        if (_matchFn && el instanceof Element && _matchFn.call(el, '[data-chrome-live-hud]')) continue;
+                        const sr = sOpenShadow(el);
+                        if (sr && !visitedRoots.has(sr) && !isInsideSkipped(el) && isFlatVisible(el)) {
+                          rootsQueue.push(sr);
+                        }
+                      }
                     }
-                    const chunk = node.nodeValue || '';
-                    if (!chunk.trim()) continue;
-                    parts.push(chunk);
-                    accLen += chunk.length + 1;
-                    if (accLen >= 22000) break;
+
+                    const walker = createSafeWalker(curSubRoot, NodeFilter.SHOW_TEXT);
+                    let node;
+                    while ((node = walker.nextNode())) {
+                      const p = sParent(node);
+                      const _nSl = sSlot(node);
+                      if (!_nSl && p && sOpenShadow(p)) continue;
+                      const startEl = _nSl || p;
+                      if (!startEl) continue;
+                      if ((p && SKIP_TAGS.has(sTag(p))) || isInsideSkipped(startEl) || !isFlatVisible(startEl)) {
+                        continue;
+                      }
+                      const chunk = node.nodeValue || '';
+                      if (!chunk.trim()) continue;
+                      parts.push(chunk);
+                      accLen += chunk.length + 1;
+                      if (accLen >= maxChars) break;
+                    }
                   }
-                  text = parts
+                  return parts
                     .join(' ')
                     .replace(/\s+\n/g, '\n')
                     .replace(/\n{3,}/g, '\n\n')
                     .replace(/[ \t]{2,}/g, ' ')
-                    .trim()
-                    .slice(0, 18000);
+                    .trim();
+                };
+
+                let bestText = '';
+                const mainCandidates = Array.from(document.querySelectorAll('main, [role="main"]'));
+                for (const m of mainCandidates) {
+                  const candidateTxt = collectVisibleTextFromRoot(m, 22000);
+                  if (candidateTxt.length > bestText.length) {
+                    bestText = candidateTxt;
+                  }
                 }
+                if (bestText.length < 160) {
+                  const articles = Array.from(document.querySelectorAll('article'));
+                  if (articles.length === 1) {
+                    const artTxt = collectVisibleTextFromRoot(articles[0], 22000);
+                    if (artTxt.length > bestText.length) bestText = artTxt;
+                  }
+                }
+                if (bestText.length < 160 && document.body) {
+                  const bodyTxt = collectVisibleTextFromRoot(document.body, 22000);
+                  if (bodyTxt.length > bestText.length) {
+                    bestText = bodyTxt;
+                  }
+                }
+                const text = bestText.slice(0, 18000);
 
                 const imgSet = new Set();
                 for (const img of document.querySelectorAll('img')) {
@@ -3246,6 +3330,13 @@ async function executeBridgeRpc(method, params) {
                 return {
                   title: document.title,
                   finalUrl: location.href,
+                  ...(isBotChallenge
+                    ? {
+                        botChallenge: true,
+                        challengeHint:
+                          'Anti-bot challenge page detected; open in Chrome and press Alt+Shift+L to share the verified tab'
+                      }
+                    : {}),
                   text,
                   images: Array.from(imgSet).slice(0, 24)
                 };
@@ -3467,6 +3558,16 @@ async function executeBridgeRpc(method, params) {
         };
         const safeCheckVis = (n) => {
           if (!n) return false;
+          const win = n.ownerDocument?.defaultView || (typeof window !== 'undefined' ? window : null);
+          const cs = win && typeof win.getComputedStyle === 'function' ? win.getComputedStyle(n) : null;
+          if (cs && cs.display === 'contents') {
+            return (
+              cs.visibility !== 'hidden' &&
+              cs.visibility !== 'collapse' &&
+              cs.opacity !== '0' &&
+              cs.contentVisibility !== 'hidden'
+            );
+          }
           if (_visFn && typeof Element !== 'undefined' && n instanceof Element) {
             return _visFn.call(n, { checkVisibilityCSS: true, checkOpacity: true });
           }
@@ -3790,8 +3891,17 @@ async function executeBridgeRpc(method, params) {
           if (txt && txt.length >= 2) alertSet.add(txt);
         }
         const alerts = Array.from(alertSet);
+        if (
+          /^(?:Just a moment|请稍候|Attention Required! \| Cloudflare|Checking your browser)/i.test(
+            String(document.title || '').trim()
+          ) ||
+          document.querySelector('#challenge-running, #cf-challenge-running, iframe[src*="challenges.cloudflare.com"]')
+        ) {
+          alerts.unshift(
+            'Anti-bot challenge detected: share an already-verified Chrome tab (Alt+Shift+L) or use relay popout for manual verification'
+          );
+        }
 
-        const mainRoot = document.querySelector('main, article, [role="main"]') || document.body;
         const SKIP_TAGS = new Set([
           'STYLE',
           'SCRIPT',
@@ -3825,8 +3935,14 @@ async function executeBridgeRpc(method, params) {
           if (visCache.has(el)) return visCache.get(el);
           const cs = window.getComputedStyle(el);
           const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue('-webkit-text-security') || '').toLowerCase();
-          let v = (!tSec || tSec === 'none') && cs.opacity !== '0' && cs.display !== 'none' && cs.visibility !== 'hidden' && cs.visibility !== 'collapse';
-          if (v) {
+          let v =
+            (!tSec || tSec === 'none') &&
+            cs.opacity !== '0' &&
+            cs.display !== 'none' &&
+            cs.visibility !== 'hidden' &&
+            cs.visibility !== 'collapse' &&
+            cs.contentVisibility !== 'hidden';
+          if (v && cs.display !== 'contents') {
             v = safeCheckVis(el);
           }
           visCache.set(el, v);
@@ -3848,27 +3964,84 @@ async function executeBridgeRpc(method, params) {
           }
           return true;
         };
-        let excerpt = '';
-        if (mainRoot) {
+        const createSnapWalker =
+          typeof Document !== 'undefined' && document instanceof Document
+            ? Document.prototype.createTreeWalker.bind(document)
+            : document.createTreeWalker.bind(document);
+        const _snapSrGet =
+          typeof Element !== 'undefined' ? Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get : null;
+        const getSnapOpenShadow = (x) => {
+          if (!x) return null;
+          try {
+            if (_snapSrGet && typeof Element !== 'undefined' && x instanceof Element) {
+              const sr = _snapSrGet.call(x);
+              if (sr) return sr;
+            }
+          } catch {}
+          return x.shadowRoot && typeof x.shadowRoot.querySelectorAll === 'function' ? x.shadowRoot : null;
+        };
+
+        const collectSnapExcerptFromRoot = (candidateRoot, maxChars) => {
+          if (!candidateRoot) return '';
           const parts = [];
           let accLen = 0;
-          const walker = (typeof Document !== 'undefined' && document instanceof Document ? Document.prototype.createTreeWalker.bind(document) : document.createTreeWalker)(mainRoot, NodeFilter.SHOW_TEXT);
-          let tNode;
-          while ((tNode = walker.nextNode())) {
-            const p = safeParent(tNode); const _tSl = safeSlot(tNode); if (!_tSl && p && Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(p)) continue;
-            const startEl = _tSl || p;
-            if (!startEl) continue;
-            if ((p && SKIP_TAGS.has(safeTagLower(p).toUpperCase())) || isInsideSkipped(startEl) || !isFlatVisible(startEl)) {
-              continue;
+          const rootsQueue = [candidateRoot];
+          const visitedRoots = new Set();
+          while (rootsQueue.length > 0 && accLen < maxChars) {
+            const curSubRoot = rootsQueue.shift();
+            if (!curSubRoot || visitedRoots.has(curSubRoot)) continue;
+            visitedRoots.add(curSubRoot);
+
+            if (typeof curSubRoot.querySelectorAll === 'function' && visitedRoots.size <= 48) {
+              for (const el of curSubRoot.querySelectorAll('*')) {
+                if (safeMatches(el, '[data-chrome-live-hud]')) continue;
+                const sr = getSnapOpenShadow(el);
+                if (sr && !visitedRoots.has(sr) && !isInsideSkipped(el) && isFlatVisible(el)) {
+                  rootsQueue.push(sr);
+                }
+              }
             }
-            const v = tNode.nodeValue || '';
-            if (!v.trim()) continue;
-            parts.push(v);
-            accLen += v.length + 1;
-            if (accLen >= 6000) break;
+
+            const walker = createSnapWalker(curSubRoot, NodeFilter.SHOW_TEXT);
+            let tNode;
+            while ((tNode = walker.nextNode())) {
+              const p = safeParent(tNode);
+              const _tSl = safeSlot(tNode);
+              if (!_tSl && p && getSnapOpenShadow(p)) continue;
+              const startEl = _tSl || p;
+              if (!startEl) continue;
+              if ((p && SKIP_TAGS.has(safeTagLower(p).toUpperCase())) || isInsideSkipped(startEl) || !isFlatVisible(startEl)) {
+                continue;
+              }
+              const v = tNode.nodeValue || '';
+              if (!v.trim()) continue;
+              parts.push(v);
+              accLen += v.length + 1;
+              if (accLen >= maxChars) break;
+            }
           }
-          excerpt = parts.join(' ').replace(/\s+/g, ' ').trim().slice(0, 4500);
+          return parts.join(' ').replace(/\s+/g, ' ').trim();
+        };
+
+        let bestExcerpt = '';
+        for (const m of document.querySelectorAll('main, [role="main"]')) {
+          const mTxt = collectSnapExcerptFromRoot(m, 6000);
+          if (mTxt.length > bestExcerpt.length) {
+            bestExcerpt = mTxt;
+          }
         }
+        if (bestExcerpt.length < 140) {
+          const arts = document.querySelectorAll('article');
+          if (arts.length === 1) {
+            const aTxt = collectSnapExcerptFromRoot(arts[0], 6000);
+            if (aTxt.length > bestExcerpt.length) bestExcerpt = aTxt;
+          }
+        }
+        if (bestExcerpt.length < 140 && document.body) {
+          const bTxt = collectSnapExcerptFromRoot(document.body, 6000);
+          if (bTxt.length > bestExcerpt.length) bestExcerpt = bTxt;
+        }
+        const excerpt = bestExcerpt.slice(0, 4500);
 
         return {
           title: document.title,
@@ -4009,14 +4182,24 @@ async function executeBridgeRpc(method, params) {
               : ceGet && typeof HTMLElement !== 'undefined' && x instanceof HTMLElement
                 ? Boolean(ceGet.call(x))
                 : x.isContentEditable === true;
-          const chkVis = (x) =>
-            !x
-              ? false
-              : vFn && typeof Element !== 'undefined' && x instanceof Element
-                ? vFn.call(x, { checkVisibilityCSS: true, checkOpacity: true })
-                : typeof x.checkVisibility === 'function'
-                  ? x.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
-                  : true;
+          const chkVis = (x) => {
+            if (!x) return false;
+            const win = x.ownerDocument?.defaultView || (typeof window !== 'undefined' ? window : null);
+            const cs = win && typeof win.getComputedStyle === 'function' ? win.getComputedStyle(x) : null;
+            if (cs && cs.display === 'contents') {
+              return (
+                cs.visibility !== 'hidden' &&
+                cs.visibility !== 'collapse' &&
+                cs.opacity !== '0' &&
+                cs.contentVisibility !== 'hidden'
+              );
+            }
+            return vFn && typeof Element !== 'undefined' && x instanceof Element
+              ? vFn.call(x, { checkVisibilityCSS: true, checkOpacity: true })
+              : typeof x.checkVisibility === 'function'
+                ? x.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
+                : true;
+          };
           const seen = new Set();
           let cur = n instanceof Element ? n : getSl(n) || getPar(n);
           let passedStop = false;
@@ -4633,6 +4816,16 @@ async function executeBridgeRpc(method, params) {
         };
         const safeCheckVis = (n) => {
           if (!n) return false;
+          const win = n.ownerDocument?.defaultView || (typeof window !== 'undefined' ? window : null);
+          const cs = win && typeof win.getComputedStyle === 'function' ? win.getComputedStyle(n) : null;
+          if (cs && cs.display === 'contents') {
+            return (
+              cs.visibility !== 'hidden' &&
+              cs.visibility !== 'collapse' &&
+              cs.opacity !== '0' &&
+              cs.contentVisibility !== 'hidden'
+            );
+          }
           if (_visFn && typeof Element !== 'undefined' && n instanceof Element) {
             return _visFn.call(n, { checkVisibilityCSS: true, checkOpacity: true });
           }
@@ -5281,13 +5474,18 @@ async function executeBridgeRpc(method, params) {
                   blocked = true;
                   break;
                 }
-                if (typeof _visFn === 'function' && cur instanceof Element && !_visFn.call(cur, { checkVisibilityCSS: true, checkOpacity: true })) {
+                const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
+                if (
+                  cs.display !== 'contents' &&
+                  typeof _visFn === 'function' &&
+                  cur instanceof Element &&
+                  !_visFn.call(cur, { checkVisibilityCSS: true, checkOpacity: true })
+                ) {
                   blocked = true;
                   break;
                 }
-                const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
                 const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue?.('-webkit-text-security') || '').toLowerCase();
-                if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0' || (tSec && tSec !== 'none')) {
+                if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0' || cs.contentVisibility === 'hidden' || (tSec && tSec !== 'none')) {
                   blocked = true;
                   break;
                 }

@@ -4386,3 +4386,23 @@ test('25. Hot-reload lifecycle: mtime-cached extension bundle hash, zero-loop au
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('26. Real-world Web Component & framework text extraction: display:contents wrappers, multi-main/card fallback, Open Shadow DOM walk & bot-challenge alert', () => {
+  const swPath = path.join(REPO_ROOT, 'extension', 'service-worker.js');
+  const swSource = fs.readFileSync(swPath, 'utf8');
+
+  // 1. Verify `display: contents` bypasses Chromium's layout-box-only checkVisibility() false-negative across all visibility helpers
+  assert.match(swSource, /cs\.display === 'contents'/);
+  assert.match(swSource, /cs\.display !== 'contents'/);
+  assert.match(swSource, /cs\.contentVisibility !== 'hidden'/);
+
+  // 2. Verify multi-root selection & body fallback for both `extract` and `snapshot`
+  assert.match(swSource, /document\.querySelectorAll\('main, \[role="main"\]'\)/);
+  assert.match(swSource, /collectVisibleTextFromRoot\(document\.body,\s*22000\)/);
+  assert.match(swSource, /collectSnapExcerptFromRoot\(document\.body,\s*6000\)/);
+
+  // 3. Verify anti-bot challenge fast-path & alert injection
+  assert.match(swSource, /botChallenge:\s*true/);
+  assert.match(swSource, /Anti-bot challenge detected: share an already-verified Chrome tab/);
+});
+
