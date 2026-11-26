@@ -3,6 +3,14 @@
   "version": "1.0.0",
   "description": "Zero-dependency local Chrome MV3 bridge, live screencast sidecar, CLI & MCP server for Antigravity — reuse your signed-in browser sessions in background tab groups.",
   "license": "GPL-3.0-only",
+  "homepage": "https://github.com/CHANPAJN/chrome-live-for-antigravity#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CHANPAJN/chrome-live-for-antigravity.git"
+  },
+  "bugs": {
+    "url": "https://github.com/CHANPAJN/chrome-live-for-antigravity/issues"
+  },
   "type": "module",
   "engines": {
     "node": ">=20.0.0"

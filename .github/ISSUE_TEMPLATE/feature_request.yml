@@ -1,0 +1,19 @@
+name: Feature Request
+description: Propose an enhancement for Chrome Live or its Antigravity MCP App
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Workflow / Use Case
+      description: What browser workflow or pain point are you trying to solve in Antigravity?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Behavior
+      description: How should it work while keeping zero external npm dependencies and local privacy guardrails intact?
+    validations:
+      required: true

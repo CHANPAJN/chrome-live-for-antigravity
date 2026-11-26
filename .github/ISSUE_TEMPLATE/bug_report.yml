@@ -1,0 +1,31 @@
+name: Bug Report
+description: Report a reproducible issue with the extension, local daemon, CLI, or MCP App
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a report. Please redact any personal URLs, cookies, or account names before submitting.
+  - type: input
+    id: env
+    attributes:
+      label: Environment (OS, Node.js, Chrome/Edge & Antigravity Version)
+      placeholder: "Windows 11 / Node v22.14.0 / Chrome 138 / Antigravity 2.35"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1. Run `node ./bin/chrome-live.mjs health`
+        2. Press `Alt+Shift+L` on ...
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Expected vs. Actual Behavior
+    validations:
+      required: true

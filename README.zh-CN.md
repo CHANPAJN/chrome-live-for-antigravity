@@ -1,9 +1,13 @@
 <div align="center">
 
+<img src="./plugin-template/assets/logo.svg" width="68" height="68" alt="Chrome Live Logo" />
+
 # chrome-live-for-antigravity
 
-专为 **Google Antigravity** 打造的零依赖 Chrome MV3 桥接与原生 **MCP App（`SEP-1865`）**，支持 Windows、macOS 与 Linux。  
-直接复用你日常已登录的 Chrome / Edge 浏览器——聊天内 0 Token 实时画框、防误触禁止点击锁、青 / 黄彩色标签组状态、独立副屏扫码接力与单轮 `batch` 批处理，无任何第三方 npm 包或黑盒二进制。
+专为 **Google Antigravity（Stable / Insiders / IDE）** 打造的零依赖 Chrome MV3 桥接与原生 **MCP App（`SEP-1865`）**，支持 Windows、macOS 与 Linux。  
+直接复用你日常已登录的 Chrome / Edge 浏览器——聊天内 0 Token 实时画框、同心光学准星环、3 秒圆环防误触锁、青 / 琥珀自动折叠标签组、独立副屏扫码接力与单轮 `batch` 批处理（实测省 `83.9%` Token），无任何第三方 npm 包或黑盒二进制。
+
+<sub>Google Antigravity 浏览器桥接 · SEP-1865 聊天内联画框 · 免重登复用日常 Chrome · 防误触保护锁 · 副屏扫码接力 · 收银台本地硬拦截</sub>
 
 <p>
   <a href="./README.md">English</a> ·
@@ -11,13 +15,14 @@
 </p>
 
 <p>
+  <img src="https://img.shields.io/badge/Antigravity-2.35%2B%20%26%20IDE-10B981?style=flat-square" alt="Compatible with Antigravity 2.35+ and IDE" />
   <a href="https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml"><img src="https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml/badge.svg" alt="Cross-Platform CI" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="GPL-3.0 License" /></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Dependencies-Zero%20(Node%20%3E%3D%2020)-2F855A?style=flat-square" alt="Zero Dependencies" /></a>
   <a href="https://linux.do"><img src="https://img.shields.io/badge/Community-LINUX%20DO-1C1C1E?style=flat-square&logo=linux&logoColor=34D399" alt="LINUX DO" /></a>
 </p>
 
-<img src="./docs/real-dual-demo-zh.gif" width="840" alt="chrome-live-for-antigravity 实时演示" />
+<img src="./docs/real-dual-demo-zh.gif" width="880" alt="chrome-live-for-antigravity 实时演示" />
 
 <sub>独立社区开源项目，与 Google LLC 无关联。</sub>
 
@@ -29,6 +34,26 @@
   <img src="./docs/real-demo.gif" width="840" alt="真实 Chrome 窗口与 CLI 实录" />
 </p>
 </details>
+
+## 视觉与方案横评总览
+
+<p align="center">
+  <img src="./docs/assets/bento-zh-CN.png" width="880" alt="Chrome Live 核心交互与安全架构总览" />
+</p>
+
+<p align="center">
+  <img src="./docs/assets/landscape-zh-CN.png" width="880" alt="浏览器自动化方案横向实测对比" />
+</p>
+
+## 架构数据流
+
+```mermaid
+flowchart LR
+  AG["Google Antigravity\n对话流 / MCP 宿主"] <-->|"stdio JSON-RPC\n+ SEP-1865 ui://"| MCP["本地 MCP Server\n与内联实时画框"]
+  CLI["本地命令行\nchrome-live.mjs"] <-->|"127.0.0.1:28196\n双向 HMAC-SHA256"| DMN["本地桥接守护进程\n零第三方 npm 依赖"]
+  MCP <-->|"127.0.0.1:28196\n双向 HMAC-SHA256"| DMN
+  DMN <-->|"本机回环 WS + Nonce\n支付与上传双层护栏"| EXT["Chrome MV3 扩展\n日常已登录标签页与折叠组"]
+```
 
 ## 核心能力
 

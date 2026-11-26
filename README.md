@@ -1,9 +1,13 @@
 <div align="center">
 
+<img src="./plugin-template/assets/logo.svg" width="68" height="68" alt="Chrome Live Logo" />
+
 # chrome-live-for-antigravity
 
 Zero-dependency Chrome MV3 bridge and native **Antigravity MCP App (`SEP-1865`)** for Windows, macOS, and Linux.  
-Connect **Google Antigravity** directly to your everyday signed-in Chrome or Edge browser — 0-token live preview in chat, anti-misclick lock, color-coded tab groups, standalone human-relay popout, and single-roundtrip `batch` automation with zero third-party npm packages.
+Connect **Google Antigravity (Stable, Insiders & IDE)** directly to your everyday signed-in Chrome or Edge browser — 0-token live preview in chat, concentric optical reticle, 3s anti-misclick lock, auto-collapsed tab groups, standalone human-relay popout, and single-roundtrip `batch` automation (`-83.9%` tokens) with zero third-party npm packages.
+
+<sub>Google Antigravity Browser Bridge · SEP-1865 Live Monitor · Signed-In Chrome Reuse · Anti-Misclick Shield · Human Relay 2FA · Local Payment Guardrails</sub>
 
 <p>
   <b>English</b> ·
@@ -11,13 +15,14 @@ Connect **Google Antigravity** directly to your everyday signed-in Chrome or Edg
 </p>
 
 <p>
+  <img src="https://img.shields.io/badge/Antigravity-2.35%2B%20%26%20IDE-10B981?style=flat-square" alt="Compatible with Antigravity 2.35+ and IDE" />
   <a href="https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml"><img src="https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml/badge.svg" alt="Cross-Platform CI" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="GPL-3.0 License" /></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Dependencies-Zero%20(Node%20%3E%3D%2020)-2F855A?style=flat-square" alt="Zero Dependencies" /></a>
   <a href="https://linux.do"><img src="https://img.shields.io/badge/Community-LINUX%20DO-1C1C1E?style=flat-square&logo=linux&logoColor=34D399" alt="LINUX DO Community" /></a>
 </p>
 
-<img src="./docs/real-dual-demo.gif" width="840" alt="chrome-live-for-antigravity Live Demo" />
+<img src="./docs/real-dual-demo.gif" width="880" alt="chrome-live-for-antigravity Live Demo" />
 
 <sub>Independent community project. Not affiliated with or endorsed by Google LLC.</sub>
 
@@ -29,6 +34,26 @@ Connect **Google Antigravity** directly to your everyday signed-in Chrome or Edg
   <img src="./docs/real-demo.gif" width="840" alt="Real Chrome window driven by CLI" />
 </p>
 </details>
+
+## Visual Overview
+
+<p align="center">
+  <img src="./docs/assets/bento-en.png" width="880" alt="Chrome Live Core Interaction & Security Architecture Overview" />
+</p>
+
+<p align="center">
+  <img src="./docs/assets/landscape-en.png" width="880" alt="Browser Automation Landscape Comparison" />
+</p>
+
+## Architecture
+
+```mermaid
+flowchart LR
+  AG["Google Antigravity\nChat / MCP Host"] <-->|"stdio JSON-RPC\n+ SEP-1865 ui://"| MCP["Local MCP Server\n& Inline Monitor UI"]
+  CLI["Local CLI\nchrome-live.mjs"] <-->|"127.0.0.1:28196\nMutual HMAC-SHA256"| DMN["Local Bridge Daemon\nZero npm Dependencies"]
+  MCP <-->|"127.0.0.1:28196\nMutual HMAC-SHA256"| DMN
+  DMN <-->|"Loopback WS + Nonce\nPayment & Upload Guardrails"| EXT["Chrome MV3 Extension\nSigned-In Tabs & Tab Groups"]
+```
 
 ## Features
 
