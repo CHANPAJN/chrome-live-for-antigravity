@@ -5,7 +5,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { expandLeadingTilde, getDefaultUploadStagingDir } from '../src/guardrails.mjs';
+import { expandLeadingTilde, getDefaultUploadStagingDir, isNetworkUncPath } from '../src/guardrails.mjs';
 import { buildSignedHttpHeaders, verifySignedHttpResponse } from '../src/hmac-auth.mjs';
 import { startMcpStdioServer } from '../src/mcp-server.mjs';
 import {
@@ -226,18 +226,22 @@ function parseFlags(args, cmd = '') {
 }
 
 function writeExtensionLocalRuntimeConfig(token) {
-  fs.mkdirSync(getDefaultUploadStagingDir(), { recursive: true, mode: 0o700 });
+  ensureSecureDirSync(getDefaultUploadStagingDir());
   const runtimeFile = path.join(REPO_ROOT, 'extension', '.local-runtime.json');
   const data = {
     host: DEFAULT_HOST,
     port: DEFAULT_PORT,
     token
   };
+  // Pre-create empty file and tighten Windows ACL BEFORE writing plaintext pairing secret
+  if (!fs.existsSync(runtimeFile)) {
+    fs.writeFileSync(runtimeFile, '', { encoding: 'utf8', mode: 0o600 });
+  }
+  tightenFileAclSync(runtimeFile);
   fs.writeFileSync(runtimeFile, `${JSON.stringify(data, null, 2)}\n`, {
     encoding: 'utf8',
     mode: 0o600
   });
-  tightenFileAclSync(runtimeFile);
   return runtimeFile;
 }
 
@@ -317,6 +321,7 @@ chrome-live-for-antigravity — Zero-dependency Chrome MV3 bridge, CLI & MCP ser
 
 Usage:
   chrome-live setup                      Generate local pairing token & extension bootstrap config
+  chrome-live start                      Start the local background bridge daemon
   chrome-live install [--with-plugin]    Opt-in install of Antigravity plugin (Skill + Live Sidecar)
   chrome-live health                     Check daemon & Chrome extension status
   chrome-live tabs                       List shared & controlled browser tabs
@@ -493,7 +498,15 @@ async function main() {
     throw new Error(`Unknown playbook subcommand "${sub}". Expected: on|off|list|save|tip|clear`);
   }
 
-  const tabId = flags.tab !== undefined ? Number.parseInt(String(flags.tab), 10) : undefined;
+  let tabId = undefined;
+  if (flags.tab !== undefined) {
+    const rawTabFlag = String(flags.tab).trim();
+    const parsedTab = /^\d+$/.test(rawTabFlag) ? Number.parseInt(rawTabFlag, 10) : Number.NaN;
+    if (!Number.isSafeInteger(parsedTab) || parsedTab <= 0) {
+      throw new Error(`Invalid --tab value "${flags.tab}"; expected a positive integer tabId`);
+    }
+    tabId = parsedTab;
+  }
 
   if (cmd === 'open') {
     const url = positional[0];
@@ -570,11 +583,18 @@ async function main() {
     let fileArgs = positional;
 
     if (flags.target === undefined && positional.length >= 2) {
-      const firstAsPath = path.resolve(expandLeadingTilde(positional[0]));
       let firstIsFile = false;
-      try {
-        firstIsFile = fs.existsSync(firstAsPath) && fs.statSync(firstAsPath).isFile();
-      } catch {}
+      if (!isNetworkUncPath(positional[0])) {
+        const expandedFirst = expandLeadingTilde(positional[0]);
+        if (!isNetworkUncPath(expandedFirst)) {
+          const firstAsPath = path.resolve(expandedFirst);
+          if (!isNetworkUncPath(firstAsPath)) {
+            try {
+              firstIsFile = fs.existsSync(firstAsPath) && fs.statSync(firstAsPath).isFile();
+            } catch {}
+          }
+        }
+      }
       if (!firstIsFile) {
         target = /^\d+$/.test(positional[0]) ? Number.parseInt(positional[0], 10) : positional[0];
         fileArgs = positional.slice(1);

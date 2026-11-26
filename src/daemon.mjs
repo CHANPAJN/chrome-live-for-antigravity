@@ -41,8 +41,8 @@ const REPO_ROOT_DIR = path.resolve(path.dirname(__daemonFilename), '..');
 
 export { computeChallengeHmac };
 
-function consumeAndShredLocalRuntimeBootstrap() {
-  const runtimeFile = path.join(REPO_ROOT_DIR, 'extension', '.local-runtime.json');
+function consumeAndShredLocalRuntimeBootstrap(targetFile) {
+  const runtimeFile = targetFile || path.join(REPO_ROOT_DIR, 'extension', '.local-runtime.json');
   try {
     if (fs.existsSync(runtimeFile)) {
       const st = fs.statSync(runtimeFile);
@@ -154,6 +154,12 @@ export function createDaemonServer(options = {}) {
   const requestedPort = options.port ?? DEFAULT_PORT;
   const resolveInstanceStateDir = () =>
     options.stateDir ? path.resolve(String(options.stateDir)) : getStateDir();
+  const resolveBootstrapPath = () =>
+    options.runtimeBootstrapPath
+      ? path.resolve(String(options.runtimeBootstrapPath))
+      : options.stateDir
+        ? path.join(path.resolve(String(options.stateDir)), '.local-runtime.json')
+        : path.join(REPO_ROOT_DIR, 'extension', '.local-runtime.json');
   const resolveAuthToken = () =>
     typeof options.token === 'function'
       ? String(options.token() || '').trim()
@@ -1014,7 +1020,7 @@ export function createDaemonServer(options = {}) {
           activeExtensionOrigin = verifiedOrigin;
         }
         // Extension has persisted the pairing token into chrome.storage.local; shred any leftover bootstrap file
-        consumeAndShredLocalRuntimeBootstrap();
+        consumeAndShredLocalRuntimeBootstrap(resolveBootstrapPath());
         if (extensionPeer && !extensionPeer.closed) {
           // Close code 4009 instructs the older browser profile not to auto-reconnect in a loop
           extensionPeer.close(4009, 'Replaced by another browser profile');

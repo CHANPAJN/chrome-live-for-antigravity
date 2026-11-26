@@ -218,6 +218,7 @@
         let activeTabId = null;
         let pinnedTabId = null;
         let pinnedTabClosed = false;
+        let displayedFrameTabId = null;
         let pollInFlight = false;
 
         const sidecarFetch = (route, opts = {}) => {
@@ -232,14 +233,13 @@
           if (document.hidden || pollInFlight) return;
           pollInFlight = true;
           try {
-            // Lightweight metadata poll first; fetch Base64 JPEG only when a newer frame exists!
-            const resp = await sidecarFetch(
-              forceFrame ? '/api/live_state?includeFrame=1' : '/api/live_state?includeFrame=0'
-            );
+            // Lightweight metadata poll first; fetch Base64 JPEG below only for the resolved activeTabId!
+            const resp = await sidecarFetch('/api/live_state?includeFrame=0');
             const s = await resp.json();
             if (!s || s.daemonOffline) {
               led.dataset.on = 'false';
               lastCapturedAt = 0;
+              displayedFrameTabId = null;
               statusTitle.textContent = TXT.waking;
               emptyMsg.textContent = TXT.waking;
               liveImg.removeAttribute('src');
@@ -258,6 +258,7 @@
 
             if (!connected) {
               lastCapturedAt = 0;
+              displayedFrameTabId = null;
               statusTitle.textContent = TXT.extOffline;
               emptyMsg.textContent = TXT.extOffline;
               liveImg.removeAttribute('src');
@@ -312,6 +313,7 @@
 
             if (!target) {
               lastCapturedAt = 0;
+              displayedFrameTabId = null;
               statusTitle.textContent = TXT.connectedIdle;
               urlLabel.textContent = '127.0.0.1:28196';
               liveImg.removeAttribute('src');
@@ -329,6 +331,7 @@
 
             if (target.paused) {
               lastCapturedAt = 0;
+              displayedFrameTabId = null;
               liveImg.removeAttribute('src');
               liveImg.style.display = 'none';
               emptyMsg.textContent = IS_ZH
@@ -342,7 +345,7 @@
             const remoteTs =
               (activeTabId !== null && perTabMap && Number(perTabMap[activeTabId])) ||
               (s.latestFrameMeta?.tabId === activeTabId ? s.latestFrameMeta?.capturedAt || 0 : 0);
-            if ((remoteTs && remoteTs !== lastCapturedAt) || forceFrame) {
+            if ((remoteTs && remoteTs !== lastCapturedAt) || forceFrame || displayedFrameTabId !== activeTabId) {
               const frameResp = await sidecarFetch(
                 `/api/live_state?includeFrame=1&tabId=${encodeURIComponent(activeTabId)}`
               );
@@ -351,9 +354,17 @@
                 frameJson?.frameTabId === activeTabId ? frameJson?.frameDataUrl || '' : '';
               if (dataUrl) {
                 lastCapturedAt = Number(frameJson?.frameCapturedAt) || remoteTs || Date.now();
+                displayedFrameTabId = activeTabId;
                 liveImg.src = dataUrl;
                 liveImg.style.display = 'block';
                 emptyMsg.style.display = 'none';
+              } else if (displayedFrameTabId !== activeTabId) {
+                lastCapturedAt = 0;
+                displayedFrameTabId = null;
+                liveImg.removeAttribute('src');
+                liveImg.style.display = 'none';
+                emptyMsg.textContent = TXT.emptyHint;
+                emptyMsg.style.display = 'block';
               }
             } else if (!lastCapturedAt) {
               emptyMsg.textContent = TXT.emptyHint;

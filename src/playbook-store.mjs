@@ -7,7 +7,7 @@ import {
   redactUrlForAudit,
   redactUrlsInText
 } from './guardrails.mjs';
-import { ensureSecureDirSync, getStateDir } from './token-store.mjs';
+import { ensureSecureDirSync, getStateDir, tightenFileAclSync } from './token-store.mjs';
 
 const MAX_SITES = 120;
 const MAX_ROUTES_PER_SITE = 18;
@@ -143,13 +143,14 @@ function loadStore(stateDirOverride = '') {
 }
 
 function persistStore(store, stateDirOverride = '') {
-  const dir = ensureSecureDirSync(stateDirOverride ? path.resolve(stateDirOverride) : getStateDir());
+  ensureSecureDirSync(stateDirOverride ? path.resolve(stateDirOverride) : getStateDir());
   const filePath = getPlaybookFilePath(stateDirOverride);
   store.updatedAt = Date.now();
   fs.writeFileSync(filePath, `${JSON.stringify(store, null, 2)}\n`, {
     encoding: 'utf8',
     mode: 0o600
   });
+  tightenFileAclSync(filePath);
   try {
     memoryMtimeMs = fs.statSync(filePath).mtimeMs;
   } catch {
@@ -202,7 +203,8 @@ export function sanitizeRouteUrl(rawUrl, customBlockedDomains = []) {
     if (
       STRIP_QUERY_PATTERNS.some((rx) => rx.test(key)) ||
       AUDIT_SENSITIVE_PARAM_RX.test(key) ||
-      isHighEntropyPathToken(val)
+      isHighEntropyPathToken(val, { splitMatrix: false }) ||
+      /https?:\/\/|[?#=]/i.test(val)
     ) {
       u.searchParams.delete(key);
     }

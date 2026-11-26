@@ -77,9 +77,10 @@ export const AUDIT_SENSITIVE_PARAM_RX =
 const HASH_SENSITIVE_PAIR_RX =
   /([#?&])([^=&#]*(?:token|secret|passw|pwd|apikey|api[-_]?key|access[-_]?key|private[-_]?key|auth|code|state|sig|jwt|bearer|ticket|session|sid|csrf|xsrf|otp|credential|hmac|(?:^|[-_.])(?:key|pass|pin|hash)(?:$|[-_.]))[^=&#]*)=([^&#]*)/gi;
 
-export function isHighEntropyPathToken(rawSegment) {
+export function isHighEntropyPathToken(rawSegment, options = {}) {
   if (!rawSegment) return false;
-  let segment = String(rawSegment).split(';')[0];
+  const splitMatrix = options.splitMatrix !== false;
+  let segment = splitMatrix ? String(rawSegment).split(';')[0] : String(rawSegment);
   if (segment.length < 32) return false;
   if (segment.includes('%')) {
     segment = segment.replace(/(?:%[0-9A-Fa-f]{2})+/g, (seq) => {
@@ -91,13 +92,13 @@ export function isHighEntropyPathToken(rawSegment) {
     });
   }
   if (segment.length < 32) return false;
-  if (/^eyJ[A-Za-z0-9._~+/=-]{10,}$/.test(segment)) return true;
+  if (/^eyJ[A-Za-z0-9._~+/=;-]{10,}$/.test(segment)) return true;
   if (/^[0-9a-f]{32,}$/i.test(segment)) return true;
-  if (segment.length >= 32 && /^[A-Za-z0-9._~+/=-]+$/.test(segment)) {
+  if (segment.length >= 32 && /^[A-Za-z0-9._~+/=;-]+$/.test(segment)) {
     const hasDigit = /\d/.test(segment);
     const hasUpper = /[A-Z]/.test(segment);
     const hasLower = /[a-z]/.test(segment);
-    const hasB64Punct = /[+/=]/.test(segment);
+    const hasB64Punct = /[+/=;]/.test(segment);
     if (
       (hasDigit && (hasUpper || hasLower)) ||
       hasB64Punct ||
@@ -112,14 +113,14 @@ export function isHighEntropyPathToken(rawSegment) {
 function redactMatrixParamsInSegment(seg) {
   if (!seg || !seg.includes(';')) return seg;
   const pieces = seg.split(';');
-  const head = isHighEntropyPathToken(pieces[0]) ? 'REDACTED' : pieces[0];
+  const head = isHighEntropyPathToken(pieces[0], { splitMatrix: true }) ? 'REDACTED' : pieces[0];
   let changed = head !== pieces[0];
   for (let i = 1; i < pieces.length; i++) {
     const eqIdx = pieces[i].indexOf('=');
     if (eqIdx === -1) continue;
     const mk = pieces[i].slice(0, eqIdx);
     const mv = pieces[i].slice(eqIdx + 1);
-    if (AUDIT_SENSITIVE_PARAM_RX.test(mk) || isHighEntropyPathToken(mv)) {
+    if (AUDIT_SENSITIVE_PARAM_RX.test(mk) || isHighEntropyPathToken(mv, { splitMatrix: false })) {
       pieces[i] = `${mk}=REDACTED`;
       changed = true;
     }
@@ -128,21 +129,60 @@ function redactMatrixParamsInSegment(seg) {
   return changed ? pieces.join(';') : seg;
 }
 
-function scrubQueryStringTokens(rawQueryWithQuestionMark) {
-  if (!rawQueryWithQuestionMark || !rawQueryWithQuestionMark.startsWith('?')) {
+function scrubNestedParamValue(rawV, depth = 0) {
+  if (!rawV || depth > 3) return { value: rawV, changed: false };
+  if (isHighEntropyPathToken(rawV, { splitMatrix: false })) {
+    return { value: 'REDACTED', changed: true };
+  }
+  let decV = rawV;
+  let wasEncoded = false;
+  if (rawV.includes('%')) {
+    try {
+      decV = decodeURIComponent(rawV);
+      wasEncoded = decV !== rawV;
+    } catch {
+      return { value: rawV, changed: false };
+    }
+  }
+  if (/^https?:\/\//i.test(decV.trim())) {
+    const redUrl = redactUrlForAudit(decV.trim(), depth + 1);
+    if (redUrl !== decV.trim()) {
+      return { value: wasEncoded ? encodeURIComponent(redUrl) : redUrl, changed: true };
+    }
+  } else if (/https?:\/\//i.test(decV)) {
+    const redTxt = redactUrlsInText(decV);
+    if (redTxt !== decV) {
+      return { value: wasEncoded ? encodeURIComponent(redTxt) : redTxt, changed: true };
+    }
+  } else if (decV.includes('=') || decV.includes('&') || decV.includes('#')) {
+    const subScrub = scrubQueryStringTokens(`?${decV}`, depth + 1);
+    if (subScrub.changed) {
+      const inner = subScrub.text.slice(1);
+      return { value: wasEncoded ? encodeURIComponent(inner) : inner, changed: true };
+    }
+  }
+  return { value: rawV, changed: false };
+}
+
+function scrubQueryStringTokens(rawQueryWithQuestionMark, depth = 0) {
+  if (!rawQueryWithQuestionMark || !rawQueryWithQuestionMark.startsWith('?') || depth > 3) {
     return { text: rawQueryWithQuestionMark || '', changed: false };
   }
   const rawBody = rawQueryWithQuestionMark.slice(1);
   if (!rawBody) return { text: rawQueryWithQuestionMark, changed: false };
   let changed = false;
-  const pairs = rawBody.split('&').map((pair) => {
+  // Split by `&`, `#`, or `?` while preserving original delimiters (handles `#tab=1#%74oken=sec` and `#tab=1#r=eyJ...`)
+  const tokens = rawBody.split(/([&#?])/);
+  for (let i = 0; i < tokens.length; i += 2) {
+    const pair = tokens[i];
+    if (!pair) continue;
     const eq = pair.indexOf('=');
     if (eq === -1) {
-      if (isHighEntropyPathToken(pair)) {
+      if (isHighEntropyPathToken(pair, { splitMatrix: false })) {
+        tokens[i] = 'REDACTED';
         changed = true;
-        return 'REDACTED';
       }
-      return pair;
+      continue;
     }
     const rawK = pair.slice(0, eq);
     const rawV = pair.slice(eq + 1);
@@ -150,13 +190,18 @@ function scrubQueryStringTokens(rawQueryWithQuestionMark) {
     try {
       decK = decodeURIComponent(rawK.replace(/\+/g, ' '));
     } catch {}
-    if (AUDIT_SENSITIVE_PARAM_RX.test(decK) || isHighEntropyPathToken(rawV)) {
+    if (AUDIT_SENSITIVE_PARAM_RX.test(decK)) {
+      tokens[i] = `${rawK}=REDACTED`;
       changed = true;
-      return `${rawK}=REDACTED`;
+      continue;
     }
-    return pair;
-  });
-  return { text: changed ? `?${pairs.join('&')}` : rawQueryWithQuestionMark, changed };
+    const nested = scrubNestedParamValue(rawV, depth);
+    if (nested.changed) {
+      tokens[i] = `${rawK}=${nested.value}`;
+      changed = true;
+    }
+  }
+  return { text: changed ? `?${tokens.join('')}` : rawQueryWithQuestionMark, changed };
 }
 
 function decodeNestedPercentOnce(str) {
@@ -226,8 +271,8 @@ function canonicalizePathForGuardrail(rawSegment, splitRawQuery = false) {
   };
 }
 
-export function redactUrlForAudit(rawUrl) {
-  if (!rawUrl || typeof rawUrl !== 'string') return rawUrl;
+export function redactUrlForAudit(rawUrl, depth = 0) {
+  if (!rawUrl || typeof rawUrl !== 'string' || depth > 3) return rawUrl;
   try {
     const parsed = new URL(rawUrl.trim());
     let mutated = false;
@@ -247,7 +292,7 @@ export function redactUrlForAudit(rawUrl) {
             parts[i] = scrubbedSeg;
             pathChanged = true;
           }
-        } else if (isHighEntropyPathToken(parts[i])) {
+        } else if (isHighEntropyPathToken(parts[i], { splitMatrix: true })) {
           parts[i] = 'REDACTED';
           pathChanged = true;
         }
@@ -258,10 +303,28 @@ export function redactUrlForAudit(rawUrl) {
       }
     }
     if (parsed.search) {
-      for (const [k, v] of parsed.searchParams.entries()) {
-        if (AUDIT_SENSITIVE_PARAM_RX.test(k) || isHighEntropyPathToken(v)) {
+      for (const [k, v] of Array.from(parsed.searchParams.entries())) {
+        if (AUDIT_SENSITIVE_PARAM_RX.test(k) || isHighEntropyPathToken(v, { splitMatrix: false })) {
           parsed.searchParams.set(k, 'REDACTED');
           mutated = true;
+        } else if (/^https?:\/\//i.test(v.trim())) {
+          const redNested = redactUrlForAudit(v.trim(), depth + 1);
+          if (redNested !== v.trim()) {
+            parsed.searchParams.set(k, redNested);
+            mutated = true;
+          }
+        } else if (/https?:\/\//i.test(v)) {
+          const redTxt = redactUrlsInText(v);
+          if (redTxt !== v) {
+            parsed.searchParams.set(k, redTxt);
+            mutated = true;
+          }
+        } else if (v.includes('=') || v.includes('&') || v.includes('#')) {
+          const subScrub = scrubQueryStringTokens(`?${v}`, depth + 1);
+          if (subScrub.changed) {
+            parsed.searchParams.set(k, subScrub.text.slice(1));
+            mutated = true;
+          }
         }
       }
     }
@@ -277,12 +340,18 @@ export function redactUrlForAudit(rawUrl) {
         !rawHashBody.includes('?') &&
         !rawHashBody.includes('&') &&
         !rawHashBody.includes('=') &&
-        (isHighEntropyPathToken(rawHashBody) || /^(?:eyJ[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{32,})$/.test(rawHashBody))
+        !rawHashBody.includes('#') &&
+        (isHighEntropyPathToken(rawHashBody, { splitMatrix: false }) ||
+          /^(?:eyJ[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{32,})$/.test(rawHashBody))
       ) {
         cleanedHash = `${hashPrefix}REDACTED`;
-      } else if (!rawHashBody.startsWith('/') && !rawHashBody.includes('?') && (rawHashBody.includes('=') || rawHashBody.includes('&'))) {
-        // OAuth2 / OIDC implicit fragment `#r=eyJ...&lang=zh`, `#state=xyz&v=eyJ...`, or percent-encoded `#%74oken=secret`
-        const scrubbedFragPairs = scrubQueryStringTokens(`?${rawHashBody}`);
+      } else if (
+        !rawHashBody.startsWith('/') &&
+        !rawHashBody.includes('?') &&
+        (rawHashBody.includes('=') || rawHashBody.includes('&') || rawHashBody.includes('#'))
+      ) {
+        // OAuth2 / OIDC implicit fragment `#r=eyJ...&lang=zh`, `#tab=1#%74oken=secret`, or `#tab=1#r=eyJ...`
+        const scrubbedFragPairs = scrubQueryStringTokens(`?${rawHashBody}`, depth);
         if (scrubbedFragPairs.changed) {
           cleanedHash = `${hashPrefix}${scrubbedFragPairs.text.slice(1)}`;
         }
@@ -295,8 +364,8 @@ export function redactUrlForAudit(rawUrl) {
         for (let i = 0; i < hParts.length; i++) {
           const seg = hParts[i];
           if (!seg) continue;
-          if (seg.includes('=') || seg.includes('&')) {
-            const scrubbedSegPairs = scrubQueryStringTokens(`?${seg}`);
+          if (seg.includes('=') || seg.includes('&') || seg.includes('#')) {
+            const scrubbedSegPairs = scrubQueryStringTokens(`?${seg}`, depth);
             if (scrubbedSegPairs.changed) {
               hParts[i] = scrubbedSegPairs.text.slice(1);
               hChanged = true;
@@ -309,18 +378,17 @@ export function redactUrlForAudit(rawUrl) {
               hParts[i] = nextSeg;
               hChanged = true;
             }
-          } else if (isHighEntropyPathToken(seg)) {
+          } else if (isHighEntropyPathToken(seg, { splitMatrix: true })) {
             hParts[i] = 'REDACTED';
             hChanged = true;
           }
         }
-        const scrubbedHQuery = scrubQueryStringTokens(hQuery);
+        const scrubbedHQuery = scrubQueryStringTokens(hQuery, depth);
         if (hChanged || scrubbedHQuery.changed) {
           cleanedHash = `${hashPrefix}${hParts.join('/')}${scrubbedHQuery.text}`;
         }
       }
 
-      // Final pass with HASH_SENSITIVE_PAIR_RX in case of nested `#` markers inside fragment
       cleanedHash = cleanedHash.replace(HASH_SENSITIVE_PAIR_RX, '$1$2=REDACTED');
       if (cleanedHash !== parsed.hash) {
         parsed.hash = cleanedHash;
@@ -493,11 +561,26 @@ function parseAllowedUploadDirs(explicitDirs, stateDirOverride = '') {
   return dirs;
 }
 
+export function isNetworkUncPath(rawPath) {
+  if (!rawPath || typeof rawPath !== 'string') return false;
+  const s = rawPath.trim();
+  return /^\\\\|^\/\//.test(s);
+}
+
 export function evaluateUploadFileSafety(rawFilePath, options = {}) {
   if (!rawFilePath || typeof rawFilePath !== 'string' || !rawFilePath.trim()) {
     return { allowed: false, code: 'INVALID_FILE', reason: 'Empty file path' };
   }
   const rawTrimmed = rawFilePath.trim();
+  // Block Windows UNC / WebDAV network paths (`\\server\share` or `//server/share`) BEFORE any `fs.*` syscall
+  // to prevent NTLMv2 credential hash egress and synchronous SMB timeout DoS!
+  if (isNetworkUncPath(rawTrimmed)) {
+    return {
+      allowed: false,
+      code: 'UNC_PATH_BLOCKED',
+      reason: 'Network UNC paths are blocked by local guardrails'
+    };
+  }
   // Reject NTFS Alternate Data Streams (`file.env::$DATA`), control chars, or trailing dots/spaces used to evade basename regexes
   const withoutDrive = rawTrimmed.replace(/^[A-Za-z]:/, '');
   if (withoutDrive.includes(':') || /[\x00-\x1f]/.test(rawTrimmed) || /[.\s]$/.test(rawTrimmed)) {
@@ -509,7 +592,21 @@ export function evaluateUploadFileSafety(rawFilePath, options = {}) {
   }
 
   const expandedPath = expandLeadingTilde(rawTrimmed);
+  if (isNetworkUncPath(expandedPath)) {
+    return {
+      allowed: false,
+      code: 'UNC_PATH_BLOCKED',
+      reason: 'Network UNC paths are blocked by local guardrails'
+    };
+  }
   const resolvedPath = path.resolve(expandedPath);
+  if (isNetworkUncPath(resolvedPath) || (process.platform === 'win32' && !/^[A-Za-z]:\\/.test(resolvedPath))) {
+    return {
+      allowed: false,
+      code: 'UNC_PATH_BLOCKED',
+      reason: 'Upload path must reside on a local drive volume'
+    };
+  }
   const realPath = resolveCanonicalPath(resolvedPath);
 
   const effectiveStateDir = options.stateDir ? path.resolve(String(options.stateDir)) : getStateDir();

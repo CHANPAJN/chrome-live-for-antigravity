@@ -1112,9 +1112,16 @@ test('Security audit hardening: mutual HTTP/WS HMAC, replay defense, runtime boo
   // 2. Live daemon integration checks
   const prevHome = process.env.CHROME_LIVE_HOME;
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-sec-audit-'));
+  const isolatedBootstrapPath = path.join(tempHome, '.local-runtime.json');
   process.env.CHROME_LIVE_HOME = tempHome;
   const testToken = crypto.randomBytes(32).toString('hex');
-  const daemon = createDaemonServer({ host: '127.0.0.1', port: 0, token: testToken });
+  const daemon = createDaemonServer({
+    host: '127.0.0.1',
+    port: 0,
+    stateDir: tempHome,
+    runtimeBootstrapPath: isolatedBootstrapPath,
+    token: testToken
+  });
   const port = await daemon.listen();
 
   try {
@@ -1195,8 +1202,8 @@ test('Security audit hardening: mutual HTTP/WS HMAC, replay defense, runtime boo
     await unmaskedClosed;
     assert.equal(unmaskedWs.closed, true);
 
-    // 2d. Valid mutual HMAC-SHA256 challenge-response connects extensionPeer cleanly AND shreds .local-runtime.json
-    const runtimeBootstrapFile = path.join(REPO_ROOT, 'extension', '.local-runtime.json');
+    // 2d. Valid mutual HMAC-SHA256 challenge-response connects extensionPeer cleanly AND shreds isolated .local-runtime.json without touching real repo checkout!
+    const runtimeBootstrapFile = isolatedBootstrapPath;
     fs.writeFileSync(runtimeBootstrapFile, JSON.stringify({ host: '127.0.0.1', port, token: testToken }), 'utf8');
     let extWs;
     try {
@@ -3204,7 +3211,9 @@ test('Blind-audit round-6 regressions: OAuth2 multi-param & percent-key #fragmen
   }
 
   // 3. `inspectEmbeddedFramesSafety` defeats `button.formAction` truthy shortcut, `<input name="action">` DOM Clobbering, relative `/checkout`, and `<a target="payFrame">`
-  const inspectFuncMatch = swSource.match(/const iframeRes = await runHudScriptSafe\(tabId, \{\s*func: \(\) => \{([\s\S]*?)\n    \}\n  \}\);/);
+  const inspectFuncMatch = swSource.match(
+    /const iframeRes = await runHudScriptSafe\(\s*tabId,\s*\{\s*allFrames:\s*true,\s*func:\s*\(\)\s*=>\s*\{([\s\S]*?)\n      \}\s*\},\s*2500\s*\);/
+  );
   assert.ok(inspectFuncMatch, 'Must locate inspectEmbeddedFramesSafety page script');
 
   class FakeElement {
@@ -3458,14 +3467,206 @@ test('Sub-frame guardrail allows passive 0x0 Stripe anti-fraud beacons on commun
   assert.equal(isPassive('about:blank#blocked'), true);
   assert.equal(isPassive('about:config'), false, 'Browser internal about:config must never be exempted');
   assert.equal(isPassive('https://js.stripe.com/v3/m-outer-3437aaddcdf6922d623e172c2d6f9278.html'), true);
+  assert.equal(isPassive('https://js.stripe.com/v3/fingerprinted/m-outer-93afeeb17bc37e711759584dbfc50d47.html'), true);
   assert.equal(isPassive('https://js.stripe.com/v3/controller-abc123def456.html'), true);
   assert.equal(isPassive('https://m.stripe.network/inner.html'), true);
 
-  // Real interactive payment Elements, 3DS hooks, and Checkout frames MUST NEVER be exempted
+  // Real interactive payment Elements, fingerprinted Elements, 3DS hooks, and Checkout frames MUST NEVER be exempted
   assert.equal(isPassive('https://js.stripe.com/v3/elements-inner-card-19066928f2ed1ba3ffada645e45f5b50.html'), false);
+  assert.equal(isPassive('https://js.stripe.com/v3/fingerprinted/elements-inner-card-19066928f2ed1ba3ffada645e45f5b50.html'), false);
+  assert.equal(isPassive('https://js.stripe.com/v3/fingerprinted/authorize-with-url-inner-abc123.html'), false);
   assert.equal(isPassive('https://js.stripe.com/v3/elements-inner-payment-abc123.html'), false);
   assert.equal(isPassive('https://js.stripe.com/v3/authorize-with-url-inner.html'), false);
   assert.equal(isPassive('https://checkout.stripe.com/c/pay/cs_live_123'), false);
   assert.equal(isPassive('https://hooks.stripe.com/three_d_secure_2_hosted'), false);
   assert.equal(isPassive('http://m.stripe.network/inner.html'), false, 'Plain HTTP must never be exempted');
+});
+
+test('Blind-audit round-7 regressions: MV3 dormancy HUD state sync, UNC path NTLMv2 egress block, fail-closed embedded frame timeout, nested redirect_uri/semicolon/multi-# URL redaction, Web Component <slot> OTP block, multi-tab done & invalid --tab rejection', async () => {
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+  const cliPath = path.join(REPO_ROOT, 'bin', 'chrome-live.mjs');
+
+  // Note: round-6 test regex `const iframeRes = await runHudScriptSafe...` check compatibility + round-7 fail-closed timeout check!
+  assert.match(swSource, /swInitPromise = loadBootstrapAndStorage\(\)/, 'SW must capture bootstrap promise');
+  assert.match(swSource, /await ensureSwInitialized\(\)/, 'Event listeners must await SW storage restoration');
+
+  // 1. `pollHudUserEvents` reconciles `state.mode === "paused"` and `state.visible === false` even when `events: []`!
+  const pollHudMatch = swSource.match(/async function pollHudUserEvents\(tabId, entry\)[\s\S]*?\n\}/);
+  assert.ok(pollHudMatch);
+  const mockManaged = new Map();
+  const entryA = { tabId: 301, paused: false, uiMode: 'working' };
+  const entryB = { tabId: 302, paused: false, uiMode: 'working' };
+  mockManaged.set(301, entryA);
+  mockManaged.set(302, entryB);
+  let cdpStoppedFor = null;
+  const runPollHud = vm.runInNewContext(`(${pollHudMatch[0]})`, {
+    managedTabs: mockManaged,
+    runHudScriptSafe: async (tid) =>
+      tid === 301
+        ? [{ result: { events: [], mode: 'paused', visible: true } }]
+        : [{ result: { events: [], mode: 'working', visible: false } }],
+    stopCdpForTab: async (tid) => {
+      cdpStoppedFor = tid;
+    },
+    detachManagedTab: async (tid) => {
+      mockManaged.delete(tid);
+    },
+    syncHud: async () => {},
+    syncLiveTabGroups: async () => {},
+    notifyPanelAndDaemon: () => {},
+    tr: () => ({ released: 'Released' })
+  });
+  await runPollHud(301, entryA);
+  assert.equal(entryA.paused, true, 'pollHudUserEvents must enforce paused=true when live HUD is in paused mode even if events=[]');
+  assert.equal(cdpStoppedFor, 301);
+  await runPollHud(302, entryB);
+  assert.equal(mockManaged.has(302), false, 'pollHudUserEvents must detach tab when live HUD visible===false');
+
+  // 2. UNC network paths (`\\attacker.example.com\share\a.png` & `//attacker.example.com/share/a.png`) are blocked with zero SMB syscall
+  for (const uncPath of ['\\\\198.51.100.99\\share\\invoice.png', '//198.51.100.99/share/invoice.png']) {
+    const startMs = Date.now();
+    const res = evaluateUploadFileSafety(uncPath);
+    const elapsedMs = Date.now() - startMs;
+    assert.equal(res.allowed, false);
+    assert.equal(res.code, 'UNC_PATH_BLOCKED');
+    assert.ok(elapsedMs < 50, `UNC check must reject instantaneously without network syscall (${elapsedMs}ms)`);
+  }
+
+  // 3. `inspectEmbeddedFramesSafety` fails CLOSED (`allowed: false`) when `runHudScriptSafe` times out (`null`)
+  const inspectFnMatch = swSource.match(/async function inspectEmbeddedFramesSafety\(tabId\)[\s\S]*?\n\}/);
+  assert.ok(inspectFnMatch);
+  const runInspectTimeout = vm.runInNewContext(`(${inspectFnMatch[0]})`, {
+    chrome: {
+      tabs: { get: async (id) => ({ id, url: 'https://shop.example.com/cart' }) },
+      webNavigation: { getAllFrames: async () => [{ frameId: 0, url: 'https://shop.example.com/cart' }] }
+    },
+    isPassiveTelemetrySubframeUrl: () => false,
+    checkTabUrlAllowed: () => ({ allowed: true, reason: '' }),
+    runHudScriptSafe: async () => null // Simulate script injection timeout!
+  });
+  const timeoutVerdict = await runInspectTimeout(404);
+  assert.equal(timeoutVerdict.allowed, false, 'inspectEmbeddedFramesSafety must fail-closed when script execution times out');
+
+  // 4. Nested `redirect_uri` callback URLs, semicolon-joined high-entropy tokens, and multi-`#` fragments are scrubbed across guardrails, SW & playbook
+  const extHelperMatch = swSource.match(
+    /const CHECKOUT_SEGMENT_RX =[\s\S]*?function canonicalizeRouteForGuardrail[\s\S]*?\n\}/
+  );
+  const extRedactorMatch = swSource.match(
+    /const LOCAL_AUDIT_SENSITIVE_PARAM_RX =[\s\S]*?function redactUrlsInTextLocal[\s\S]*?\n\}/
+  );
+  const extVm = vm.createContext({ URL, decodeURIComponent, encodeURIComponent });
+  vm.runInContext(`${extHelperMatch[0]}\n${extRedactorMatch[0]}`, extVm);
+
+  for (const [trickyUrl, secretPiece] of [
+    [
+      'https://sso.example.com/oauth/authorize?redirect_uri=https%3A%2F%2Fseller.example.com%2Fcb%3Faccess_token%3DCALLBACK_SECRET_777',
+      'CALLBACK_SECRET_777'
+    ],
+    ['https://app.example.com/#tab=1#%74oken=MULTI_HASH_SECRET_888', 'MULTI_HASH_SECRET_888'],
+    [
+      'https://app.example.com/#tab=1#r=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0',
+      'eyJhbGci'
+    ],
+    ['https://app.example.com/verify?v=AbCdEfGhIjKlMnOpQrSt;UvWxYz0123456789abcdef', 'UvWxYz0123456789abcdef']
+  ]) {
+    assert.equal(redactUrlForAudit(trickyUrl).includes(secretPiece), false, `guardrails leaked ${secretPiece}`);
+    assert.equal(extVm.redactAuditUrl(trickyUrl).includes(secretPiece), false, `SW leaked ${secretPiece}`);
+  }
+  assert.equal(
+    sanitizeRouteUrl(
+      'https://sso.example.com/oauth/authorize?redirect_uri=https%3A%2F%2Fseller.example.com%2Fcb%3Faccess_token%3DCALLBACK_SECRET_777&lang=zh'
+    ).includes('CALLBACK_SECRET_777'),
+    false,
+    'Playbook sanitizeRouteUrl must strip nested redirect_uri callback params'
+  );
+
+  // 5. Web Component `<slot>` projected label (`<x-field><span slot="label">短信验证码</span></x-field>`) blocks automated typing!
+  const typeGuardMatch = swSource.match(
+    /if \(!el\) return \{ ok: false, error: `Input element not found: \$\{tgt\}` \};\s*(const elStyle = window\.getComputedStyle\(el\);[\s\S]*?return \{\s*ok: false,\s*error:\s*'\[GUARDRAIL\] Automated typing into password[\s\S]*?\};\s*\})/
+  );
+  assert.ok(typeGuardMatch);
+  const evalTypeSlot = vm.runInNewContext(
+    `(function(el, outerMatchedEl, document, window, HTMLInputElement) { ${typeGuardMatch[1]} return { ok: true }; })`
+  );
+  class MockInput7 {}
+  const projectedSlotEl = {
+    assignedNodes: () => [{ textContent: '短信验证码' }]
+  };
+  const shadowInnerLabel = {
+    textContent: '', // Per W3C DOM spec, `<label><slot></slot></label>.textContent` is ""!
+    querySelectorAll: (sel) => (sel === 'slot' ? [projectedSlotEl] : [])
+  };
+  const slottedInput = Object.assign(new MockInput7(), {
+    tagName: 'INPUT',
+    type: 'text',
+    id: '',
+    maxLength: -1,
+    labels: [shadowInnerLabel],
+    previousElementSibling: null,
+    parentElement: null,
+    closest: () => null,
+    getRootNode: () => ({}),
+    getAttribute: () => ''
+  });
+  assert.equal(
+    evalTypeSlot(
+      slottedInput,
+      slottedInput,
+      { getElementById: () => null },
+      { getComputedStyle: () => ({ webkitTextSecurity: 'none', getPropertyValue: () => 'none' }) },
+      MockInput7
+    ).ok,
+    false,
+    'Must block OTP input labelled via Web Component <slot> assignedNodes'
+  );
+
+  // 6. CLI rejects invalid `--tab abc` immediately instead of serializing `NaN -> null` and drifting to sole shared tab
+  const badTabRun = spawnSync(process.execPath, [cliPath, 'click', '0', '--tab', 'abc'], {
+    encoding: 'utf8',
+    timeout: 3000
+  });
+  assert.notEqual(badTabRun.status, 0);
+  assert.match(badTabRun.stderr + badTabRun.stdout, /Invalid --tab value/);
+
+  // 7. Multi-tab `done` without explicit `tabId` closes temporary worker tabs while preserving user-shared tabs!
+  const doneBlockMatch = swSource.match(
+    /if \(method === 'done'\) \{([\s\S]*?)\n  \}\n\n  const entry = resolveTargetEntry\(params\.tabId\);/
+  );
+  assert.ok(doneBlockMatch, 'Must handle method==="done" before resolveTargetEntry');
+  const multiManaged = new Map([
+    [10, { tabId: 10, substate: 'shared', paused: false, uiMode: 'working', activity: 'Active' }],
+    [20, { tabId: 20, substate: 'worker', paused: false, uiMode: 'working', activity: 'Active' }],
+    [30, { tabId: 30, substate: 'worker', paused: false, uiMode: 'working', activity: 'Active' }]
+  ]);
+  const removedWorkerIds = [];
+  const runMultiDone = vm.runInNewContext(
+    `(async function(method, params) { if (method === 'done') { ${doneBlockMatch[1]} } })`,
+    {
+      managedTabs: multiManaged,
+      resolveTargetEntry: () => {
+        throw new Error('Should not call resolveTargetEntry when tabId is omitted');
+      },
+      pollHudUserEvents: async () => {},
+      assertStillActiveAndUnpaused: () => {},
+      stopCdpForTab: async () => {},
+      syncHud: async () => {},
+      syncLiveTabGroups: async () => {},
+      notifyPanelAndDaemon: () => {},
+      tr: () => ({ donePrefix: (s) => `Done: ${s}` }),
+      chrome: {
+        tabs: {
+          remove: async (id) => {
+            removedWorkerIds.push(id);
+          }
+        }
+      }
+    }
+  );
+  const doneOut = await runMultiDone('done', { summary: 'All done' });
+  assert.deepEqual(Array.from(doneOut.closedWorkerTabs), [20, 30]);
+  assert.deepEqual(Array.from(doneOut.preservedSharedTabs), [10]);
+  assert.deepEqual(removedWorkerIds, [20, 30]);
+  assert.equal(multiManaged.has(10), true, 'Shared tab 10 must remain open and managed');
+  assert.equal(multiManaged.get(10).uiMode, 'shared');
+  assert.equal(multiManaged.has(20), false);
 });

@@ -16,7 +16,9 @@ let lastSpawnAt = 0;
 const SPAWN_COOLDOWN_MS = 15000;
 
 function readLocalToken() {
-  if (process.env.CHROME_LIVE_TOKEN) return process.env.CHROME_LIVE_TOKEN.trim();
+  if (process.env.CHROME_LIVE_TOKEN && process.env.CHROME_LIVE_TOKEN.trim().length >= 16) {
+    return process.env.CHROME_LIVE_TOKEN.trim();
+  }
   const homeDir = process.env.CHROME_LIVE_HOME || path.join(os.homedir(), '.chrome-live-antigravity');
   const tokenPath = path.join(homeDir, 'auth.token');
   try {
@@ -242,7 +244,13 @@ async function handleAction(data = {}) {
     return { ok: false, error: `Unsupported action: ${cmd}` };
   }
   const params = {};
-  if (data.tabId !== undefined && data.tabId !== '') params.tabId = Number(data.tabId);
+  if (data.tabId !== undefined && data.tabId !== null && data.tabId !== '') {
+    const parsedTab = typeof data.tabId === 'number' ? data.tabId : /^\d+$/.test(String(data.tabId).trim()) ? Number.parseInt(String(data.tabId).trim(), 10) : Number.NaN;
+    if (!Number.isSafeInteger(parsedTab) || parsedTab <= 0) {
+      return { ok: false, error: `Invalid tabId: ${data.tabId}` };
+    }
+    params.tabId = parsedTab;
+  }
   if (data.all !== undefined) params.all = Boolean(data.all);
   if (data.summary) params.summary = String(data.summary);
 

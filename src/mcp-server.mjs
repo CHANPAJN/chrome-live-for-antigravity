@@ -730,6 +730,11 @@ async function executeMonitorAppAction(args, callDaemon) {
 }
 
 async function invokeTool(toolName, args, callDaemon) {
+  if (args && typeof args === 'object' && args.tabId !== undefined) {
+    if (typeof args.tabId !== 'number' || !Number.isSafeInteger(args.tabId) || args.tabId <= 0) {
+      throw new Error(`Invalid tabId "${args.tabId}"; expected a positive integer`);
+    }
+  }
   switch (toolName) {
     case 'chrome_live_monitor':
     case 'chrome_live_workspace': {
