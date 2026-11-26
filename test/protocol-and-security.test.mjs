@@ -4545,6 +4545,16 @@ test('27. Top-50 security & real-world forum hardening: cloud metadata/0.0.0.0 S
   assert.match(hudSource, /reticle-svg/, 'Concentric optical reticle SVG class must be present');
   assert.match(hudSource, /reticle-spin/, 'Spinning optical reticle arc must be present');
   assert.match(swSource, /zh\(\?:\[-_\]\|\$\)/, 'Language detection must match both zh-CN and zh_CN UI locales');
+  assert.match(
+    swSource,
+    /injectImmediately:\s*true/,
+    'execSingleTargetBounded must inject immediately without blocking on slow image/CDN document_idle'
+  );
+  assert.match(
+    swSource,
+    /namedFrames\.size === 0\) return;/,
+    'collectTargetedNavigations must short-circuit full Shadow DOM scan when no named frames exist'
+  );
 });
 
 

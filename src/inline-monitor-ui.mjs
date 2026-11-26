@@ -811,9 +811,11 @@ export function buildInlineMonitorHtml() {
           primary = tabs.find((t) => t.tabId === selectedTabId) || null;
           if (!primary) {
             const relaySuccessor = tabs.find((t) => t.replacedTabId === selectedTabId) || null;
-            if (relaySuccessor) {
-              selectedTabId = relaySuccessor.tabId;
-              primary = relaySuccessor;
+            const nextWorker = !relaySuccessor ? (tabs.find((t) => t.substate === 'worker') || null) : null;
+            const successor = relaySuccessor || nextWorker;
+            if (successor) {
+              selectedTabId = successor.tabId;
+              primary = successor;
             }
           }
           // Do NOT silently jump to capturing another unrelated shared tab when the watched tab closes or is released
@@ -821,6 +823,13 @@ export function buildInlineMonitorHtml() {
         } else if (!pinnedTabClosed) {
           primary = tabs.find((t) => t.substate === 'shared') || tabs[0] || null;
           selectedTabId = primary ? primary.tabId : null;
+        } else {
+          const freshWorker = tabs.find((t) => t.substate === 'worker') || null;
+          if (freshWorker) {
+            primary = freshWorker;
+            selectedTabId = freshWorker.tabId;
+            pinnedTabClosed = false;
+          }
         }
         currentTab = primary;
 

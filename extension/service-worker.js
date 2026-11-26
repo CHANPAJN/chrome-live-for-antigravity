@@ -1205,7 +1205,11 @@ async function execSingleTargetBounded(targetSpec, restOpts, timeoutMs) {
   let timer = null;
   try {
     return await Promise.race([
-      chrome.scripting.executeScript({ target: targetSpec, ...restOpts }),
+      chrome.scripting.executeScript({
+        target: targetSpec,
+        injectImmediately: true,
+        ...restOpts
+      }),
       new Promise((resolve) => {
         timer = setTimeout(() => resolve(null), timeoutMs);
       })
@@ -1227,9 +1231,16 @@ async function runHudScriptSafe(tabId, opts, timeoutMs = 1200) {
 
   // Per-frame bounded execution when `allFrames: true`:
   // 1) Top-level main frame (`frameId: 0`) MUST succeed within `timeoutMs` (strict Fail-Closed if main page is hung).
+  //    Retry once after 180ms if caught mid-navigation document swap so transient SPA/route commits never false-detach.
   // 2) Cross-origin sub-frames (whose navigation URLs are already verified via C++ `webNavigation.getAllFrames` & `onBeforeNavigate`)
   //    each run with an isolated short timeout so a slow external ad `<iframe>` never times out and detaches a healthy main tab!
-  const mainRes = await execSingleTargetBounded({ tabId, frameIds: [0] }, restOpts, timeoutMs);
+  let mainRes = await execSingleTargetBounded({ tabId, frameIds: [0] }, restOpts, timeoutMs);
+  if ((!Array.isArray(mainRes) || mainRes.length === 0) && timeoutMs >= 450) {
+    await new Promise((r) => setTimeout(r, 180));
+    const tRetry = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tRetry || tRetry.discarded || tRetry.status === 'unloaded') return null;
+    mainRes = await execSingleTargetBounded({ tabId, frameIds: [0] }, restOpts, Math.max(300, timeoutMs - 200));
+  }
   if (!Array.isArray(mainRes) || mainRes.length === 0) {
     return null;
   }
@@ -2282,7 +2293,7 @@ async function inspectEmbeddedFramesSafety(tabId) {
         };
         const seenNavDocs = new Set();
         const collectTargetedNavigations = (root, depth = 0) => {
-          if (!root || depth > 6) return;
+          if (!root || depth > 6 || namedFrames.size === 0) return;
           if (root.nodeType === 9) {
             if (seenNavDocs.has(root)) return;
             seenNavDocs.add(root);
