@@ -75,53 +75,45 @@ function roundedBoxSdf(nx, ny, halfSize, radius) {
 }
 
 function samplePoint(nx, ny) {
-  // Normalized coordinates nx, ny in [-1, 1] — Full-Bleed Enlarged Viewfinder Tally Icon
+  // Normalized coordinates nx, ny in [-1, 1] — White Porcelain Dual-Arc Broadcast Lens Icon
   const bgDist = roundedBoxSdf(nx, ny, 0.8869, 0.24);
-  const fullDist = roundedBoxSdf(nx, ny, 0.96, 0.24);
+  const fullDist = roundedBoxSdf(nx, ny, 0.94, 0.24);
   if (fullDist > 0) {
     return [0, 0, 0, 0];
   }
 
-  // Crisp white porcelain surface (#ffffff) with bold contrast border
+  // Clean white porcelain surface (#ffffff -> #f8fafc) with crisp slate border
   const t = (nx + ny + 2) / 4;
-  let r = Math.round(255 - t * 4);
-  let g = Math.round(255 - t * 3);
-  let b = Math.round(255 - t * 1);
+  let r = Math.round(255 - t * 5);
+  let g = Math.round(255 - t * 4);
+  let b = Math.round(255 - t * 2);
 
-  if (fullDist > -0.08 && bgDist > -0.16) {
-    r = 168;
-    g = 184;
-    b = 204;
+  if (fullDist > -0.075 && bgDist > -0.15) {
+    r = 176;
+    g = 190;
+    b = 210;
   }
 
-  const ax = Math.abs(nx);
-  const ay = Math.abs(ny);
-  const distCenter = Math.max(ax, ay);
+  const distCenter = Math.hypot(nx, ny);
 
-  // Bold enlarged corner viewfinder brackets in Prussian blue (#2563eb)
+  // Bold Prussian-blue dual-arc broadcast ring (#2563eb)
   const ringDist = Math.abs(distCenter - 0.5017);
-  const outerBracket = Math.abs(distCenter - 0.62);
   const angle = Math.atan2(ny, nx);
-  const onDiagonalArm = ax >= 0.28 && ay >= 0.28 && Math.abs(Math.sin(angle - 0.6589)) <= 1.0;
-  if (onDiagonalArm && (outerBracket < 0.095 || ringDist < 0.03)) {
-    r = 37;
-    g = 99;
-    b = 235;
+  const inGap = Math.abs(Math.sin(angle - 0.6589)) < 0.22;
+  if (!inGap && ringDist < 0.105) {
+    const glow = 1 - ringDist / 0.105;
+    const mix = Math.min(1, glow * 1.45);
+    r = Math.round(r * (1 - mix) + 37 * mix);
+    g = Math.round(g * (1 - mix) + 99 * mix);
+    b = Math.round(b * (1 - mix) + 235 * mix);
   }
 
-  // Enlarged center solid tally core (#2563eb)
-  const coreDist = roundedBoxSdf(nx, ny, 0.27, 0.08);
+  // Solid Prussian-blue center lens core (#1d4ed8)
   if (distCenter < 0.2335) {
     const coreMix = Math.min(1, (0.2335 - distCenter) / 0.06);
-    if (coreDist <= 0) {
-      r = Math.round(r * (1 - coreMix) + 37 * coreMix);
-      g = Math.round(g * (1 - coreMix) + 99 * coreMix);
-      b = Math.round(b * (1 - coreMix) + 235 * coreMix);
-    }
-  } else if (coreDist <= 0) {
-    r = 37;
-    g = 99;
-    b = 235;
+    r = Math.round(r * (1 - coreMix) + 29 * coreMix);
+    g = Math.round(g * (1 - coreMix) + 78 * coreMix);
+    b = Math.round(b * (1 - coreMix) + 216 * coreMix);
   }
 
   return [r, g, b, 255];

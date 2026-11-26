@@ -12,7 +12,7 @@
     "128": "icons/icon128.png"
   },
   "action": {
-    "default_title": "Click to Share / Release Tab (Right-click for Console)",
+    "default_title": "Open Chrome Live Console",
     "default_icon": {
       "16": "icons/icon16.png",
       "24": "icons/icon24.png",

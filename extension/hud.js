@@ -4,7 +4,7 @@
   if (window.top !== window) return;
 
   const REGISTRY_SYMBOL = '__chromeLiveHudController__';
-  const CURRENT_HUD_REV = 15;
+  const CURRENT_HUD_REV = 16;
   const HOST_Z_MARKER = '2147483647';
 
   function isExtensionContextValid() {
@@ -52,8 +52,8 @@
   } catch {}
 
   const HOLD_UNLOCK_MS = 3000;
-  const FOREGROUND_AUTO_COLLAPSE_MS = 10000; // Wait 10s while tab is in foreground before gently tucking left
-  const DEFAULT_BOTTOM_OFFSET_PX = 84; // Sits cleanly above inline monitor's bottom-left `LIVE · 0 Token` chip
+  const FOREGROUND_AUTO_COLLAPSE_MS = 10000; // Wait full 10s in foreground before gently tucking left
+  const DEFAULT_BOTTOM_OFFSET_PX = 84; // Clear of inline screencast bottom-left `LIVE · 0 Token` chip
   const RING_CIRCUMFERENCE = 2 * Math.PI * 20; // r = 20 -> ~125.66
   // Original rounded collaboration dart silhouette (zero overlap with classic OS arrow paths)
   const COLLAB_DART_PATH =
@@ -62,14 +62,14 @@
   const DICT = {
     zh: {
       dragTip: '上下拖动调整高度，或拖至左/右边缘贴壁停靠',
-      ready: '按住左键 3 秒解锁',
+      ready: '按住左键3秒解锁',
       doneText: '任务已完成',
       pausedByUser: '已解锁 · 手动操控中',
       resumed: '已恢复防误触锁定',
       badgeLive: 'LIVE',
       badgeHold: 'HOLD',
       badgeShared: 'LIVE',
-      pauseTip: '点击立即解锁切为手动（或在页面按住左键满 3 秒解锁）',
+      pauseTip: '点击切换手动模式（或在页面按住左键满3秒解锁）',
       resumeTip: '点击恢复 AI 防误触锁定操控',
       peekTip: '移入或点击向右展开控制栏',
       disconnectLabel: '断开',
@@ -77,7 +77,7 @@
       confirmAsk: '断开此页受控？',
       cancelBtn: '取消',
       disconnectBtn: '确认断开',
-      lockedTapHint: '已防误触锁定 · 按住左键 3 秒解锁',
+      lockedTapHint: '已防误触锁定 · 按住左键3秒解锁',
       holdingHint: '继续按住解锁',
       cursorClick: '点击',
       cursorType: '输入',
@@ -121,8 +121,8 @@
       pointer-events: none;
       font-family: "Microsoft YaHei UI", "PingFang SC", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
       --spring-width: 440ms linear(0, 0.4479, 0.8864, 1.055, 1.018, 0.998, 1);
-      --collapse-slow: 900ms cubic-bezier(0.22, 1, 0.36, 1);
-      --spring-pop: 260ms cubic-bezier(0.22, 1, 0.36, 1);
+      --collapse-slow: 880ms cubic-bezier(0.22, 1, 0.36, 1);
+      --spring-pop: 240ms cubic-bezier(0.22, 1, 0.36, 1);
     }
 
     /* Original Circle-Slash Anti-Misclick Lock Shield */
@@ -139,24 +139,24 @@
       pointer-events: auto;
     }
 
-    /* Large 52px 3-Second Hold-to-Unlock Circular Ring Progress Indicator */
+    /* 3-Second Hold-to-Unlock Circular Ring Progress Indicator */
     .hold-badge {
       position: fixed;
       left: 0;
       top: 0;
       translate: -50% -124%;
-      scale: 0.9;
+      scale: 0.92;
       display: inline-flex;
       align-items: center;
-      gap: 13px;
-      padding: 10px 22px 10px 12px;
-      border-radius: 13px;
+      gap: 12px;
+      padding: 9px 20px 9px 11px;
+      border-radius: 12px;
       background: #ffffff;
-      border: 1.5px solid #cbd5e1;
-      box-shadow: 0 14px 34px rgba(15, 23, 42, 0.22), 0 3px 8px rgba(15, 23, 42, 0.08);
+      border: 1px solid #cbd5e1;
+      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.18), 0 2px 6px rgba(15, 23, 42, 0.08);
       color: #18181b;
-      font-size: 16px;
-      font-weight: 600;
+      font-size: 15px;
+      font-weight: 500;
       pointer-events: none;
       opacity: 0;
       transition: opacity 0.14s ease, scale var(--spring-pop);
@@ -168,33 +168,33 @@
     }
     .hold-ring-wrap {
       position: relative;
-      width: 52px;
-      height: 52px;
+      width: 46px;
+      height: 46px;
       display: grid;
       place-items: center;
       flex-shrink: 0;
     }
     .hold-ring-svg {
-      width: 52px;
-      height: 52px;
+      width: 46px;
+      height: 46px;
       transform: rotate(-90deg);
     }
     .hold-ring-track {
-      fill: rgba(37, 99, 235, 0.07);
-      stroke: #dbeafe;
-      stroke-width: 3.9;
+      fill: rgba(37, 99, 235, 0.06);
+      stroke: #e2e8f0;
+      stroke-width: 3.8;
     }
     .hold-ring-bar {
       fill: none;
       stroke: #2563eb;
-      stroke-width: 3.9;
+      stroke-width: 3.8;
       stroke-linecap: round;
       stroke-dasharray: 125.66;
       stroke-dashoffset: 125.66;
     }
     .hold-sec-num {
       position: absolute;
-      font-size: 18px;
+      font-size: 16.5px;
       font-weight: 700;
       font-variant-numeric: tabular-nums;
       color: #1d4ed8;
@@ -247,22 +247,22 @@
       100% { transform: translateX(285%); }
     }
 
-    /* High-Visibility 60px Left-Edge Dock Positioned Above Bottom-Left Screencast Chip (bottom: 84px) */
+    /* 54px Left-Edge Tally Dock Above Screencast Chip (bottom: 84px) */
     .edge-tally-dock {
       position: fixed;
       left: 0;
       bottom: 84px;
-      height: 60px;
-      max-width: calc(100vw - 16px);
+      height: 54px;
+      max-width: calc(100vw - 20px);
       display: inline-flex;
       align-items: stretch;
       background: #ffffff;
       color: #18181b;
-      border: 1.5px solid #cbd5e1;
+      border: 1px solid #cbd5e1;
       border-left: none;
-      border-radius: 0 14px 14px 0;
-      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.16), 0 2px 6px rgba(15, 23, 42, 0.08);
-      font-size: 16.5px;
+      border-radius: 0 12px 12px 0;
+      box-shadow: 0 10px 28px rgba(15, 23, 42, 0.14), 0 2px 6px rgba(15, 23, 42, 0.06);
+      font-size: 15px;
       line-height: 1;
       pointer-events: auto;
       user-select: none;
@@ -276,9 +276,9 @@
     .edge-tally-dock[data-side="right"] {
       left: auto;
       right: 0;
-      border-left: 1.5px solid #cbd5e1;
+      border-left: 1px solid #cbd5e1;
       border-right: none;
-      border-radius: 14px 0 0 14px;
+      border-radius: 12px 0 0 12px;
       flex-direction: row-reverse;
     }
     .edge-tally-dock[data-hidden="true"] {
@@ -287,11 +287,11 @@
       pointer-events: none;
     }
     .edge-tally-dock[data-pressing="true"] {
-      scale: 0.98;
-      box-shadow: 0 16px 34px rgba(37, 99, 235, 0.25);
+      scale: 0.985;
+      box-shadow: 0 14px 32px rgba(15, 23, 42, 0.22);
     }
 
-    /* Always-Visible Large Head Badge: 32px Circle-Lock Icon + Bold 17.5px LIVE / HOLD */
+    /* Always-Visible Solid Tally Head: Precision 28px Circle-Padlock + Bold LIVE / HOLD */
     .tally-head-cell {
       display: inline-flex;
       align-items: stretch;
@@ -303,11 +303,11 @@
       border: none;
       margin: 0;
       height: 100%;
-      padding: 0 22px 0 18px;
+      padding: 0 20px 0 16px;
       background: #2563eb;
       color: #ffffff;
-      font: 700 17.5px/1 "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
-      letter-spacing: 0.04em;
+      font: 700 16px/1 "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+      letter-spacing: 0.05em;
       font-variant-numeric: tabular-nums;
       cursor: pointer;
       display: inline-flex;
@@ -317,7 +317,7 @@
       transition: background-color 160ms ease, filter 160ms ease;
     }
     .tally-mode-btn:hover {
-      filter: brightness(1.07);
+      filter: brightness(1.06);
     }
     .tally-mode-btn:active {
       filter: brightness(0.95);
@@ -332,90 +332,68 @@
       background: #dc2626;
     }
     .tally-lock-svg {
-      width: 32px;
-      height: 32px;
+      width: 28px;
+      height: 28px;
       display: block;
       flex-shrink: 0;
     }
 
-    /* Smooth Collapsible Drawer Shell (Tucks gently toward left edge after 10s in foreground) */
-    .drawer-shell {
-      display: inline-flex;
-      align-items: stretch;
+    /* Zero-Truncation CSS Grid 1fr <-> 0fr Collapsible Drawer (Never clips buttons when text grows!) */
+    .drawer-grid {
+      display: grid;
+      grid-template-columns: 1fr;
       height: 100%;
-      overflow: hidden;
-      width: var(--drawer-w, auto);
       opacity: 1;
       transition:
-        width var(--collapse-slow),
-        opacity 560ms ease;
+        grid-template-columns var(--collapse-slow),
+        opacity 480ms ease;
     }
-    .edge-tally-dock[data-collapsed="true"] .drawer-shell {
-      width: 0px !important;
+    .edge-tally-dock[data-collapsed="true"] .drawer-grid {
+      grid-template-columns: 0fr;
       opacity: 0;
       pointer-events: none;
     }
-
-    /* Obvious White Peek Ear When Tucked Left: Shows Clear Expand Chevron */
-    .peek-ear {
-      display: none;
+    .drawer-inner {
+      min-width: 0;
+      overflow: hidden;
+      display: flex;
       align-items: center;
-      justify-content: center;
-      width: 30px;
       height: 100%;
-      background: #ffffff;
-      color: #2563eb;
-      cursor: pointer;
-      flex-shrink: 0;
-      transition: background-color 150ms ease, color 150ms ease;
-    }
-    .peek-ear:hover {
-      background: #eff6ff;
-    }
-    .edge-tally-dock[data-collapsed="true"] .peek-ear {
-      display: inline-flex;
-    }
-    .peek-ear svg {
-      width: 20px;
-      height: 20px;
-      display: block;
-      transition: transform 200ms ease;
-    }
-    .edge-tally-dock[data-side="right"] .peek-ear svg {
-      transform: rotate(180deg);
     }
 
     .drawer-body {
       display: inline-flex;
       align-items: center;
-      gap: 16px;
+      gap: 14px;
       height: 100%;
-      padding: 0 16px 0 20px;
+      padding: 0 14px 0 18px;
       white-space: nowrap;
       background: #ffffff;
+      flex-shrink: 0;
     }
     .drag-grip {
       display: inline-flex;
       align-items: center;
       height: 100%;
       cursor: grab;
-      min-width: 0;
     }
     .drag-grip:active {
       cursor: grabbing;
     }
+    /* Strict OpenDesign Rule: Clean Neutral Charcoal Text (#18181b), Regular/500 Weight, Never Gaudy Blue Bold! */
     .status-label {
       color: #18181b;
-      font-size: 16.5px;
-      font-weight: 500;
-      max-width: 310px;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      font-size: 15px;
+      font-weight: 400;
+      letter-spacing: 0.01em;
       white-space: nowrap;
     }
-    .status-label[data-alert="true"] {
-      color: #1d4ed8;
-      font-weight: 600;
+
+    .v-divider {
+      width: 1px;
+      height: 20px;
+      background: #e4e4e7;
+      flex-shrink: 0;
     }
 
     .action-cluster {
@@ -427,16 +405,17 @@
     .flat-btn {
       appearance: none;
       border: 1px solid #d4d4d8;
-      border-radius: 8px;
-      height: 38px;
-      padding: 0 16px;
+      border-radius: 7px;
+      height: 34px;
+      padding: 0 14px;
       background: #f8fafc;
-      color: #3f3f46;
-      font: 500 14.5px/1 "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+      color: #27272a;
+      font: 400 14px/1 "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
       cursor: pointer;
       display: inline-flex;
       align-items: center;
       justify-content: center;
+      flex-shrink: 0;
       transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease;
     }
     .flat-btn:hover {
@@ -465,6 +444,45 @@
       color: #ffffff;
     }
 
+    /* Smoothly Revealed White Peek Ear When Tucked Left (Zero display:none jump!) */
+    .peek-ear {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 0px;
+      height: 100%;
+      overflow: hidden;
+      opacity: 0;
+      background: #ffffff;
+      color: #52525b;
+      cursor: pointer;
+      flex-shrink: 0;
+      pointer-events: none;
+      transition:
+        width var(--collapse-slow),
+        opacity 480ms ease,
+        background-color 150ms ease,
+        color 150ms ease;
+    }
+    .edge-tally-dock[data-collapsed="true"] .peek-ear {
+      width: 30px;
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .peek-ear:hover {
+      background: #f4f4f5;
+      color: #18181b;
+    }
+    .peek-ear svg {
+      width: 18px;
+      height: 18px;
+      display: block;
+      flex-shrink: 0;
+    }
+    .edge-tally-dock[data-side="right"] .peek-ear svg {
+      transform: rotate(180deg);
+    }
+
     .hidden-el {
       display: none !important;
     }
@@ -477,10 +495,10 @@
     }
     .coord-ring {
       position: absolute;
-      width: 30px;
-      height: 30px;
-      margin-left: -15px;
-      margin-top: -15px;
+      width: 28px;
+      height: 28px;
+      margin-left: -14px;
+      margin-top: -14px;
       border-radius: 50%;
       border: 2px solid #2563eb;
       background: rgba(37, 99, 235, 0.08);
@@ -519,8 +537,8 @@
       transform: scale(0.84);
     }
     .collab-dart-svg {
-      width: 28px;
-      height: 28px;
+      width: 26px;
+      height: 26px;
       display: block;
       filter: drop-shadow(0 2px 5px rgba(15, 23, 42, 0.28));
       transform: translate(-2px, -2px);
@@ -533,23 +551,23 @@
     }
     .collab-cursor-pill {
       position: absolute;
-      left: 18px;
-      top: 17px;
-      padding: 3.5px 10px;
-      border-radius: 6px;
+      left: 17px;
+      top: 16px;
+      padding: 3px 9px;
+      border-radius: 5px;
       background: #ffffff;
-      border: 1px solid #2563eb;
-      box-shadow: 0 3px 10px rgba(15, 23, 42, 0.16);
-      color: #1d4ed8;
-      font-size: 13px;
-      font-weight: 600;
+      border: 1px solid #cbd5e1;
+      box-shadow: 0 3px 10px rgba(15, 23, 42, 0.14);
+      color: #18181b;
+      font-size: 12.5px;
+      font-weight: 500;
       white-space: nowrap;
     }
 
     @media (prefers-reduced-motion: reduce) {
       :host {
         --spring-width: 160ms ease;
-        --collapse-slow: 240ms ease;
+        --collapse-slow: 220ms ease;
         --spring-pop: 140ms ease;
       }
       .director-topline[data-state="working"] .director-topline-runner {
@@ -566,11 +584,48 @@
     }
   `;
 
-  // Crisp 24x24 Enlarged Circle-Lock SVG Paths (Rendered at 32x32px: Bold Circle + Clear Padlock)
-  const LOCK_CLOSED_SVG_PATH =
-    'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20ZM9.2 10.6V8.7a2.8 2.8 0 0 1 5.6 0v1.9M8 10.6h8a1 1 0 0 1 1 1v4.8a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1v-4.8a1 1 0 0 1 1-1Z';
-  const LOCK_OPEN_SVG_PATH =
-    'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20ZM9.2 10.6V8.4a2.8 2.8 0 0 1 5.2-1.4M8 10.6h8a1 1 0 0 1 1 1v4.8a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1v-4.8a1 1 0 0 1 1-1Z';
+  function buildLockIconNodes(svgNs, isOpen) {
+    // Precision 24x24 Circle-Padlock: crisp outer ring + solid rounded lock body + shackle + central keyhole dot
+    const frag = document.createDocumentFragment();
+
+    const outerRing = document.createElementNS(svgNs, 'circle');
+    outerRing.setAttribute('cx', '12');
+    outerRing.setAttribute('cy', '12');
+    outerRing.setAttribute('r', '10.2');
+    outerRing.setAttribute('fill', 'rgba(255, 255, 255, 0.14)');
+    outerRing.setAttribute('stroke', 'currentColor');
+    outerRing.setAttribute('stroke-width', '1.9');
+
+    const shackle = document.createElementNS(svgNs, 'path');
+    shackle.setAttribute(
+      'd',
+      isOpen
+        ? 'M9.3 10.8V8.3a2.7 2.7 0 0 1 5.0-1.4'
+        : 'M9.3 10.8V8.5a2.7 2.7 0 0 1 5.4 0v2.3'
+    );
+    shackle.setAttribute('fill', 'none');
+    shackle.setAttribute('stroke', 'currentColor');
+    shackle.setAttribute('stroke-width', '2.0');
+    shackle.setAttribute('stroke-linecap', 'round');
+
+    const bodyRect = document.createElementNS(svgNs, 'rect');
+    bodyRect.setAttribute('x', '7.5');
+    bodyRect.setAttribute('y', '10.6');
+    bodyRect.setAttribute('width', '9');
+    bodyRect.setAttribute('height', '6.8');
+    bodyRect.setAttribute('rx', '1.6');
+    bodyRect.setAttribute('fill', 'currentColor');
+
+    const keyhole = document.createElementNS(svgNs, 'circle');
+    keyhole.setAttribute('cx', '12');
+    keyhole.setAttribute('cy', '14');
+    keyhole.setAttribute('r', '1.15');
+    keyhole.setAttribute('fill', isOpen ? '#d97706' : '#2563eb');
+    keyhole.setAttribute('data-keyhole', 'true');
+
+    frag.append(outerRing, shackle, bodyRect, keyhole);
+    return frag;
+  }
 
   class ChromeLiveHud {
     constructor() {
@@ -586,8 +641,13 @@
       this._wasVisible = false;
       this._pointerInsideDock = false;
       this._collapsed = false;
+      this._lastRenderedLockOpen = null;
+      this._lastRenderedLockBg = '';
       const defaultLang = /^zh\b/i.test(navigator.language || '') ? 'zh' : 'en';
-      const initSide = inheritedSide === 'right' || inheritedSide === 'bottom-right' || inheritedSide === 'top-right' ? 'right' : 'left';
+      const initSide =
+        inheritedSide === 'right' || inheritedSide === 'bottom-right' || inheritedSide === 'top-right'
+          ? 'right'
+          : 'left';
       const initBottomPx =
         typeof inheritedBottomPx === 'number' && Number.isFinite(inheritedBottomPx)
           ? Math.max(16, inheritedBottomPx)
@@ -633,7 +693,7 @@
       }
     }
 
-    // Expand badge & start 10-second foreground countdown (stays open while tab is in background!)
+    // Expand badge & start 10-second foreground-only countdown (never collapses while tab is in background!)
     _expandAndArmForegroundCollapse() {
       this._collapsed = false;
       this._clearFgCollapseTimer();
@@ -662,6 +722,7 @@
 
     _mount() {
       const svgNs = 'http://www.w3.org/2000/svg';
+      this._svgNs = svgNs;
       this.hostEl = document.createElement('div');
       this.hostEl.setAttribute(
         'style',
@@ -703,7 +764,7 @@
       cursorInner.append(dartSvg, this.cursorPillEl);
       this.cursorEl.appendChild(cursorInner);
 
-      // Enlarged 52px 3-second left-click hold unlock circular ring indicator
+      // 3-second left-click hold unlock circular ring indicator
       this.holdBadgeEl = document.createElement('div');
       this.holdBadgeEl.className = 'hold-badge';
       const ringWrap = document.createElement('div');
@@ -732,7 +793,7 @@
       this.holdTextEl.textContent = this._t().holdingHint;
       this.holdBadgeEl.append(ringWrap, this.holdTextEl);
 
-      // High-Visibility 60px Left-Edge Tally Badge (`bottom: 84px`, clear of inline `LIVE · 0 Token` chip)
+      // 54px Left-Edge Tally Badge with CSS Grid 1fr <-> 0fr Zero-Truncation Drawer
       this.capsuleEl = document.createElement('div');
       this.capsuleEl.className = 'edge-tally-dock';
       this.capsuleEl.dataset.hidden = 'true';
@@ -746,26 +807,23 @@
       this.pauseBtn.type = 'button';
       this.pauseBtn.className = 'tally-mode-btn';
 
-      const lockSvg = document.createElementNS(svgNs, 'svg');
-      lockSvg.setAttribute('viewBox', '0 0 24 24');
-      lockSvg.setAttribute('fill', 'none');
-      lockSvg.setAttribute('stroke', 'currentColor');
-      lockSvg.setAttribute('stroke-width', '2.15');
-      lockSvg.setAttribute('stroke-linecap', 'round');
-      lockSvg.setAttribute('stroke-linejoin', 'round');
-      lockSvg.setAttribute('class', 'tally-lock-svg');
-      this.lockIconPath = document.createElementNS(svgNs, 'path');
-      this.lockIconPath.setAttribute('d', LOCK_CLOSED_SVG_PATH);
-      lockSvg.appendChild(this.lockIconPath);
+      this.lockSvgEl = document.createElementNS(svgNs, 'svg');
+      this.lockSvgEl.setAttribute('viewBox', '0 0 24 24');
+      this.lockSvgEl.setAttribute('class', 'tally-lock-svg');
+      this.lockSvgEl.appendChild(buildLockIconNodes(svgNs, false));
+      this._lastRenderedLockOpen = false;
+      this._lastRenderedLockBg = '#2563eb';
 
       this.tallyTextSpan = document.createElement('span');
       this.tallyTextSpan.textContent = this._t().badgeLive;
-      this.pauseBtn.append(lockSvg, this.tallyTextSpan);
+      this.pauseBtn.append(this.lockSvgEl, this.tallyTextSpan);
       this.headCellEl.appendChild(this.pauseBtn);
 
-      // Collapsible Right Drawer Shell
-      this.drawerShellEl = document.createElement('div');
-      this.drawerShellEl.className = 'drawer-shell';
+      // CSS Grid 1fr <-> 0fr Collapsible Drawer
+      this.drawerGridEl = document.createElement('div');
+      this.drawerGridEl.className = 'drawer-grid';
+      this.drawerInnerEl = document.createElement('div');
+      this.drawerInnerEl.className = 'drawer-inner';
 
       this.drawerEl = document.createElement('div');
       this.drawerEl.className = 'drawer-body';
@@ -778,6 +836,9 @@
       this.labelEl.className = 'status-label';
       this.labelEl.textContent = this._t().ready;
       this.gripEl.appendChild(this.labelEl);
+
+      const dividerEl = document.createElement('span');
+      dividerEl.className = 'v-divider';
 
       this.normalActionsEl = document.createElement('div');
       this.normalActionsEl.className = 'action-cluster';
@@ -804,10 +865,11 @@
       this.confirmDisconnectBtn.textContent = this._t().disconnectBtn;
 
       this.confirmActionsEl.append(this.cancelConfirmBtn, this.confirmDisconnectBtn);
-      this.drawerEl.append(this.gripEl, this.normalActionsEl, this.confirmActionsEl);
-      this.drawerShellEl.appendChild(this.drawerEl);
+      this.drawerEl.append(this.gripEl, dividerEl, this.normalActionsEl, this.confirmActionsEl);
+      this.drawerInnerEl.appendChild(this.drawerEl);
+      this.drawerGridEl.appendChild(this.drawerInnerEl);
 
-      // Obvious White Peek Ear with Chevron When Collapsed Left
+      // Smoothly Animated White Peek Ear When Tucked Left
       this.peekEarEl = document.createElement('div');
       this.peekEarEl.className = 'peek-ear';
       this.peekEarEl.title = this._t().peekTip;
@@ -815,7 +877,7 @@
       chevSvg.setAttribute('viewBox', '0 0 16 16');
       chevSvg.setAttribute('fill', 'none');
       chevSvg.setAttribute('stroke', 'currentColor');
-      chevSvg.setAttribute('stroke-width', '2.2');
+      chevSvg.setAttribute('stroke-width', '2.1');
       chevSvg.setAttribute('stroke-linecap', 'round');
       chevSvg.setAttribute('stroke-linejoin', 'round');
       const chevPath = document.createElementNS(svgNs, 'path');
@@ -823,7 +885,7 @@
       chevSvg.appendChild(chevPath);
       this.peekEarEl.appendChild(chevSvg);
 
-      this.capsuleEl.append(this.headCellEl, this.drawerShellEl, this.peekEarEl);
+      this.capsuleEl.append(this.headCellEl, this.drawerGridEl, this.peekEarEl);
 
       this.shadow.append(
         styleEl,
@@ -856,7 +918,7 @@
       this._state.confirmingDisconnect = false;
     }
 
-    _flashMessage(msg, durationMs = 2800) {
+    _flashMessage(msg, durationMs = 3500) {
       if (this._flashTimer) clearTimeout(this._flashTimer);
       this._state.flashText = msg;
       this._expandAndArmForegroundCollapse();
@@ -974,7 +1036,6 @@
         this._render();
       };
 
-      // Hover or touch immediately expands; leaving re-arms 10s foreground countdown
       const onDockEnter = (ev) => {
         if (ev && !ev.isTrusted) return;
         this._pointerInsideDock = true;
@@ -989,7 +1050,6 @@
         this._expandAndArmForegroundCollapse();
       };
 
-      // Pause 10s collapse countdown while tab is in background; start fresh 10s countdown when user brings tab to foreground!
       const onVisibilityChange = () => {
         if (selfDestructIfOrphan()) return;
         if (!this._state.visible) return;
@@ -1071,7 +1131,7 @@
         holdingPointerId = null;
         this._cancelHoldUnlock();
         if (elapsed < HOLD_UNLOCK_MS && this._state.mode === 'working') {
-          this._flashMessage(this._t().lockedTapHint, 2800);
+          this._flashMessage(this._t().lockedTapHint, 3500);
         }
       };
 
@@ -1093,7 +1153,6 @@
         }
       };
 
-      // Vertical drag to fine-tune height + snap left/right edge (default: left edge, bottom: 84px)
       let dragging = false;
       let dragPointerId = null;
       let dragStartX = 0;
@@ -1208,10 +1267,11 @@
         evClientX = typeof ev.clientX === 'number' ? ev.clientX : null;
         evClientY = typeof ev.clientY === 'number' ? ev.clientY : null;
         const isConfirming = Boolean(this._state.confirmingDisconnect);
+        const isCurrentlyCollapsed = this.capsuleEl.dataset.collapsed === 'true';
         const onPauseToggle =
           topTarget === this.pauseBtn || this.pauseBtn.contains(topTarget) || hitHudButton(this.pauseBtn, true);
         const onPeekEar =
-          this._collapsed &&
+          isCurrentlyCollapsed &&
           (topTarget === this.peekEarEl || this.peekEarEl.contains(topTarget) || hitHudButton(this.peekEarEl, true));
         const onActiveBtn = isConfirming
           ? onPauseToggle ||
@@ -1224,10 +1284,10 @@
             hitHudButton(this.confirmDisconnectBtn, true)
           : onPauseToggle ||
             onPeekEar ||
-            (!this._collapsed &&
+            (!isCurrentlyCollapsed &&
               (topTarget === this.closeBtn || this.closeBtn.contains(topTarget) || hitHudButton(this.closeBtn, true)));
         const onGrip =
-          !this._collapsed &&
+          !isCurrentlyCollapsed &&
           (topTarget === this.gripEl || this.gripEl.contains(topTarget) || hitHudBox(this.gripEl, this._state.visible));
         const onDockCard =
           topTarget === this.capsuleEl ||
@@ -1288,7 +1348,7 @@
             onPauseClick(ev);
           } else if (
             !isConfirming &&
-            !this._collapsed &&
+            !isCurrentlyCollapsed &&
             (topTarget === this.closeBtn || this.closeBtn.contains(topTarget) || hitHudButton(this.closeBtn, true))
           ) {
             ev._cliveHandled = true;
@@ -1397,10 +1457,24 @@
       });
     }
 
-    _syncDrawerNaturalWidth() {
-      const w = Math.ceil(this.drawerEl.offsetWidth || 0);
-      if (w > 0) {
-        this.capsuleEl.style.setProperty('--drawer-w', `${w}px`);
+    _syncLockIconGraphic(isOpen, effectiveMode) {
+      const keyholeColor =
+        effectiveMode === 'confirm'
+          ? '#dc2626'
+          : effectiveMode === 'paused'
+            ? '#d97706'
+            : effectiveMode === 'shared'
+              ? '#059669'
+              : '#2563eb';
+      if (this._lastRenderedLockOpen !== isOpen) {
+        this.lockSvgEl.replaceChildren(buildLockIconNodes(this._svgNs, isOpen));
+        this._lastRenderedLockOpen = isOpen;
+        this._lastRenderedLockBg = '';
+      }
+      if (this._lastRenderedLockBg !== keyholeColor) {
+        const kh = this.lockSvgEl.querySelector('[data-keyhole]');
+        if (kh) kh.setAttribute('fill', keyholeColor);
+        this._lastRenderedLockBg = keyholeColor;
       }
     }
 
@@ -1442,24 +1516,23 @@
       this.capsuleEl.style.bottom = `${this._state.bottomPx}px`;
       this.borderEl.dataset.state = this._state.mode;
 
+      const effectiveMode = this._state.confirmingDisconnect ? 'confirm' : this._state.mode;
       this.tallyTextSpan.textContent = isPaused
         ? t.badgeHold
         : this._state.mode === 'shared'
           ? t.badgeShared
           : t.badgeLive;
-      this.lockIconPath.setAttribute('d', isPaused ? LOCK_OPEN_SVG_PATH : LOCK_CLOSED_SVG_PATH);
+      this._syncLockIconGraphic(isPaused, effectiveMode);
       this.pauseBtn.title = isPaused ? t.resumeTip : t.pauseTip;
-      this.pauseBtn.dataset.mode = this._state.confirmingDisconnect ? 'confirm' : this._state.mode;
+      this.pauseBtn.dataset.mode = effectiveMode;
 
       if (this._state.confirmingDisconnect) {
         this.labelEl.textContent = t.confirmAsk;
-        this.labelEl.dataset.alert = 'false';
         this.normalActionsEl.classList.add('hidden-el');
         this.confirmActionsEl.classList.remove('hidden-el');
       } else {
         const displayStr = this._state.flashText || this._normalizeActivityText(this._state.activity);
         this.labelEl.textContent = displayStr;
-        this.labelEl.dataset.alert = String(Boolean(this._state.flashText));
         this.normalActionsEl.classList.remove('hidden-el');
         this.confirmActionsEl.classList.add('hidden-el');
       }
@@ -1470,9 +1543,6 @@
         this._expandAndArmForegroundCollapse();
       }
 
-      if (!this._collapsed) {
-        this._syncDrawerNaturalWidth();
-      }
       const effectiveCollapsed = Boolean(
         this._collapsed &&
           !this._pointerInsideDock &&

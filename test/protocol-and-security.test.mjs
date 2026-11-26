@@ -4524,19 +4524,20 @@ test('27. Top-50 security & real-world forum hardening: cloud metadata/0.0.0.0 S
   assert.match(swSource, /isPriorityOverlayControl/);
   assert.match(cliSource, /replace\(\/<\\\/\?untrusted_page_content\/gi/);
 
-  // 5. Verify bottom-left always-open tally HUD, original 3s hold-to-unlock ring & circle-lock cursor, and direct toolbar click coexistence
+  // 5. Verify bottom-left CSS-Grid zero-truncation tally HUD, 3s hold-to-unlock ring, numeric action badge & Side Panel console
   const hudSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'hud.js'), 'utf8');
   assert.equal(hudSource.includes('aura-border'), false, 'Four-sided blur glow border must be removed');
   assert.equal(hudSource.includes('island-shell'), false, 'Dynamic-island black pill must be removed');
   assert.match(hudSource, /edge-tally-dock/);
+  assert.match(hudSource, /drawer-grid/, 'CSS Grid 1fr<->0fr must be used so long text never truncates buttons');
   assert.match(hudSource, /director-topline/);
   assert.match(hudSource, /const HOLD_UNLOCK_MS = 3000;/, 'Original 3s hold-to-unlock duration must be preserved');
   assert.match(hudSource, /const FOREGROUND_AUTO_COLLAPSE_MS = 10000;/, '10s foreground-only gentle left-collapse timer must be preserved');
   assert.match(hudSource, /cursor:\s*not-allowed;/, 'Original circle-slash lock shield cursor must be preserved');
   assert.match(hudSource, /hold-ring-svg/, 'Original circular ring unlock progress SVG must be preserved');
   assert.match(hudSource, /const onEscKeyDown = \(ev\) => \{\s*if \(!ev \|\| !ev\.isTrusted\) return;/);
-  assert.match(swSource, /openPanelOnActionClick:\s*false/);
-  assert.match(swSource, /chrome\.action\.onClicked\.addListener/);
+  assert.match(swSource, /openPanelOnActionClick:\s*true/, 'Clicking toolbar icon must open Side Panel console');
+  assert.match(swSource, /setBadgeText\(\{ text: String\(Math\.min\(99, count\)\) \}\)/, 'Action badge must use compact numeric count so Chrome never clips 4-letter text');
 });
 
 

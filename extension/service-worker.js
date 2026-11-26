@@ -1031,15 +1031,9 @@ function syncActionBadge() {
     if (!e.paused && e.uiMode === 'working') anyWorking = true;
   }
   const bgColor = allPaused ? '#d97706' : anyWorking ? '#2563eb' : '#059669';
-  const badgeLabel =
-    count === 1
-      ? allPaused
-        ? 'HOLD'
-        : 'LIVE'
-      : `${allPaused ? 'H' : 'L'}·${Math.min(99, count)}`;
   chrome.action.setBadgeBackgroundColor({ color: bgColor }).catch(() => {});
   chrome.action.setBadgeTextColor?.({ color: '#ffffff' }).catch(() => {});
-  chrome.action.setBadgeText({ text: badgeLabel }).catch(() => {});
+  chrome.action.setBadgeText({ text: String(Math.min(99, count)) }).catch(() => {});
 }
 
 function notifyPanelAndDaemon() {
@@ -6600,14 +6594,14 @@ chrome.windows.onFocusChanged.addListener((winId) => {
   }
 });
 
-function setupActionDirectModeAndMenus() {
-  chrome.sidePanel?.setPanelBehavior?.({ openPanelOnActionClick: false }).catch(() => {});
+function setupSidePanelAndMenus() {
+  chrome.sidePanel?.setPanelBehavior?.({ openPanelOnActionClick: true }).catch(() => {});
   chrome.contextMenus.removeAll(() => {
     chrome.contextMenus.create(
       {
         id: 'chrome-live-toggle-share',
         title: 'Share / Release tab with Chrome Live',
-        contexts: ['page']
+        contexts: ['page', 'action']
       },
       () => void chrome.runtime.lastError
     );
@@ -6619,31 +6613,11 @@ function setupActionDirectModeAndMenus() {
       },
       () => void chrome.runtime.lastError
     );
-    chrome.contextMenus.create(
-      {
-        id: 'chrome-live-open-sidepanel',
-        title: 'Open Chrome Live Console in Side Panel',
-        contexts: ['action']
-      },
-      () => void chrome.runtime.lastError
-    );
   });
 }
 
-// Always keep direct 1-click toolbar share active (never hijack Chrome's single right Side Panel on left-click)
-chrome.sidePanel?.setPanelBehavior?.({ openPanelOnActionClick: false }).catch(() => {});
-
-chrome.action.onClicked.addListener(async (clickedTab) => {
-  await ensureSwInitialized();
-  let targetTab = clickedTab && typeof clickedTab.id === 'number' ? clickedTab : null;
-  if (!targetTab) {
-    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    targetTab = activeTab || null;
-  }
-  if (targetTab) {
-    await shareTab(targetTab, true);
-  }
-});
+// Keep Chrome Side Panel enabled on toolbar icon click (with right-click standalone window option)
+chrome.sidePanel?.setPanelBehavior?.({ openPanelOnActionClick: true }).catch(() => {});
 
 chrome.commands.onCommand.addListener(async (command) => {
   await ensureSwInitialized();
@@ -6654,18 +6628,23 @@ chrome.commands.onCommand.addListener(async (command) => {
 });
 
 chrome.runtime.onInstalled.addListener(async () => {
-  setupActionDirectModeAndMenus();
+  setupSidePanelAndMenus();
   chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.45 });
 });
 
 chrome.runtime.onStartup?.addListener(() => {
-  setupActionDirectModeAndMenus();
+  setupSidePanelAndMenus();
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   await ensureSwInitialized();
-  if (info.menuItemId === 'chrome-live-toggle-share' && tab) {
-    await shareTab(tab, true);
+  if (info.menuItemId === 'chrome-live-toggle-share') {
+    let targetTab = tab && typeof tab.id === 'number' ? tab : null;
+    if (!targetTab) {
+      const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      targetTab = activeTab || null;
+    }
+    if (targetTab) await shareTab(targetTab, true);
     return;
   }
   if (info.menuItemId === 'chrome-live-open-console-window') {
@@ -6677,11 +6656,6 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         height: 650
       })
       .catch(() => {});
-    return;
-  }
-  if (info.menuItemId === 'chrome-live-open-sidepanel') {
-    const winId = tab?.windowId ?? chrome.windows.WINDOW_ID_CURRENT;
-    await chrome.sidePanel?.open?.({ windowId: winId }).catch(() => {});
   }
 });
 
