@@ -4531,6 +4531,7 @@ test('27. Top-50 security & real-world forum hardening: cloud metadata/0.0.0.0 S
   assert.match(hudSource, /edge-tally-dock/);
   assert.match(hudSource, /director-topline/);
   assert.match(hudSource, /const HOLD_UNLOCK_MS = 3000;/, 'Original 3s hold-to-unlock duration must be preserved');
+  assert.match(hudSource, /const FOREGROUND_AUTO_COLLAPSE_MS = 10000;/, '10s foreground-only gentle left-collapse timer must be preserved');
   assert.match(hudSource, /cursor:\s*not-allowed;/, 'Original circle-slash lock shield cursor must be preserved');
   assert.match(hudSource, /hold-ring-svg/, 'Original circular ring unlock progress SVG must be preserved');
   assert.match(hudSource, /const onEscKeyDown = \(ev\) => \{\s*if \(!ev \|\| !ev\.isTrusted\) return;/);
