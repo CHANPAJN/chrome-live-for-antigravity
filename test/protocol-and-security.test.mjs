@@ -4464,8 +4464,8 @@ test('27. Top-50 security & real-world forum hardening: cloud metadata/0.0.0.0 S
     'http://127.0.0.1:3000/app',
     'http://localhost:5173/',
     'http://[::1]:8080/',
-    'http://192.168.31.14:8000/',
-    'http://100.96.49.47:8080/'
+    'http://192.168.1.50:8000/',
+    'http://100.64.0.10:8080/'
   ]) {
     assert.equal(evaluateUrlSafety(allowedDevUrl).allowed, true, `Must allow legitimate local/Tailscale URL: ${allowedDevUrl}`);
     assert.equal(extVm.checkTabUrlAllowed(allowedDevUrl).allowed, true, `Extension must allow legitimate local/Tailscale URL: ${allowedDevUrl}`);
