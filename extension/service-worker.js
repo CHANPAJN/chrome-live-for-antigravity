@@ -763,6 +763,78 @@ function pushLocalAudit(action, detail = {}, status = 'ok') {
   if (localAudit.length > 40) localAudit.length = 40;
 }
 
+function isBlockedSwIpv4Octets(a, b, c, d) {
+  if (
+    !Number.isInteger(a) ||
+    !Number.isInteger(b) ||
+    !Number.isInteger(c) ||
+    !Number.isInteger(d) ||
+    a < 0 ||
+    a > 255 ||
+    b < 0 ||
+    b > 255 ||
+    c < 0 ||
+    c > 255 ||
+    d < 0 ||
+    d > 255
+  ) {
+    return false;
+  }
+  if (a === 0) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 100 && b === 100 && c === 100 && d === 200) return true;
+  return false;
+}
+
+function isBlockedSwMetadataOrZeroHost(rawHostname) {
+  let h = String(rawHostname || '').trim().toLowerCase().replace(/\.+$/, '');
+  if (!h) return false;
+  if (!h.startsWith('[') && !h.includes(':')) {
+    try {
+      const reparsed = new URL(`http://${h}/`).hostname.toLowerCase().replace(/\.+$/, '');
+      if (reparsed) h = reparsed;
+    } catch {}
+  }
+  if (
+    h === 'metadata' ||
+    h === 'instance-data' ||
+    h === 'metadata.google.internal' ||
+    h.endsWith('.metadata.google.internal') ||
+    h === 'metadata.azure.internal' ||
+    h.endsWith('.metadata.azure.internal') ||
+    h === 'metadata.packet.net' ||
+    h === 'metadata.tencentyun.com' ||
+    /(?:^|[.-])(?:169[.-]254(?:[.-]\d{1,3}){2}|100[.-]100[.-]100[.-]200)(?:$|\.)/i.test(h)
+  ) {
+    return true;
+  }
+  const m4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m4) {
+    return isBlockedSwIpv4Octets(Number(m4[1]), Number(m4[2]), Number(m4[3]), Number(m4[4]));
+  }
+  if (h.startsWith('[') && h.endsWith(']')) {
+    const v6 = h.slice(1, -1).split('%')[0].split('%25')[0].toLowerCase();
+    if (/^[0:]+$/.test(v6) && v6.includes(':')) return true;
+    if (/^fe[89ab][0-9a-f]:/i.test(v6)) return true;
+    if (/^fd00:0*ec2:(?:0*:)*0*254$/i.test(v6)) return true;
+    const v4Suf = v6.match(/:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (v4Suf && isBlockedSwIpv4Octets(Number(v4Suf[1]), Number(v4Suf[2]), Number(v4Suf[3]), Number(v4Suf[4]))) {
+      return true;
+    }
+    const chkHex = (hiHex, loHex) => {
+      const hi = Number.parseInt(hiHex, 16);
+      const lo = Number.parseInt(loHex, 16);
+      if (!Number.isFinite(hi) || !Number.isFinite(lo)) return false;
+      return isBlockedSwIpv4Octets((hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff);
+    };
+    const m6to4 = v6.match(/^2002:([0-9a-f]{1,4}):([0-9a-f]{1,4})(?::|$)/i);
+    if (m6to4 && chkHex(m6to4[1], m6to4[2])) return true;
+    const mTail = v6.match(/^(?:(?::|[0:]+:(?:ffff:)?)|64:ff9b:(?:0*:)*)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+    if (mTail && chkHex(mTail[1], mTail[2])) return true;
+  }
+  return false;
+}
+
 function checkTabUrlAllowed(rawUrl) {
   if (!rawUrl || rawUrl === 'about:blank') return { allowed: true, reason: '' };
   let parsed;
@@ -778,7 +850,10 @@ function checkTabUrlAllowed(rawUrl) {
   if (parsed.port && reservedPorts.has(parsed.port)) {
     return { allowed: false, reason: `Reserved local port ${parsed.port}` };
   }
-  const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
+  const host = parsed.hostname.toLowerCase().replace(/\.+$/, '');
+  if (isBlockedSwMetadataOrZeroHost(parsed.hostname)) {
+    return { allowed: false, reason: `Blocked cloud metadata or unspecified address (${host})` };
+  }
   const rules = [...BUILTIN_PROTECTED_DOMAINS, ...customBlockedDomains];
   for (const r of rules) {
     const clean = String(r || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
@@ -1110,12 +1185,8 @@ async function connectWebSocket(forceManual = false) {
   }
 }
 
-async function runHudScriptSafe(tabId, opts, timeoutMs = 1200) {
-  const t = await chrome.tabs.get(tabId).catch(() => null);
-  if (!t || t.discarded || t.status === 'unloaded') return null;
+async function execSingleTargetBounded(targetSpec, restOpts, timeoutMs) {
   let timer = null;
-  const { allFrames, ...restOpts } = opts || {};
-  const targetSpec = allFrames ? { tabId, allFrames: true } : { tabId };
   try {
     return await Promise.race([
       chrome.scripting.executeScript({ target: targetSpec, ...restOpts }),
@@ -1128,6 +1199,49 @@ async function runHudScriptSafe(tabId, opts, timeoutMs = 1200) {
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+async function runHudScriptSafe(tabId, opts, timeoutMs = 1200) {
+  const t = await chrome.tabs.get(tabId).catch(() => null);
+  if (!t || t.discarded || t.status === 'unloaded') return null;
+  const { allFrames, ...restOpts } = opts || {};
+  if (!allFrames) {
+    return await execSingleTargetBounded({ tabId }, restOpts, timeoutMs);
+  }
+
+  // Per-frame bounded execution when `allFrames: true`:
+  // 1) Top-level main frame (`frameId: 0`) MUST succeed within `timeoutMs` (strict Fail-Closed if main page is hung).
+  // 2) Cross-origin sub-frames (whose navigation URLs are already verified via C++ `webNavigation.getAllFrames` & `onBeforeNavigate`)
+  //    each run with an isolated short timeout so a slow external ad `<iframe>` never times out and detaches a healthy main tab!
+  const mainRes = await execSingleTargetBounded({ tabId, frameIds: [0] }, restOpts, timeoutMs);
+  if (!Array.isArray(mainRes) || mainRes.length === 0) {
+    return null;
+  }
+  if (!chrome.webNavigation?.getAllFrames) {
+    return mainRes;
+  }
+  const navFrames = await chrome.webNavigation.getAllFrames({ tabId }).catch(() => null);
+  if (!Array.isArray(navFrames) || navFrames.length <= 1) {
+    return mainRes;
+  }
+  const subTimeout = Math.min(750, Math.max(350, Math.floor(timeoutMs * 0.45)));
+  const subFrameIds = navFrames
+    .filter((f) => f && typeof f.frameId === 'number' && f.frameId > 0 && !f.errorOccurred && f.url && f.url !== 'about:blank')
+    .slice(0, 24)
+    .map((f) => f.frameId);
+  if (subFrameIds.length === 0) {
+    return mainRes;
+  }
+  const subBatches = await Promise.all(
+    subFrameIds.map((fid) => execSingleTargetBounded({ tabId, frameIds: [fid] }, restOpts, subTimeout))
+  );
+  const merged = [...mainRes];
+  for (const batch of subBatches) {
+    if (Array.isArray(batch)) {
+      for (const item of batch) merged.push(item);
+    }
+  }
+  return merged;
 }
 
 async function syncHudNow(tabId, payload) {
@@ -1492,6 +1606,10 @@ async function captureQuickFrame(tabId, entry, timeoutMs = 1200) {
           })
         );
       }
+      return null;
+    }
+    // If a native JS alert/confirm/prompt dialog is currently blocking the page's main thread, skip DOM-injected script checks so we do not falsely detach the tab!
+    if (entry.openDialog) {
       return null;
     }
     const subSafety = await inspectEmbeddedFramesSafety(tabId);
@@ -3221,7 +3339,20 @@ async function executeBridgeRpc(method, params) {
                   if (visCache.has(el)) return visCache.get(el);
                   const cs = window.getComputedStyle(el);
                   const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue('-webkit-text-security') || '').toLowerCase();
+                  const fSize = Number.parseFloat(cs.fontSize);
+                  const clipP = String(cs.clipPath || '').trim().toLowerCase();
+                  const clipL = String(cs.clip || '').replace(/\s+/g, '').toLowerCase();
+                  const isHiddenClipOrMicroFont =
+                    (Number.isFinite(fSize) && fSize < 1) ||
+                    clipP === 'inset(100%)' ||
+                    clipP === 'inset(50%)' ||
+                    clipP.startsWith('circle(0') ||
+                    clipL === 'rect(0px,0px,0px,0px)' ||
+                    clipL === 'rect(0,0,0,0)' ||
+                    ((cs.overflow === 'hidden' || cs.overflowX === 'hidden' || cs.overflowY === 'hidden') &&
+                      (cs.maxHeight === '0px' || (cs.height === '0px' && cs.width === '0px')));
                   let v =
+                    !isHiddenClipOrMicroFont &&
                     (!tSec || tSec === 'none') &&
                     cs.opacity !== '0' &&
                     cs.display !== 'none' &&
@@ -3474,12 +3605,31 @@ async function executeBridgeRpc(method, params) {
 
   if (method === 'snapshot') {
     const maxItems = Math.min(200, Math.max(10, Number(params.maxItems) || 90));
+    const scopeSelector =
+      params.selector !== undefined && params.selector !== null ? String(params.selector).trim() : '';
+    if (scopeSelector) {
+      assertSafeModelSelector(scopeSelector);
+    }
     entry.activity = tr().readingDom;
     await syncHud(entry.tabId, { visible: true, mode: 'working', activity: entry.activity });
     await verifyEntryStillControllable(entry);
 
+    if (entry.openDialog) {
+      return {
+        tabId: entry.tabId,
+        title: entry.title || '',
+        url: entry.url || '',
+        elements: [],
+        alerts: [
+          `Native JS ${entry.openDialog.type || 'dialog'} is blocking page: "${entry.openDialog.message || ''}" — call click with acceptDialog: true (or false) to confirm/cancel it`
+        ],
+        dialogOpen: entry.openDialog,
+        excerpt: ''
+      };
+    }
+
     const execRes = await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
-      func: (limit) => {
+      func: (limit, customScopeSel) => {
         const SELECTORS =
           'a[href], button, input, textarea, select, summary, [role="button"], [role="link"], [role="tab"], [role="textbox"], [role="searchbox"], [role="combobox"], [role="switch"], [role="radio"], [role="checkbox"], [role="option"], [role="menuitem"], [contenteditable]:not([contenteditable="false"]), label:has(input[type="radio"]), label:has(input[type="checkbox"])';
 
@@ -3670,27 +3820,118 @@ async function executeBridgeRpc(method, params) {
           return false;
         };
 
-        const candidates = collectDeep(document, SELECTORS);
-        const elements = [];
-        let idx = 0;
+        function queryScopeDeep(root, sel, depth = 0) {
+          if (!root || depth > 6) return null;
+          try {
+            const direct = root.querySelector(sel);
+            if (direct) return direct;
+          } catch {
+            return null;
+          }
+          for (const h of root.querySelectorAll('*')) {
+            if (h instanceof Element && Element.prototype.hasAttribute.call(h, 'data-chrome-live-hud')) continue;
+            const sr =
+              (typeof Element !== 'undefined' && Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(h)) ||
+              (h.shadowRoot && typeof h.shadowRoot.querySelectorAll === 'function' ? h.shadowRoot : null);
+            if (sr) {
+              const hit = queryScopeDeep(sr, sel, depth + 1);
+              if (hit) return hit;
+            }
+          }
+          return null;
+        }
 
-        for (const node of candidates) {
-          if (idx >= limit) break;
+        const scopeRoot = customScopeSel ? queryScopeDeep(document, customScopeSel) : null;
+        if (customScopeSel && !scopeRoot) {
+          return {
+            title: document.title,
+            url: location.href,
+            elements: [],
+            alerts: [`Scoped snapshot container not found: ${customScopeSel}`],
+            excerpt: ''
+          };
+        }
+
+        const isPriorityOverlayControl = (elNode) => {
+          if (
+            safeClosest(
+              elNode,
+              'dialog[open], [role="dialog"], [aria-modal="true"], [role="alertdialog"]'
+            )
+          ) {
+            return true;
+          }
+          // Detect fixed/sticky floating composer drawers (e.g. Discourse `#reply-control`) while excluding top navbars/headers
+          if (safeClosest(elNode, 'header, nav, [role="navigation"], [role="banner"]')) {
+            return false;
+          }
+          const seen = new Set();
+          let cur = elNode;
+          while (cur && !seen.has(cur) && cur !== document.body && cur !== document.documentElement) {
+            seen.add(cur);
+            const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
+            if (cs && cs.position === 'fixed') {
+              return true;
+            }
+            const sl = safeSlot(cur);
+            if (sl) {
+              cur = sl;
+              continue;
+            }
+            const rn = safeRoot(cur);
+            cur = safeParent(cur) || (rn && rn.host ? rn.host : null);
+          }
+          return false;
+        };
+
+        const rawCandidates = collectDeep(scopeRoot || document, SELECTORS);
+        const visibleCandidates = [];
+        for (const node of rawCandidates) {
+          if (visibleCandidates.length >= 1200) break;
           if (safeClosest(node, '[data-chrome-live-hud]') || isNestedInsideEditorOrHidden(node)) continue;
           if (!isElementFlatVisible(node)) continue;
-          const style = window.getComputedStyle(node);
           const rect = node.getBoundingClientRect();
           if (rect.width < 4 || rect.height < 4) continue;
-
           const tagLower = safeTagLower(node);
-          let linkedInput = null;
           if (tagLower === 'label') {
-            linkedInput = node.querySelector('input[type="radio"], input[type="checkbox"]');
+            const linkedInput = node.querySelector('input[type="radio"], input[type="checkbox"]');
             if (linkedInput) {
               const inpRect = linkedInput.getBoundingClientRect();
               if (isElementFlatVisible(linkedInput) && inpRect.width >= 4 && inpRect.height >= 4) continue;
             }
           }
+          visibleCandidates.push(node);
+        }
+
+        // Prioritize active modal dialogs and fixed reply/composer drawers when total visible elements exceed `limit`
+        let chosenNodes;
+        if (!scopeRoot && visibleCandidates.length > limit) {
+          const priorityNodes = [];
+          const regularNodes = [];
+          for (const node of visibleCandidates) {
+            if (isPriorityOverlayControl(node)) priorityNodes.push(node);
+            else regularNodes.push(node);
+          }
+          if (priorityNodes.length > 0 && priorityNodes.length < limit) {
+            const regularQuota = limit - priorityNodes.length;
+            chosenNodes = [...regularNodes.slice(0, regularQuota), ...priorityNodes];
+          } else if (priorityNodes.length >= limit) {
+            chosenNodes = priorityNodes.slice(0, limit);
+          } else {
+            chosenNodes = visibleCandidates.slice(0, limit);
+          }
+        } else {
+          chosenNodes = visibleCandidates.slice(0, limit);
+        }
+
+        const elements = [];
+        let idx = 0;
+
+        for (const node of chosenNodes) {
+          const style = window.getComputedStyle(node);
+          const tagLower = safeTagLower(node);
+          const linkedInput =
+            tagLower === 'label' ? node.querySelector('input[type="radio"], input[type="checkbox"]') : null;
 
           safeSetAttr(node, 'data-clive-idx', String(idx));
           const inputType = tagLower === 'input' ? String(node.type || 'text').toLowerCase() : '';
@@ -3947,7 +4188,20 @@ async function executeBridgeRpc(method, params) {
           if (visCache.has(el)) return visCache.get(el);
           const cs = window.getComputedStyle(el);
           const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue('-webkit-text-security') || '').toLowerCase();
+          const fSize = Number.parseFloat(cs.fontSize);
+          const clipP = String(cs.clipPath || '').trim().toLowerCase();
+          const clipL = String(cs.clip || '').replace(/\s+/g, '').toLowerCase();
+          const isHiddenClipOrMicroFont =
+            (Number.isFinite(fSize) && fSize < 1) ||
+            clipP === 'inset(100%)' ||
+            clipP === 'inset(50%)' ||
+            clipP.startsWith('circle(0') ||
+            clipL === 'rect(0px,0px,0px,0px)' ||
+            clipL === 'rect(0,0,0,0)' ||
+            ((cs.overflow === 'hidden' || cs.overflowX === 'hidden' || cs.overflowY === 'hidden') &&
+              (cs.maxHeight === '0px' || (cs.height === '0px' && cs.width === '0px')));
           let v =
+            !isHiddenClipOrMicroFont &&
             (!tSec || tSec === 'none') &&
             cs.opacity !== '0' &&
             cs.display !== 'none' &&
@@ -4036,34 +4290,39 @@ async function executeBridgeRpc(method, params) {
         };
 
         let bestExcerpt = '';
-        for (const m of document.querySelectorAll('main, [role="main"]')) {
-          const mTxt = collectSnapExcerptFromRoot(m, 6000);
-          if (mTxt.length > bestExcerpt.length) {
-            bestExcerpt = mTxt;
+        if (scopeRoot) {
+          bestExcerpt = collectSnapExcerptFromRoot(scopeRoot, 6000);
+        } else {
+          for (const m of document.querySelectorAll('main, [role="main"]')) {
+            const mTxt = collectSnapExcerptFromRoot(m, 6000);
+            if (mTxt.length > bestExcerpt.length) {
+              bestExcerpt = mTxt;
+            }
           }
-        }
-        if (bestExcerpt.length < 140) {
-          const arts = document.querySelectorAll('article');
-          if (arts.length === 1) {
-            const aTxt = collectSnapExcerptFromRoot(arts[0], 6000);
-            if (aTxt.length > bestExcerpt.length) bestExcerpt = aTxt;
+          if (bestExcerpt.length < 140) {
+            const arts = document.querySelectorAll('article');
+            if (arts.length === 1) {
+              const aTxt = collectSnapExcerptFromRoot(arts[0], 6000);
+              if (aTxt.length > bestExcerpt.length) bestExcerpt = aTxt;
+            }
           }
-        }
-        if (bestExcerpt.length < 140 && document.body) {
-          const bTxt = collectSnapExcerptFromRoot(document.body, 6000);
-          if (bTxt.length > bestExcerpt.length) bestExcerpt = bTxt;
+          if (bestExcerpt.length < 140 && document.body) {
+            const bTxt = collectSnapExcerptFromRoot(document.body, 6000);
+            if (bTxt.length > bestExcerpt.length) bestExcerpt = bTxt;
+          }
         }
         const excerpt = bestExcerpt.slice(0, 4500);
 
         return {
           title: document.title,
           url: location.href,
+          ...(customScopeSel ? { scopedTo: customScopeSel } : {}),
           elements,
           alerts: alerts.length > 0 ? alerts : undefined,
           excerpt
         };
       },
-      args: [maxItems]
+      args: [maxItems, scopeSelector]
     });
 
     await verifyEntryStillControllable(entry);
@@ -4084,7 +4343,34 @@ async function executeBridgeRpc(method, params) {
     await syncHud(entry.tabId, { visible: true, mode: 'working', activity: entry.activity });
     await verifyEntryStillControllable(entry);
 
-    const execRes = await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
+    entry.lastHandledDialog = null;
+    if (typeof params.acceptDialog === 'boolean') {
+      await ensureCdpForTab(entry.tabId, entry);
+      if (entry.openDialog) {
+        const prevDlg = entry.openDialog;
+        entry.openDialog = null;
+        entry.lastHandledDialog = { ...prevDlg, accepted: params.acceptDialog };
+        await chrome.debugger
+          .sendCommand({ tabId: entry.tabId }, 'Page.handleJavaScriptDialog', {
+            accept: params.acceptDialog,
+            ...(typeof params.promptText === 'string' ? { promptText: params.promptText } : {})
+          })
+          .catch(() => {});
+      }
+      entry.pendingDialogPolicy = {
+        accept: params.acceptDialog,
+        promptText: typeof params.promptText === 'string' ? params.promptText : undefined,
+        expiresAt: Date.now() + 8000
+      };
+    } else {
+      // Attach Page domain proactively so if an unexpected confirm() opens, we observe `entry.openDialog` cleanly instead of timing out blindly
+      await ensureCdpForTab(entry.tabId, entry).catch(() => {});
+    }
+
+    let clickTimedOutOnDialog = false;
+    let clickTimer = null;
+    const execRes = await Promise.race([
+      chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
       func: async (tgt) => {
         function getOpenShadow(n) {
           if (!n) return null;
@@ -4572,7 +4858,27 @@ async function executeBridgeRpc(method, params) {
         };
       },
       args: [target]
-    });
+    }),
+      new Promise((resolve) => {
+        clickTimer = setTimeout(() => {
+          clickTimedOutOnDialog = true;
+          resolve(null);
+        }, 4500);
+      })
+    ]);
+    if (clickTimer) clearTimeout(clickTimer);
+
+    if (clickTimedOutOnDialog && entry.openDialog) {
+      entry.pendingDialogPolicy = null;
+      notifyPanelAndDaemon();
+      return {
+        tabId: entry.tabId,
+        clicked: String(target),
+        pageUrl: entry.url,
+        dialogOpen: entry.openDialog,
+        hint: 'Native JS dialog opened and paused page script execution; call click with acceptDialog: true (or false) to confirm/cancel it'
+      };
+    }
 
     const out = execRes?.[0]?.result;
     if (!out || !out.ok) {
@@ -4674,34 +4980,51 @@ async function executeBridgeRpc(method, params) {
         throw new Error('Aborted: debugger was detached during click');
       }
 
-      await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
-          func: (didCdp) => {
-            const ctrl = window.__chromeLiveHudController__;
-            if (ctrl?.shieldEl) ctrl.shieldEl.style.pointerEvents = '';
-            const pending = window.__clivePendingClickEl;
-            delete window.__clivePendingClickEl;
-            if (pending) {
-              const hudStillWorking = ctrl && ctrl._state?.visible === true && ctrl._state?.mode === 'working';
-              if (hudStillWorking && (!didCdp || !pending.__cliveTrustedReceived)) {
-                pending.click();
-              }
-              delete pending.__cliveTrustedReceived;
-            }
-          },
-          args: [cdpDispatched]
-        })
-        .catch(() => {});
+      if (!entry.openDialog) {
+        let postClickTimer = null;
+        await Promise.race([
+          chrome.scripting
+            .executeScript({
+              target: { tabId: entry.tabId },
+              injectImmediately: true,
+              func: (didCdp) => {
+                const ctrl = window.__chromeLiveHudController__;
+                if (ctrl?.shieldEl) ctrl.shieldEl.style.pointerEvents = '';
+                const pending = window.__clivePendingClickEl;
+                delete window.__clivePendingClickEl;
+                if (pending) {
+                  const hudStillWorking = ctrl && ctrl._state?.visible === true && ctrl._state?.mode === 'working';
+                  if (hudStillWorking && (!didCdp || !pending.__cliveTrustedReceived)) {
+                    pending.click();
+                  }
+                  delete pending.__cliveTrustedReceived;
+                }
+              },
+              args: [cdpDispatched]
+            })
+            .catch(() => {}),
+          new Promise((resolve) => {
+            postClickTimer = setTimeout(resolve, 900);
+          })
+        ]);
+        if (postClickTimer) clearTimeout(postClickTimer);
+      }
     }
     await new Promise((r) => setTimeout(r, 220));
+    entry.pendingDialogPolicy = null;
     await verifyEntryStillControllable(entry);
     await captureQuickFrame(entry.tabId, entry);
     notifyPanelAndDaemon();
+    const handledDlg = entry.lastHandledDialog || undefined;
+    entry.lastHandledDialog = null;
     return {
       tabId: entry.tabId,
       clicked: out.label || out.tag,
       pageUrl: entry.url,
       learnedLabel: out.label ? `点击 · ${out.label}` : '',
-      learnedSelector: out.learnedSelector || ''
+      learnedSelector: out.learnedSelector || '',
+      ...(handledDlg ? { handledDialog: handledDlg } : {}),
+      ...(entry.openDialog ? { dialogOpen: entry.openDialog } : {})
     };
   }
 
@@ -4715,6 +5038,14 @@ async function executeBridgeRpc(method, params) {
     }
     if (typeof target === 'string') {
       assertSafeModelSelector(target);
+    }
+    entry.lastHandledDialog = null;
+    if (typeof params.acceptDialog === 'boolean') {
+      await ensureCdpForTab(entry.tabId, entry);
+      entry.pendingDialogPolicy = {
+        accept: params.acceptDialog,
+        expiresAt: Date.now() + 8000
+      };
     }
     entry.activity = tr().typing;
     await syncHud(entry.tabId, { visible: true, mode: 'working', activity: entry.activity });
@@ -5285,16 +5616,21 @@ async function executeBridgeRpc(method, params) {
       }
     }
     await new Promise((r) => setTimeout(r, 220));
+    entry.pendingDialogPolicy = null;
     await verifyEntryStillControllable(entry);
     await captureQuickFrame(entry.tabId, entry);
     notifyPanelAndDaemon();
+    const typedDlg = entry.lastHandledDialog || undefined;
+    entry.lastHandledDialog = null;
     return {
       tabId: entry.tabId,
       typedLength: String(text ?? '').length,
       submitted: Boolean(submit),
       pageUrl: entry.url,
       learnedLabel: out.learnedName ? `输入 · ${out.learnedName}` : '',
-      learnedSelector: out.learnedSelector || ''
+      learnedSelector: out.learnedSelector || '',
+      ...(typedDlg ? { handledDialog: typedDlg } : {}),
+      ...(entry.openDialog ? { dialogOpen: entry.openDialog } : {})
     };
   }
 
@@ -5944,6 +6280,39 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   const tabId = source.tabId;
   if (!tabId || !managedTabs.has(tabId)) return;
   const entry = managedTabs.get(tabId);
+
+  if (method === 'Page.javascriptDialogOpening' && params) {
+    const dlgInfo = {
+      type: String(params.type || 'alert'),
+      message: redactUrlsInTextLocal(String(params.message || '')).slice(0, 300),
+      ts: Date.now()
+    };
+    entry.openDialog = dlgInfo;
+    const policy = entry.pendingDialogPolicy;
+    if (
+      policy &&
+      Date.now() <= policy.expiresAt &&
+      !entry.paused &&
+      !entry.detached &&
+      checkTabUrlAllowed(entry.url || '').allowed
+    ) {
+      entry.pendingDialogPolicy = null;
+      entry.openDialog = null;
+      entry.lastHandledDialog = { ...dlgInfo, accepted: Boolean(policy.accept) };
+      chrome.debugger
+        .sendCommand({ tabId }, 'Page.handleJavaScriptDialog', {
+          accept: Boolean(policy.accept),
+          ...(typeof policy.promptText === 'string' ? { promptText: policy.promptText } : {})
+        })
+        .catch(() => {});
+    }
+    return;
+  }
+
+  if (method === 'Page.javascriptDialogClosed') {
+    entry.openDialog = null;
+    return;
+  }
 
   if (method === 'Page.screencastFrame' && params) {
     chrome.debugger

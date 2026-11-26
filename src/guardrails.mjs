@@ -28,6 +28,118 @@ const BLOCKED_PROTOCOLS = new Set([
 
 const BLOCKED_PORTS = new Set(['9222', '9229', '28196']);
 
+const BLOCKED_METADATA_HOSTNAMES = new Set([
+  'metadata',
+  'instance-data',
+  'metadata.google.internal',
+  'metadata.azure.internal',
+  'metadata.packet.net',
+  'metadata.tencentyun.com'
+]);
+
+const DNS_REBIND_METADATA_RX =
+  /(?:^|[.-])(?:169[.-]254(?:[.-]\d{1,3}){2}|100[.-]100[.-]100[.-]200)(?:$|\.)/i;
+
+function isBlockedIpv4Octets(a, b, c, d) {
+  if (
+    !Number.isInteger(a) ||
+    !Number.isInteger(b) ||
+    !Number.isInteger(c) ||
+    !Number.isInteger(d) ||
+    a < 0 ||
+    a > 255 ||
+    b < 0 ||
+    b > 255 ||
+    c < 0 ||
+    c > 255 ||
+    d < 0 ||
+    d > 255
+  ) {
+    return false;
+  }
+  // 0.0.0.0/8 ("this network" / all-interfaces wildcard)
+  if (a === 0) return true;
+  // 169.254.0.0/16 Link-Local & AWS/GCP/Azure/Oracle/ECS cloud metadata services
+  if (a === 169 && b === 254) return true;
+  // 100.100.100.200 Alibaba/Tencent cloud instance metadata service (preserves normal Tailscale 100.64.0.0/10 hosts)
+  if (a === 100 && b === 100 && c === 100 && d === 200) return true;
+  return false;
+}
+
+export function isBlockedCloudMetadataOrZeroHost(rawHostname) {
+  let host = String(rawHostname || '').trim().toLowerCase().replace(/\.+$/, '');
+  if (!host) return false;
+
+  // Re-normalize trailing-dot numeric/hex/octal IPv4 forms (`http://2852039166./` or `http://0xa9fea9fe./`) via WHATWG URL parser
+  if (!host.startsWith('[') && !host.includes(':')) {
+    try {
+      const reparsed = new URL(`http://${host}/`).hostname.toLowerCase().replace(/\.+$/, '');
+      if (reparsed) host = reparsed;
+    } catch {}
+  }
+
+  if (
+    BLOCKED_METADATA_HOSTNAMES.has(host) ||
+    host.endsWith('.metadata.google.internal') ||
+    host.endsWith('.metadata.azure.internal') ||
+    DNS_REBIND_METADATA_RX.test(host)
+  ) {
+    return true;
+  }
+
+  const ipv4Match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4Match) {
+    return isBlockedIpv4Octets(
+      Number(ipv4Match[1]),
+      Number(ipv4Match[2]),
+      Number(ipv4Match[3]),
+      Number(ipv4Match[4])
+    );
+  }
+
+  if (host.startsWith('[') && host.endsWith(']')) {
+    const v6 = host.slice(1, -1).split('%')[0].split('%25')[0].toLowerCase();
+    // Unspecified IPv6 `::`
+    if (/^[0:]+$/.test(v6) && v6.includes(':')) return true;
+    // IPv6 Link-Local `fe80::/10`
+    if (/^fe[89ab][0-9a-f]:/i.test(v6)) return true;
+    // AWS / cloud IPv6 IMDS `fd00:ec2::254`
+    if (/^fd00:0*ec2:(?:0*:)*0*254$/i.test(v6)) return true;
+
+    // Dotted-quad suffix on IPv6 (`[::ffff:169.254.169.254]`, `[64:ff9b::169.254.169.254]`)
+    const v4Suffix = v6.match(/:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (v4Suffix) {
+      if (
+        isBlockedIpv4Octets(
+          Number(v4Suffix[1]),
+          Number(v4Suffix[2]),
+          Number(v4Suffix[3]),
+          Number(v4Suffix[4])
+        )
+      ) {
+        return true;
+      }
+    }
+
+    // Hex-encoded embedded IPv4 in IPv4-mapped (`::ffff:a9fe:a9fe`), IPv4-compatible (`::a9fe:a9fe`), NAT64 (`64:ff9b::a9fe:a9fe`), or 6to4 (`2002:a9fe:a9fe:...`)
+    const checkHexPair = (hiHex, loHex) => {
+      const hi = Number.parseInt(hiHex, 16);
+      const lo = Number.parseInt(loHex, 16);
+      if (!Number.isFinite(hi) || !Number.isFinite(lo)) return false;
+      return isBlockedIpv4Octets((hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff);
+    };
+    const m6to4 = v6.match(/^2002:([0-9a-f]{1,4}):([0-9a-f]{1,4})(?::|$)/i);
+    if (m6to4 && checkHexPair(m6to4[1], m6to4[2])) return true;
+
+    const mTailHex = v6.match(
+      /^(?:(?::|[0:]+:(?:ffff:)?)|64:ff9b:(?:0*:)*)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i
+    );
+    if (mTailHex && checkHexPair(mTailHex[1], mTailHex[2])) return true;
+  }
+
+  return false;
+}
+
 export const DEFAULT_BLOCKED_DOMAINS = Object.freeze([
   // Global payment & checkout gateways
   'stripe.com',
@@ -531,7 +643,14 @@ export function evaluateUrlSafety(rawUrl, customBlockedDomains = []) {
     };
   }
 
-  const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
+  const host = parsed.hostname.toLowerCase().replace(/\.+$/, '');
+  if (isBlockedCloudMetadataOrZeroHost(parsed.hostname)) {
+    return {
+      allowed: false,
+      code: 'CLOUD_METADATA_BLOCKED',
+      reason: `Host "${host}" is blocked by cloud metadata / unspecified-address SSRF guardrail`
+    };
+  }
   const mergedList = [...DEFAULT_BLOCKED_DOMAINS, ...customBlockedDomains];
   for (const rawRule of mergedList) {
     const rule = String(rawRule || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');

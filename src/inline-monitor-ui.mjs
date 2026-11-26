@@ -14,7 +14,7 @@ export function buildInlineMonitorHtml() {
       padding: 0;
       background: transparent;
       color: var(--color-text-primary, #18181b);
-      font: 400 12px/1.4 var(--font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif);
+      font: 400 12px/1.4 "Microsoft YaHei UI", "PingFang SC", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
       -webkit-font-smoothing: antialiased;
       overflow: hidden;
       user-select: none;
@@ -111,27 +111,32 @@ export function buildInlineMonitorHtml() {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      gap: 4px;
+      gap: 4.5px;
       border: 1px solid transparent;
       background: transparent;
       color: var(--color-text-secondary, #52525b);
       border-radius: 6px;
-      height: 25px;
+      height: 26px;
       padding: 0 7px;
       font-family: inherit;
-      font-size: 11.5px;
+      font-size: 12px;
       font-weight: 500;
       line-height: 1;
-      letter-spacing: -0.005em;
       white-space: nowrap;
+      vertical-align: middle;
       cursor: pointer;
       transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease, transform 0.1s ease;
     }
     button svg {
-      width: 12.5px;
-      height: 12.5px;
+      display: block;
+      width: 13px;
+      height: 13px;
       flex-shrink: 0;
-      opacity: 0.82;
+      opacity: 0.85;
+    }
+    button .lbl {
+      display: inline-block;
+      line-height: 1;
     }
     html.dark button {
       color: var(--color-text-secondary, #a1a1aa);
@@ -422,28 +427,28 @@ export function buildInlineMonitorHtml() {
       </div>
       <div class="btn-row">
         <button id="remoteBtn" type="button" disabled title="Click, scroll, or type directly on the live stream">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 2.5L12.5 7.5L8.4 8.8L6.8 12.8L3.5 2.5Z"/></svg>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.2 2.8l9.2 4.4-4 1.4-1.4 4-3.8-9.8z"/></svg>
           <span class="lbl">Control</span>
         </button>
         <button id="regionBtn" type="button" disabled title="Click or drag to pick page elements and extract selectors">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 5V3.5a1 1 0 0 1 1-1H5M11 2.5h1.5a1 1 0 0 1 1 1V5M13.5 11v1.5a1 1 0 0 1-1 1H11M5 13.5H3.5a1 1 0 0 1-1-1V11"/></svg>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 5.2V3.5a1 1 0 0 1 1-1h1.7M10.8 2.5h1.7a1 1 0 0 1 1 1v1.7M13.5 10.8v1.7a1 1 0 0 1-1 1h-1.7M5.2 13.5H3.5a1 1 0 0 1-1-1v-1.7"/></svg>
           <span class="lbl">Pick</span>
         </button>
         <button id="attachBtn" type="button" disabled style="display:none" title="Attach the current page title and URL to the next prompt">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.5 4.5l-4.6 4.6a1.5 1.5 0 1 0 2.1 2.1l5-5a2.8 2.8 0 0 0-4-4l-5.3 5.3a4 4 0 0 0 5.7 5.7l4.3-4.3"/></svg>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.1 4.9L6.1 8.9a1.35 1.35 0 0 0 1.9 1.9l4.3-4.3a2.7 2.7 0 0 0-3.8-3.8L4.1 7.1a4.05 4.05 0 0 0 5.7 5.7l3.5-3.5"/></svg>
           <span class="lbl">Attach</span>
         </button>
         <span class="btn-sep"></span>
         <button id="relayBtn" type="button" data-relay="popout" disabled title="Pop out into a standalone window for manual login/2FA, then merge back">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 3.5H3.5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V9.5M9.5 2.5h4v4M13.5 2.5L7.5 8.5"/></svg>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 3.2H3.8a1.3 1.3 0 0 0-1.3 1.3v7.7a1.3 1.3 0 0 0 1.3 1.3h7.7a1.3 1.3 0 0 0 1.3-1.3V9.5M9.8 2.5h3.7v3.7M13.3 2.7L7.8 8.2"/></svg>
           <span class="lbl">Popout</span>
         </button>
         <button id="snapBtn" type="button" title="Capture a fresh frame now">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13 8a5 5 0 1 1-1.3-3.4M13 2.8v2.6h-2.6"/></svg>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.1 8a5.1 5.1 0 1 1-1.4-3.5M13.1 2.8v2.6h-2.6"/></svg>
           <span class="lbl">Refresh</span>
         </button>
         <button id="releaseBtn" type="button" disabled title="Release AI control while keeping this tab open">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3H3.5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1H6M10.5 11l3-3-3-3M13.5 8H6.5"/></svg>
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6.2 2.8H3.8a1.3 1.3 0 0 0-1.3 1.3v7.8a1.3 1.3 0 0 0 1.3 1.3h2.4M10.5 10.8L13.5 8l-3-2.8M13.3 8H6.5"/></svg>
           <span class="lbl">Release</span>
         </button>
       </div>
@@ -628,13 +633,13 @@ export function buildInlineMonitorHtml() {
         statusBar.dataset.kind = kind;
         statusBar.dataset.open = 'true';
         statusMsg.textContent = msg;
-        sendCtxNowBtn.style.display = showSendNow && hostCaps && hostCaps.message ? 'inline-block' : 'none';
+        sendCtxNowBtn.style.display = showSendNow && hostCaps && hostCaps.message ? 'inline-flex' : 'none';
         reportSize();
       }
 
       function syncCapabilityButtons() {
         const canAttach = Boolean(hostCaps && (hostCaps.updateModelContext || hostCaps.message));
-        attachBtn.style.display = canAttach ? 'inline-block' : 'none';
+        attachBtn.style.display = canAttach ? 'inline-flex' : 'none';
       }
 
       let parentTargetOrigin = '*';
@@ -1246,7 +1251,7 @@ export function buildInlineMonitorHtml() {
         }
 
         if (hostCaps && hostCaps.message) {
-          askAiBtn.style.display = 'inline-block';
+          askAiBtn.style.display = 'inline-flex';
         }
       });
 

@@ -4416,3 +4416,89 @@ test('26. Real-world Web Component & framework text extraction: display:contents
   assert.match(swSource, /Anti-bot challenge detected: share an already-verified Chrome tab/);
 });
 
+test('27. Top-50 security & real-world forum hardening: cloud metadata/0.0.0.0 SSRF block, micro-font injection filter, untrusted boundary, slow ad-iframe isolation, overlay priority & acceptDialog', async () => {
+  const { buildInlineMonitorHtml } = await import('../src/inline-monitor-ui.mjs');
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+  const cliSource = fs.readFileSync(path.join(REPO_ROOT, 'bin', 'chrome-live.mjs'), 'utf8');
+
+  // 1. Cloud metadata & 0.0.0.0 SSRF block across decimal, hex, trailing-dot, IPv4-mapped IPv6, NAT64, 6to4, nip.io & IMDSv6
+  for (const blockedMetaUrl of [
+    'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
+    'http://169.254.170.2/v2/credentials',
+    'http://2852039166/latest/meta-data/',
+    'http://0xa9fea9fe./latest/meta-data/',
+    'http://[::ffff:169.254.169.254]/latest/meta-data/',
+    'http://[64:ff9b::a9fe:a9fe]/computeMetadata/v1/',
+    'http://[2002:a9fe:a9fe::1]/latest/meta-data/',
+    'http://[fd00:ec2::254]/latest/meta-data/',
+    'http://[fe80::1]/',
+    'http://0.0.0.0:8080/',
+    'http://[::]:8080/',
+    'http://metadata.google.internal./computeMetadata/v1/',
+    'http://instance-data/latest/meta-data/',
+    'http://100.100.100.200/latest/meta-data/',
+    'http://169.254.169.254.nip.io/latest/meta-data/'
+  ]) {
+    const verdict = evaluateUrlSafety(blockedMetaUrl);
+    assert.equal(verdict.allowed, false, `Must block cloud metadata / 0.0.0.0 URL: ${blockedMetaUrl}`);
+    assert.equal(verdict.code, 'CLOUD_METADATA_BLOCKED');
+  }
+
+  // Must preserve legitimate localhost, LAN, and Tailscale dev endpoints!
+  for (const allowedDevUrl of [
+    'http://127.0.0.1:3000/app',
+    'http://localhost:5173/',
+    'http://[::1]:8080/',
+    'http://192.168.31.14:8000/',
+    'http://100.96.49.47:8080/'
+  ]) {
+    assert.equal(evaluateUrlSafety(allowedDevUrl).allowed, true, `Must allow legitimate local/Tailscale URL: ${allowedDevUrl}`);
+  }
+
+  // 2. Inline monitor UI buttons must NEVER use `inline-block` (which breaks inline-flex vertical centering)
+  const uiHtml = buildInlineMonitorHtml();
+  assert.equal(uiHtml.includes("'inline-block'"), false, 'Inline monitor buttons must use inline-flex, never inline-block');
+  assert.match(uiHtml, /attachBtn\.style\.display = canAttach \? 'inline-flex' : 'none'/);
+
+  // 3. Per-frame `runHudScriptSafe` isolates hung external ad sub-frames while staying Fail-Closed when main frame (0) fails
+  const runHudBlockMatch = swSource.match(
+    /async function execSingleTargetBounded[\s\S]*?async function runHudScriptSafe\(tabId, opts, timeoutMs = 1200\) \{[\s\S]*?\n\}/
+  );
+  assert.ok(runHudBlockMatch, 'Expected per-frame bounded runHudScriptSafe');
+  const runHudVm = vm.runInNewContext(
+    `(${runHudBlockMatch[0].replace('async function execSingleTargetBounded', 'const execSingleTargetBounded = async function').replace('async function runHudScriptSafe', '; return async function runHudScriptSafe')})`,
+    {
+      Promise,
+      Math,
+      Array,
+      setTimeout,
+      clearTimeout,
+      chrome: {
+        tabs: { get: async (id) => ({ id, discarded: false, status: 'complete' }) },
+        webNavigation: {
+          getAllFrames: async () => [
+            { frameId: 0, url: 'https://v2ex.com/t/123' },
+            { frameId: 55, url: 'https://slow-ads.example.net/ad.html' }
+          ]
+        },
+        scripting: {
+          executeScript: async ({ target }) => {
+            if (target.frameIds?.[0] === 0) return [{ result: ['https://v2ex.com/embed'] }];
+            // Sub-frame 55 hangs forever!
+            return await new Promise(() => {});
+          }
+        }
+      }
+    }
+  );
+  const isolatedRes = await runHudVm(1, { allFrames: true, func: () => [] }, 800);
+  assert.ok(Array.isArray(isolatedRes) && isolatedRes.length === 1, 'Healthy main frame must succeed even when slow ad sub-frame hangs');
+
+  // 4. Verify micro-font (<1px) / zero-clip prompt-injection filter, untrusted boundary escape, scoped snapshot & acceptDialog wiring
+  assert.match(swSource, /Number\.isFinite\(fSize\) && fSize < 1/);
+  assert.match(swSource, /Page\.handleJavaScriptDialog/);
+  assert.match(swSource, /isPriorityOverlayControl/);
+  assert.match(cliSource, /replace\(\/<\\\/\?untrusted_page_content\/gi/);
+});
+
+
