@@ -92,6 +92,78 @@ const CHECKOUT_SEGMENT_RX =
 
 const CHECKOUT_SUBDOMAIN_RX = /(?:^|\.)(?:checkout|pay|payment|payments|cashier|billing)\./i;
 
+function isBlockedSwIpv4Octets(a, b, c, d) {
+  if (
+    !Number.isInteger(a) ||
+    !Number.isInteger(b) ||
+    !Number.isInteger(c) ||
+    !Number.isInteger(d) ||
+    a < 0 ||
+    a > 255 ||
+    b < 0 ||
+    b > 255 ||
+    c < 0 ||
+    c > 255 ||
+    d < 0 ||
+    d > 255
+  ) {
+    return false;
+  }
+  if (a === 0) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 100 && b === 100 && c === 100 && d === 200) return true;
+  return false;
+}
+
+function isBlockedSwMetadataOrZeroHost(rawHostname) {
+  let h = String(rawHostname || '').trim().toLowerCase().replace(/\.+$/, '');
+  if (!h) return false;
+  if (!h.startsWith('[') && !h.includes(':')) {
+    try {
+      const reparsed = new URL(`http://${h}/`).hostname.toLowerCase().replace(/\.+$/, '');
+      if (reparsed) h = reparsed;
+    } catch {}
+  }
+  if (
+    h === 'metadata' ||
+    h === 'instance-data' ||
+    h === 'metadata.google.internal' ||
+    h.endsWith('.metadata.google.internal') ||
+    h === 'metadata.azure.internal' ||
+    h.endsWith('.metadata.azure.internal') ||
+    h === 'metadata.packet.net' ||
+    h === 'metadata.tencentyun.com' ||
+    /(?:^|[.-])(?:169[.-]254(?:[.-]\d{1,3}){2}|100[.-]100[.-]100[.-]200)(?:$|\.)/i.test(h)
+  ) {
+    return true;
+  }
+  const m4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m4) {
+    return isBlockedSwIpv4Octets(Number(m4[1]), Number(m4[2]), Number(m4[3]), Number(m4[4]));
+  }
+  if (h.startsWith('[') && h.endsWith(']')) {
+    const v6 = h.slice(1, -1).split('%')[0].split('%25')[0].toLowerCase();
+    if (/^[0:]+$/.test(v6) && v6.includes(':')) return true;
+    if (/^fe[89ab][0-9a-f]:/i.test(v6)) return true;
+    if (/^fd00:0*ec2:(?:0*:)*0*254$/i.test(v6)) return true;
+    const v4Suf = v6.match(/:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (v4Suf && isBlockedSwIpv4Octets(Number(v4Suf[1]), Number(v4Suf[2]), Number(v4Suf[3]), Number(v4Suf[4]))) {
+      return true;
+    }
+    const chkHex = (hiHex, loHex) => {
+      const hi = Number.parseInt(hiHex, 16);
+      const lo = Number.parseInt(loHex, 16);
+      if (!Number.isFinite(hi) || !Number.isFinite(lo)) return false;
+      return isBlockedSwIpv4Octets((hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff);
+    };
+    const m6to4 = v6.match(/^2002:([0-9a-f]{1,4}):([0-9a-f]{1,4})(?::|$)/i);
+    if (m6to4 && chkHex(m6to4[1], m6to4[2])) return true;
+    const mTail = v6.match(/^(?:(?::|[0:]+:(?:ffff:)?)|64:ff9b:(?:0*:)*)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+    if (mTail && chkHex(mTail[1], mTail[2])) return true;
+  }
+  return false;
+}
+
 function isHighEntropyPathSegment(rawSegment, options = {}) {
   if (!rawSegment) return false;
   const splitMatrix = options.splitMatrix !== false;
@@ -761,78 +833,6 @@ function pushLocalAudit(action, detail = {}, status = 'ok') {
   const safeDetail = sanitizeLocalAuditNode(detail);
   localAudit.unshift({ ts: Date.now(), action, detail: safeDetail, status });
   if (localAudit.length > 40) localAudit.length = 40;
-}
-
-function isBlockedSwIpv4Octets(a, b, c, d) {
-  if (
-    !Number.isInteger(a) ||
-    !Number.isInteger(b) ||
-    !Number.isInteger(c) ||
-    !Number.isInteger(d) ||
-    a < 0 ||
-    a > 255 ||
-    b < 0 ||
-    b > 255 ||
-    c < 0 ||
-    c > 255 ||
-    d < 0 ||
-    d > 255
-  ) {
-    return false;
-  }
-  if (a === 0) return true;
-  if (a === 169 && b === 254) return true;
-  if (a === 100 && b === 100 && c === 100 && d === 200) return true;
-  return false;
-}
-
-function isBlockedSwMetadataOrZeroHost(rawHostname) {
-  let h = String(rawHostname || '').trim().toLowerCase().replace(/\.+$/, '');
-  if (!h) return false;
-  if (!h.startsWith('[') && !h.includes(':')) {
-    try {
-      const reparsed = new URL(`http://${h}/`).hostname.toLowerCase().replace(/\.+$/, '');
-      if (reparsed) h = reparsed;
-    } catch {}
-  }
-  if (
-    h === 'metadata' ||
-    h === 'instance-data' ||
-    h === 'metadata.google.internal' ||
-    h.endsWith('.metadata.google.internal') ||
-    h === 'metadata.azure.internal' ||
-    h.endsWith('.metadata.azure.internal') ||
-    h === 'metadata.packet.net' ||
-    h === 'metadata.tencentyun.com' ||
-    /(?:^|[.-])(?:169[.-]254(?:[.-]\d{1,3}){2}|100[.-]100[.-]100[.-]200)(?:$|\.)/i.test(h)
-  ) {
-    return true;
-  }
-  const m4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (m4) {
-    return isBlockedSwIpv4Octets(Number(m4[1]), Number(m4[2]), Number(m4[3]), Number(m4[4]));
-  }
-  if (h.startsWith('[') && h.endsWith(']')) {
-    const v6 = h.slice(1, -1).split('%')[0].split('%25')[0].toLowerCase();
-    if (/^[0:]+$/.test(v6) && v6.includes(':')) return true;
-    if (/^fe[89ab][0-9a-f]:/i.test(v6)) return true;
-    if (/^fd00:0*ec2:(?:0*:)*0*254$/i.test(v6)) return true;
-    const v4Suf = v6.match(/:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-    if (v4Suf && isBlockedSwIpv4Octets(Number(v4Suf[1]), Number(v4Suf[2]), Number(v4Suf[3]), Number(v4Suf[4]))) {
-      return true;
-    }
-    const chkHex = (hiHex, loHex) => {
-      const hi = Number.parseInt(hiHex, 16);
-      const lo = Number.parseInt(loHex, 16);
-      if (!Number.isFinite(hi) || !Number.isFinite(lo)) return false;
-      return isBlockedSwIpv4Octets((hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff);
-    };
-    const m6to4 = v6.match(/^2002:([0-9a-f]{1,4}):([0-9a-f]{1,4})(?::|$)/i);
-    if (m6to4 && chkHex(m6to4[1], m6to4[2])) return true;
-    const mTail = v6.match(/^(?:(?::|[0:]+:(?:ffff:)?)|64:ff9b:(?:0*:)*)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
-    if (mTail && chkHex(mTail[1], mTail[2])) return true;
-  }
-  return false;
 }
 
 function checkTabUrlAllowed(rawUrl) {

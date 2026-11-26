@@ -4422,6 +4422,20 @@ test('27. Top-50 security & real-world forum hardening: cloud metadata/0.0.0.0 S
   const cliSource = fs.readFileSync(path.join(REPO_ROOT, 'bin', 'chrome-live.mjs'), 'utf8');
 
   // 1. Cloud metadata & 0.0.0.0 SSRF block across decimal, hex, trailing-dot, IPv4-mapped IPv6, NAT64, 6to4, nip.io & IMDSv6
+  const extGuardMatch = swSource.match(
+    /const CHECKOUT_SEGMENT_RX =[\s\S]*?function assertSafeModelSelector[\s\S]*?\n\}/
+  );
+  const extCheckTabMatch = swSource.match(/function checkTabUrlAllowed\(rawUrl\)[\s\S]*?\n\}/);
+  assert.ok(extGuardMatch && extCheckTabMatch, 'Expected extension URL & selector guardrail functions');
+  const extVm = vm.createContext({
+    URL,
+    decodeURIComponent,
+    BUILTIN_PROTECTED_DOMAINS: ['checkout.stripe.com', 'alipay.com'],
+    customBlockedDomains: [],
+    bridgeConfig: { port: 28196 }
+  });
+  vm.runInContext(`${extGuardMatch[0]}\n${extCheckTabMatch[0]}`, extVm);
+
   for (const blockedMetaUrl of [
     'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
     'http://169.254.170.2/v2/credentials',
@@ -4442,6 +4456,7 @@ test('27. Top-50 security & real-world forum hardening: cloud metadata/0.0.0.0 S
     const verdict = evaluateUrlSafety(blockedMetaUrl);
     assert.equal(verdict.allowed, false, `Must block cloud metadata / 0.0.0.0 URL: ${blockedMetaUrl}`);
     assert.equal(verdict.code, 'CLOUD_METADATA_BLOCKED');
+    assert.equal(extVm.checkTabUrlAllowed(blockedMetaUrl).allowed, false, `Extension must block metadata URL: ${blockedMetaUrl}`);
   }
 
   // Must preserve legitimate localhost, LAN, and Tailscale dev endpoints!
@@ -4453,6 +4468,7 @@ test('27. Top-50 security & real-world forum hardening: cloud metadata/0.0.0.0 S
     'http://100.96.49.47:8080/'
   ]) {
     assert.equal(evaluateUrlSafety(allowedDevUrl).allowed, true, `Must allow legitimate local/Tailscale URL: ${allowedDevUrl}`);
+    assert.equal(extVm.checkTabUrlAllowed(allowedDevUrl).allowed, true, `Extension must allow legitimate local/Tailscale URL: ${allowedDevUrl}`);
   }
 
   // 2. Inline monitor UI buttons must NEVER use `inline-block` (which breaks inline-flex vertical centering)
@@ -4465,8 +4481,9 @@ test('27. Top-50 security & real-world forum hardening: cloud metadata/0.0.0.0 S
     /async function execSingleTargetBounded[\s\S]*?async function runHudScriptSafe\(tabId, opts, timeoutMs = 1200\) \{[\s\S]*?\n\}/
   );
   assert.ok(runHudBlockMatch, 'Expected per-frame bounded runHudScriptSafe');
+  let failMainFrame = false;
   const runHudVm = vm.runInNewContext(
-    `(${runHudBlockMatch[0].replace('async function execSingleTargetBounded', 'const execSingleTargetBounded = async function').replace('async function runHudScriptSafe', '; return async function runHudScriptSafe')})`,
+    `(function() {\n${runHudBlockMatch[0]}\nreturn runHudScriptSafe;\n})()`,
     {
       Promise,
       Math,
@@ -4483,7 +4500,10 @@ test('27. Top-50 security & real-world forum hardening: cloud metadata/0.0.0.0 S
         },
         scripting: {
           executeScript: async ({ target }) => {
-            if (target.frameIds?.[0] === 0) return [{ result: ['https://v2ex.com/embed'] }];
+            if (target.frameIds?.[0] === 0) {
+              if (failMainFrame) throw new Error('main frame hung');
+              return [{ result: ['https://v2ex.com/embed'] }];
+            }
             // Sub-frame 55 hangs forever!
             return await new Promise(() => {});
           }
@@ -4493,6 +4513,10 @@ test('27. Top-50 security & real-world forum hardening: cloud metadata/0.0.0.0 S
   );
   const isolatedRes = await runHudVm(1, { allFrames: true, func: () => [] }, 800);
   assert.ok(Array.isArray(isolatedRes) && isolatedRes.length === 1, 'Healthy main frame must succeed even when slow ad sub-frame hangs');
+
+  failMainFrame = true;
+  const failClosedRes = await runHudVm(1, { allFrames: true, func: () => [] }, 800);
+  assert.equal(failClosedRes, null, 'Main frame failure MUST still return null (Fail-Closed)');
 
   // 4. Verify micro-font (<1px) / zero-clip prompt-injection filter, untrusted boundary escape, scoped snapshot & acceptDialog wiring
   assert.match(swSource, /Number\.isFinite\(fSize\) && fSize < 1/);
