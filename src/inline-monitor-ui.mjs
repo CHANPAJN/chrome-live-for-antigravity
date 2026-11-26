@@ -790,14 +790,14 @@ export function buildInlineMonitorHtml() {
         hasActiveTabs = tabs.length > 0;
         const prevInRelay = Boolean(currentTab && currentTab.inRelayPopout);
 
-        // When all controlled tabs have been released/closed and no specific missing tab was requested,
-        // clear the pin lock so future newly opened tabs mount cleanly without getting stuck!
-        if (tabs.length === 0 && !data.requestedTabMissing) {
+        // When all controlled tabs have been released/closed, unconditionally clear the pin lock
+        // (zero remaining tabs can be accidentally auto-captured, and future newly opened tabs mount without deadlock)
+        if (tabs.length === 0) {
           selectedTabId = null;
           pinnedTabClosed = false;
         }
 
-        if (typeof data.requestedTabId === 'number' && selectedTabId === null) {
+        if (typeof data.requestedTabId === 'number' && selectedTabId === null && !data.requestedTabMissing) {
           selectedTabId = data.requestedTabId;
         }
 
@@ -825,7 +825,7 @@ export function buildInlineMonitorHtml() {
           regionBtn.disabled = isPaused;
           if (isPaused && interactionMode !== 'watch') setMode('watch');
           attachBtn.disabled = false;
-          relayBtn.disabled = false;
+          relayBtn.disabled = isPaused && !primary.inRelayPopout;
           snapBtn.disabled = isPaused;
           releaseBtn.disabled = false;
           if (primary.inRelayPopout) {

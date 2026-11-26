@@ -74,7 +74,7 @@ function parseValidExtensionOrigin(originHeader) {
   return null;
 }
 
-const URL_FIELD_KEYS = new Set(['url', 'pageUrl', 'finalUrl', 'href', 'targetUrl']);
+const URL_FIELD_KEYS = new Set(['url', 'pageUrl', 'finalUrl', 'href', 'targetUrl', 'frameUrl']);
 const URL_ARRAY_KEYS = new Set(['urls', 'images']);
 const TEXT_URL_SCRUB_KEYS = new Set([
   'error',
@@ -206,6 +206,7 @@ export function createDaemonServer(options = {}) {
     state.tabs = [];
     state.latestFrame = null;
     state.framesByTab.clear();
+    auditLog.length = 0;
     state.updatedAt = Date.now();
   }
 
@@ -274,11 +275,10 @@ export function createDaemonServer(options = {}) {
   function recordAudit(action, detail = {}, status = 'ok') {
     const safeDetail =
       detail && typeof detail === 'object'
-        ? {
-            ...detail,
-            ...(typeof detail.url === 'string' ? { url: redactUrlForAudit(detail.url) } : {})
-          }
-        : detail;
+        ? redactPayloadUrls(detail)
+        : typeof detail === 'string'
+          ? redactUrlsInText(detail)
+          : detail;
     const entry = {
       id: crypto.randomUUID(),
       ts: Date.now(),
@@ -662,11 +662,12 @@ export function createDaemonServer(options = {}) {
       return;
     }
 
-    // Block arbitrary web page cross-origin requests (including no-cors <script>/fetch via Sec-Fetch-Site)
+    // Block arbitrary web page requests (including cross-site and same-site cross-port `http://127.0.0.1:<other>` probes)
     const secFetchSite = String(req.headers['sec-fetch-site'] || '').trim().toLowerCase();
+    const hasValidExtOrigin = Boolean(parseValidExtensionOrigin(req.headers.origin));
     if (
-      (req.headers.origin && !parseValidExtensionOrigin(req.headers.origin)) ||
-      (secFetchSite === 'cross-site' && !parseValidExtensionOrigin(req.headers.origin))
+      (req.headers.origin && !hasValidExtOrigin) ||
+      ((secFetchSite === 'cross-site' || secFetchSite === 'same-site') && !hasValidExtOrigin)
     ) {
       res.writeHead(403, {
         'Content-Type': 'text/plain; charset=utf-8',
@@ -956,7 +957,12 @@ export function createDaemonServer(options = {}) {
       return;
     }
 
-    if (req.headers.origin && !parseValidExtensionOrigin(req.headers.origin)) {
+    const wsSecFetchSite = String(req.headers['sec-fetch-site'] || '').trim().toLowerCase();
+    const wsHasExtOrigin = Boolean(parseValidExtensionOrigin(req.headers.origin));
+    if (
+      (req.headers.origin && !wsHasExtOrigin) ||
+      ((wsSecFetchSite === 'cross-site' || wsSecFetchSite === 'same-site') && !wsHasExtOrigin)
+    ) {
       socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;

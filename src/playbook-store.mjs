@@ -198,15 +198,23 @@ export function sanitizeRouteUrl(rawUrl, customBlockedDomains = []) {
     }
   }
 
-  for (const key of Array.from(u.searchParams.keys())) {
-    if (STRIP_QUERY_PATTERNS.some((rx) => rx.test(key)) || AUDIT_SENSITIVE_PARAM_RX.test(key)) {
+  for (const [key, val] of Array.from(u.searchParams.entries())) {
+    if (
+      STRIP_QUERY_PATTERNS.some((rx) => rx.test(key)) ||
+      AUDIT_SENSITIVE_PARAM_RX.test(key) ||
+      isHighEntropyPathToken(val)
+    ) {
       u.searchParams.delete(key);
     }
   }
-  if (u.pathname && u.pathname.length >= 32) {
+  if (u.pathname) {
     const parts = u.pathname.split('/');
     for (let i = 0; i < parts.length; i++) {
-      if (isHighEntropyPathToken(parts[i])) {
+      if (!parts[i]) continue;
+      if (parts[i].includes(';')) {
+        const cleanHead = parts[i].split(';')[0];
+        parts[i] = isHighEntropyPathToken(cleanHead) ? 'REDACTED' : cleanHead;
+      } else if (isHighEntropyPathToken(parts[i])) {
         parts[i] = 'REDACTED';
       }
     }
@@ -412,7 +420,7 @@ export function saveManualPlaybook({ domain: rawDomain, route, tip, tipIndex, se
     if (!routeHost || (routeHost !== domain && !routeHost.endsWith(`.${domain}`))) {
       throw new Error(`Route URL host "${routeHost}" does not match playbook domain "${domain}"`);
     }
-    const name = String(route.name).trim().slice(0, 64);
+    const name = redactUrlsInText(String(route.name).replace(/[\x00-\x1f]/g, ' ').trim()).slice(0, 64);
     if (!isSafeDictKey(name)) throw new Error('Invalid route shortcut name');
     if (route.oldName && route.oldName !== name && Object.hasOwn(bucket.routes, route.oldName)) {
       delete bucket.routes[route.oldName];
@@ -425,11 +433,11 @@ export function saveManualPlaybook({ domain: rawDomain, route, tip, tipIndex, se
   }
 
   if (selector && typeof selector === 'object' && selector.name && selector.css) {
-    const name = String(selector.name).trim().slice(0, 48);
-    const css = String(selector.css).trim().slice(0, 140);
+    const name = redactUrlsInText(String(selector.name).replace(/[\x00-\x1f]/g, ' ').trim()).slice(0, 48);
+    const css = String(selector.css).replace(/[\x00-\x1f]/g, ' ').trim().slice(0, 140);
     if (!isSafeDictKey(name)) throw new Error('Invalid selector alias');
-    if (SENSITIVE_SELECTOR_RX.test(name) || SENSITIVE_SELECTOR_RX.test(css)) {
-      throw new Error('Refusing to store sensitive password/OTP/token selector in playbook');
+    if (SENSITIVE_SELECTOR_RX.test(name) || SENSITIVE_SELECTOR_RX.test(css) || /[\^$*~|]=|\\|\/\*|\*\/|:has\s*\(/i.test(css)) {
+      throw new Error('Refusing to store sensitive or probing selector in playbook');
     }
     if (selector.oldName && selector.oldName !== name && Object.hasOwn(bucket.selectors, selector.oldName)) {
       delete bucket.selectors[selector.oldName];
@@ -442,7 +450,7 @@ export function saveManualPlaybook({ domain: rawDomain, route, tip, tipIndex, se
   }
 
   if (typeof tip === 'string' && tip.trim()) {
-    const cleanTip = tip.trim().slice(0, 200);
+    const cleanTip = redactUrlsInText(tip.replace(/[\x00-\x1f]/g, ' ').trim()).slice(0, 200);
     if (typeof tipIndex === 'number' && tipIndex >= 0 && tipIndex < bucket.tips.length) {
       bucket.tips[tipIndex] = cleanTip;
     } else if (!bucket.tips.includes(cleanTip)) {

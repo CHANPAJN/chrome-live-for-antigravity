@@ -140,14 +140,30 @@ function callDaemon(method, routePath, bodyObj = null, timeoutMs = 6000) {
           : baseHeaders
       },
       (res) => {
+        const status = res.statusCode || 500;
+        if (!verifyDaemonHttp(token, status, res.headers, ts, nonce)) {
+          res.destroy();
+          req.destroy();
+          reject(new Error('Unverified local service on daemon port'));
+          return;
+        }
+        const MAX_RES_BYTES = 16 * 1024 * 1024;
         const chunks = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () => {
-          const status = res.statusCode || 500;
-          if (!verifyDaemonHttp(token, status, res.headers, ts, nonce)) {
-            reject(new Error('Unverified local service on daemon port'));
+        let received = 0;
+        let aborted = false;
+        res.on('data', (c) => {
+          received += c.length;
+          if (received > MAX_RES_BYTES) {
+            aborted = true;
+            res.destroy();
+            req.destroy();
+            reject(new Error('Daemon response exceeded 16MB safety cap'));
             return;
           }
+          chunks.push(c);
+        });
+        res.on('end', () => {
+          if (aborted) return;
           resolve({
             status,
             contentType: res.headers['content-type'] || 'application/octet-stream',
@@ -238,7 +254,6 @@ async function handleAction(data = {}) {
   }
 }
 
-app.api('/api/action', handleAction, 'GET');
 app.api('/api/action', handleAction, 'POST');
 
 app.run();

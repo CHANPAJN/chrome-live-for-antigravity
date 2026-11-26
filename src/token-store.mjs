@@ -39,6 +39,27 @@ export function ensureSecureDirSync(dirPath) {
   return resolved;
 }
 
+export function tightenFileAclSync(filePath) {
+  const resolved = path.resolve(filePath);
+  try {
+    if (process.platform !== 'win32') {
+      fs.chmodSync(resolved, 0o600);
+    } else {
+      const username = os.userInfo().username;
+      if (username && !/["\r\n]/.test(username)) {
+        spawnSync('icacls', [resolved, '/inheritance:r', '/grant:r', `${username}:F`], {
+          windowsHide: true,
+          stdio: 'ignore',
+          timeout: 3000
+        });
+      }
+    }
+  } catch {
+    // Best-effort ACL tightening in restricted sandboxes
+  }
+  return resolved;
+}
+
 export function getTokenFilePath() {
   return path.join(getStateDir(), 'auth.token');
 }
@@ -61,7 +82,9 @@ export function ensureAuthToken() {
 
   const dir = ensureSecureDirSync(getStateDir());
   const fresh = crypto.randomBytes(32).toString('hex');
-  fs.writeFileSync(path.join(dir, 'auth.token'), `${fresh}\n`, { encoding: 'utf8', mode: 0o600 });
+  const outPath = path.join(dir, 'auth.token');
+  fs.writeFileSync(outPath, `${fresh}\n`, { encoding: 'utf8', mode: 0o600 });
+  tightenFileAclSync(outPath);
   return fresh;
 }
 

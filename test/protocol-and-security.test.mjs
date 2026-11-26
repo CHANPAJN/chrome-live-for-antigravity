@@ -1575,6 +1575,7 @@ test('Security audit hardening: mutual HTTP/WS HMAC, replay defense, runtime boo
     },
     placeInBackgroundTabGroup: async () => {},
     waitForTabComplete: async () => {},
+    inspectEmbeddedFramesSafety: async () => ({ allowed: true, frameUrl: '', reason: '' }),
     detachManagedTab: async () => {},
     syncHud: async () => {},
     syncLiveTabGroups: async () => {},
@@ -2652,6 +2653,480 @@ test('Blind-audit round-4 regressions: quote-aware CSS comment/pseudo lexer, bat
     try {
       extWs?.socket?.destroy();
     } catch {}
+    await daemon.close();
+    fs.rmSync(tempStateDir, { recursive: true, force: true });
+  }
+});
+
+test('Blind-audit round-5 regressions: MCP batch screenshot & playbook opt-in lock, shareTab/captureQuickFrame embedded frame guardrails, AntD sibling/split-OTP/token typing block, literal %25 vs 4x-encoding, query-value/punctuation URL redaction, inline UI sole-tab release unlock, audit wipe on rotation & pre-buffer HTTP sig check', async () => {
+  const { spawn } = await import('node:child_process');
+  const { redactUrlsInText } = await import('../src/guardrails.mjs');
+  const { buildInlineMonitorHtml } = await import('../src/inline-monitor-ui.mjs');
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+
+  // 1. Literal `%25` (e.g. `50%25-off`) passes cleanly while 4x/7x percent-encoded `/checkout` is blocked
+  const extHelperMatch = swSource.match(
+    /const CHECKOUT_SEGMENT_RX =[\s\S]*?function canonicalizeRouteForGuardrail[\s\S]*?\n\}/
+  );
+  const extRedactorMatch = swSource.match(
+    /const LOCAL_AUDIT_SENSITIVE_PARAM_RX =[\s\S]*?function redactUrlsInTextLocal[\s\S]*?\n\}/
+  );
+  const extCheckTabMatch = swSource.match(/function checkTabUrlAllowed\(rawUrl\)[\s\S]*?\n\}/);
+  assert.ok(extHelperMatch && extRedactorMatch && extCheckTabMatch);
+  const extVm = vm.createContext({
+    URL,
+    decodeURIComponent,
+    BUILTIN_PROTECTED_DOMAINS: ['stripe.com', 'alipay.com'],
+    customBlockedDomains: [],
+    bridgeConfig: { port: 28196 }
+  });
+  vm.runInContext(`${extHelperMatch[0]}\n${extRedactorMatch[0]}\n${extCheckTabMatch[0]}`, extVm);
+
+  for (const validLiteralPct of [
+    'https://shop.example.com/promo/50%25-off',
+    'https://shop.example.com/#/search?q=100%25'
+  ]) {
+    assert.equal(evaluateUrlSafety(validLiteralPct).allowed, true, `Must allow literal %25 URL: ${validLiteralPct}`);
+    assert.equal(extVm.checkTabUrlAllowed(validLiteralPct).allowed, true);
+  }
+  for (const multiEncodedCheckout of [
+    'https://shop.example.com/%25252563heckout', // 4x encoded
+    'https://shop.example.com/%2525252525252563heckout' // 7x deep evasion
+  ]) {
+    assert.equal(evaluateUrlSafety(multiEncodedCheckout).allowed, false, `Must block ${multiEncodedCheckout}`);
+    assert.equal(extVm.checkTabUrlAllowed(multiEncodedCheckout).allowed, false);
+  }
+
+  // 2. High-entropy query values (`?v=eyJ...`, `?id=<32hex>`, `#/verify?v=...`), 32-char Base64url & trailing punctuation URL redaction
+  const magicQueryUrl =
+    'https://seller.example.com/magic/verify?v=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0&id=9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c&tab=orders';
+  const redMagic = redactUrlForAudit(magicQueryUrl);
+  assert.equal(redMagic.includes('eyJhbGci'), false, 'High-entropy JWT under non-sensitive param ?v= must be redacted');
+  assert.equal(redMagic.includes('9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c'), false);
+  assert.equal(redMagic.includes('tab=orders'), true, 'Normal query param must remain intact');
+  assert.equal(extVm.redactAuditUrl(magicQueryUrl).includes('eyJhbGci'), false);
+
+  const hashQueryTokenUrl = 'https://seller.example.com/app/#/verify?v=9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c&step=2';
+  assert.equal(redactUrlForAudit(hashQueryTokenUrl).includes('9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c'), false);
+  assert.equal(extVm.redactAuditUrl(hashQueryTokenUrl).includes('9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c'), false);
+
+  const cleanPlaybookRoute = sanitizeRouteUrl(magicQueryUrl);
+  assert.equal(cleanPlaybookRoute.includes('eyJhbGci'), false);
+  assert.equal(cleanPlaybookRoute.includes('9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c'), false);
+  assert.equal(cleanPlaybookRoute.includes('tab=orders'), true);
+
+  const punctSentence =
+    'Visit https://app.example.com/reset/9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c. Or https://app.example.com/k/AbCdEfGhIjKlMnOpQrStUvWxYz012345;jsessionid=SECRET_SID_99, thanks!';
+  const scrubbedSentence = redactUrlsInText(punctSentence);
+  assert.equal(scrubbedSentence.includes('9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c'), false, 'Trailing period must not defeat URL token redaction');
+  assert.equal(scrubbedSentence.includes('AbCdEfGhIjKlMnOpQrStUvWxYz012345'), false, '32-char Base64url + matrix param must be redacted');
+  assert.equal(scrubbedSentence.includes('SECRET_SID_99'), false);
+  assert.match(scrubbedSentence, /REDACTED\./);
+  assert.equal(extVm.redactUrlsInTextLocal(punctSentence).includes('9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c'), false);
+
+  // 3. Automated typing blocks AntD sibling labels, 6-box split OTP inputs, and `#sms-input`/`access_token`/`api_key` without bleeding across form rows
+  const typeGuardMatch = swSource.match(
+    /if \(!el\) return \{ ok: false, error: `Input element not found: \$\{tgt\}` \};\s*(const elStyle = window\.getComputedStyle\(el\);[\s\S]*?return \{\s*ok: false,\s*error:\s*'\[GUARDRAIL\] Automated typing into password[\s\S]*?\};\s*\})/
+  );
+  assert.ok(typeGuardMatch);
+  const evalTypeGuard = vm.runInNewContext(
+    `(function(el, outerMatchedEl, document, window, HTMLInputElement) { ${typeGuardMatch[1]} return { ok: true }; })`
+  );
+  class MockInputEl {}
+  const mockWin = { getComputedStyle: () => ({ webkitTextSecurity: 'none', getPropertyValue: () => 'none' }) };
+  const mockDoc = { getElementById: () => null };
+
+  // 3a. AntD / ElementPlus sibling label (`<div class="form-item"><div class="lbl">短信验证码</div><div class="ctrl"><input></div></div>`)
+  const siblingLabelDiv = { textContent: '短信验证码', previousElementSibling: null, querySelector: () => null };
+  const ctrlWrapperDiv = {
+    id: '',
+    labels: [],
+    previousElementSibling: siblingLabelDiv,
+    parentElement: null,
+    closest: () => null,
+    getRootNode: () => ({}),
+    getAttribute: () => ''
+  };
+  const antdOtpInput = Object.assign(new MockInputEl(), {
+    tagName: 'INPUT',
+    type: 'text',
+    id: '',
+    maxLength: -1,
+    labels: [],
+    previousElementSibling: null,
+    parentElement: ctrlWrapperDiv,
+    closest: () => null,
+    getRootNode: () => ({}),
+    getAttribute: () => ''
+  });
+  assert.equal(evalTypeGuard(antdOtpInput, antdOtpInput, mockDoc, mockWin, MockInputEl).ok, false, 'Must block AntD sibling label OTP field');
+
+  // 3b. Adjacent normal form row right after a password form row MUST NOT be false-positively blocked!
+  const prevPasswordRow = {
+    textContent: '登录密码',
+    previousElementSibling: null,
+    querySelector: (sel) => (sel.includes('input') ? {} : null) // contains its own <input>
+  };
+  const normalRowLabel = { textContent: '商品标题', previousElementSibling: null, querySelector: () => null };
+  const normalRowCtrl = {
+    id: '',
+    labels: [],
+    previousElementSibling: normalRowLabel,
+    parentElement: null,
+    closest: () => null,
+    getRootNode: () => ({}),
+    getAttribute: () => ''
+  };
+  const normalFormRow = {
+    id: '',
+    labels: [],
+    previousElementSibling: prevPasswordRow,
+    parentElement: null,
+    closest: () => null,
+    getRootNode: () => ({}),
+    getAttribute: () => ''
+  };
+  normalRowCtrl.parentElement = normalFormRow;
+  const normalTitleInput = Object.assign(new MockInputEl(), {
+    tagName: 'INPUT',
+    type: 'text',
+    id: 'product-title',
+    maxLength: -1,
+    labels: [],
+    previousElementSibling: null,
+    parentElement: normalRowCtrl,
+    closest: () => null,
+    getRootNode: () => ({}),
+    getAttribute: (k) => (k === 'name' ? 'productTitle' : '')
+  });
+  assert.equal(evalTypeGuard(normalTitleInput, normalTitleInput, mockDoc, mockWin, MockInputEl).ok, true, 'Must NOT bleed previous row password label into normal input');
+
+  // 3c. 6-box single-character split OTP input (`maxlength="1"` x 6)
+  const otpRowContainer = {
+    id: '',
+    labels: [],
+    previousElementSibling: null,
+    parentElement: null,
+    closest: () => null,
+    getRootNode: () => ({}),
+    getAttribute: () => '',
+    querySelectorAll: (sel) => (sel === 'input[maxlength="1"]' ? [{}, {}, {}, {}, {}, {}] : [])
+  };
+  const splitBoxInput = Object.assign(new MockInputEl(), {
+    tagName: 'INPUT',
+    type: 'tel',
+    id: '',
+    maxLength: 1,
+    labels: [],
+    previousElementSibling: null,
+    parentElement: otpRowContainer,
+    closest: () => null,
+    getRootNode: () => ({}),
+    getAttribute: (k) => (k === 'maxlength' ? '1' : '')
+  });
+  assert.equal(evalTypeGuard(splitBoxInput, splitBoxInput, mockDoc, mockWin, MockInputEl).ok, false, 'Must block 6-box split OTP input');
+
+  // 3d. `#sms-input`, `name="access_token"`, `name="api_key"`
+  for (const [idVal, nameVal] of [
+    ['sms-input', ''],
+    ['', 'access_token'],
+    ['', 'api_key'],
+    ['', 'clientSecret']
+  ]) {
+    const tokenInput = Object.assign(new MockInputEl(), {
+      tagName: 'INPUT',
+      type: 'text',
+      id: idVal,
+      maxLength: -1,
+      labels: [],
+      previousElementSibling: null,
+      parentElement: null,
+      closest: () => null,
+      getRootNode: () => ({}),
+      getAttribute: (k) => (k === 'name' ? nameVal : '')
+    });
+    assert.equal(evalTypeGuard(tokenInput, tokenInput, mockDoc, mockWin, MockInputEl).ok, false, `Must block ${idVal || nameVal}`);
+  }
+
+  // 4. `shareTab` blocks pages with embedded cross-origin payment iframes BEFORE managedTabs.set or captureQuickFrame
+  const shareTabMatch = swSource.match(/async function shareTab\(tab, toggleIfAlreadyShared = false\)[\s\S]*?\n\}/);
+  assert.ok(shareTabMatch);
+  const mockManaged = new Map();
+  let capturedDuringBlockedShare = false;
+  const runShareTab = vm.runInNewContext(`(${shareTabMatch[0]})`, {
+    managedTabs: mockManaged,
+    wsSuppressedByOtherProfile: false,
+    connectWebSocket: () => {},
+    checkTabUrlAllowed: () => ({ allowed: true, reason: '' }),
+    inspectEmbeddedFramesSafety: async () => ({
+      allowed: false,
+      frameUrl: 'https://checkout.stripe.com/c/pay/cs_live_123',
+      reason: 'Embedded payment/protected sub-frame: Protected financial/security domain (stripe.com)'
+    }),
+    captureQuickFrame: async () => {
+      capturedDuringBlockedShare = true;
+    },
+    pushLocalAudit: () => {},
+    notifyPanelAndDaemon: () => {},
+    tr: () => ({ sharedReady: 'Ready', groupTitle: 'Live' })
+  });
+  await runShareTab({ id: 505, url: 'https://shop.example.com/order/1', title: 'Order 1', windowId: 1, groupId: -1 });
+  assert.equal(mockManaged.has(505), false, 'shareTab must NOT add tab with embedded Stripe iframe into managedTabs');
+  assert.equal(capturedDuringBlockedShare, false, 'shareTab must NOT capture frame on blocked embedded payment page');
+
+  // 5. Inline Monitor UI state machine: releasing sole tab unlocks `selectedTabId` for future tabs while preserving multi-tab pin lock & disabling Popout when paused
+  const html = buildInlineMonitorHtml();
+  const renderBlockMatch = html.match(/function renderTabStrip\(tabs\)[\s\S]*?function renderSnapshot\(data\)[\s\S]*?\n      \}/);
+  assert.ok(renderBlockMatch, 'Must locate renderSnapshot in inline monitor HTML');
+  const makeStubEl = () => ({
+    textContent: '',
+    disabled: false,
+    src: '',
+    onload: null,
+    style: { display: '' },
+    dataset: {},
+    removeAttribute(attr) {
+      if (attr === 'src') this.src = '';
+    },
+    replaceChildren() {},
+    appendChild() {},
+    addEventListener() {}
+  });
+  const uiCtx = vm.createContext({
+    IS_ZH: true,
+    L: { offline: 'Offline', active: 'Active', idle: 'Idle', relayOut: 'Popout', relayBack: 'Merge' },
+    selectedTabId: null,
+    currentTab: null,
+    hasActiveTabs: false,
+    lastFrameTs: 0,
+    lastFrameTabId: null,
+    interactionMode: 'watch',
+    led: makeStubEl(),
+    titleEl: makeStubEl(),
+    subEl: makeStubEl(),
+    screenImg: makeStubEl(),
+    emptyEl: makeStubEl(),
+    remoteBtn: makeStubEl(),
+    regionBtn: makeStubEl(),
+    attachBtn: makeStubEl(),
+    relayBtn: makeStubEl(),
+    snapBtn: makeStubEl(),
+    releaseBtn: makeStubEl(),
+    tabStrip: makeStubEl(),
+    document: { createElement: () => makeStubEl() },
+    setMode(m) {
+      this.interactionMode = m;
+    },
+    setBtnLabel() {},
+    showStatus() {},
+    reportSize() {},
+    callAppAction: async () => {}
+  });
+  vm.runInContext(
+    `${renderBlockMatch[0]}\nthis.__getState = () => ({ selectedTabId, currentTab, pinnedTabClosed, relayDisabled: relayBtn.disabled });\nthis.__render = renderSnapshot;`,
+    uiCtx
+  );
+
+  // Mount sole tab 101 -> release sole tab 101 (`tabs: []`, `requestedTabId: 101`, `requestedTabMissing: true`) -> open new tab 202
+  uiCtx.__render({ ok: true, extensionConnected: true, tabs: [{ tabId: 101, substate: 'shared', paused: false, title: 'A' }] });
+  assert.equal(uiCtx.__getState().selectedTabId, 101);
+  uiCtx.__render({ ok: true, extensionConnected: true, tabs: [], requestedTabId: 101, requestedTabMissing: true });
+  assert.equal(uiCtx.__getState().selectedTabId, null, 'Releasing sole tab must reset selectedTabId to prevent deadlock');
+  assert.equal(uiCtx.__getState().pinnedTabClosed, false);
+  uiCtx.__render({ ok: true, extensionConnected: true, tabs: [{ tabId: 202, substate: 'worker', paused: false, title: 'B' }] });
+  assert.equal(uiCtx.__getState().currentTab?.tabId, 202, 'Newly opened tab 202 must auto-mount after sole tab release');
+
+  // Ordinary paused tab (`inRelayPopout: false`) MUST disable `relayBtn`
+  uiCtx.__render({
+    ok: true,
+    extensionConnected: true,
+    tabs: [{ tabId: 202, substate: 'worker', paused: true, inRelayPopout: false, title: 'B' }]
+  });
+  assert.equal(uiCtx.__getState().relayDisabled, true, 'Popout button must be disabled when tab is paused in main window');
+
+  // Multi-tab pin isolation: watching 88 while [77, 88] exist -> 88 closes leaving [77] -> MUST stay locked (`currentTab === null`)
+  uiCtx.__render({
+    ok: true,
+    extensionConnected: true,
+    tabs: [
+      { tabId: 77, substate: 'shared', paused: false, title: 'Mail' },
+      { tabId: 88, substate: 'worker', paused: false, title: 'Task' }
+    ]
+  });
+  vm.runInContext('selectedTabId = 88; pinnedTabClosed = false;', uiCtx);
+  uiCtx.__render({
+    ok: true,
+    extensionConnected: true,
+    tabs: [{ tabId: 77, substate: 'shared', paused: false, title: 'Mail' }],
+    requestedTabId: 88,
+    requestedTabMissing: true
+  });
+  assert.equal(uiCtx.__getState().currentTab, null, 'Closing watched tab 88 must NOT silently jump to remaining shared tab 77');
+  assert.equal(uiCtx.__getState().pinnedTabClosed, true);
+
+  // 6. Custom `CHROME_LIVE_HOME` blocks uploading `site-playbooks.json` or state files even when parent dir is in `CHROME_LIVE_UPLOAD_DIR`
+  const customHomeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-r5-home-parent-'));
+  const customStateHome = path.join(customHomeRoot, 'my-custom-clive-state');
+  fs.mkdirSync(path.join(customStateHome, 'uploads'), { recursive: true });
+  const fakePlaybookPath = path.join(customStateHome, 'site-playbooks.json');
+  const fakeInternalNote = path.join(customStateHome, 'internal-cache.json');
+  const stagedOkFile = path.join(customStateHome, 'uploads', 'ok.png');
+  fs.writeFileSync(fakePlaybookPath, '{}', 'utf8');
+  fs.writeFileSync(fakeInternalNote, '{}', 'utf8');
+  fs.writeFileSync(stagedOkFile, 'PNG', 'utf8');
+  const prevHomeEnv = process.env.CHROME_LIVE_HOME;
+  process.env.CHROME_LIVE_HOME = customStateHome;
+  try {
+    assert.equal(evaluateUploadFileSafety(fakePlaybookPath, { allowedDirs: [customHomeRoot] }).allowed, false);
+    assert.equal(evaluateUploadFileSafety(fakeInternalNote, { allowedDirs: [customHomeRoot] }).allowed, false);
+    assert.equal(evaluateUploadFileSafety(stagedOkFile, { allowedDirs: [customHomeRoot] }).allowed, true);
+    // Manual playbook tip scrubbing
+    setPlaybookEnabled(true, customStateHome);
+    saveManualPlaybook({
+      domain: 'seller.example.com',
+      tip: 'Login callback was https://seller.example.com/cb?access_token=TIP_SECRET_777.',
+      stateDir: customStateHome
+    });
+    const pb = lookupDomainPlaybook('seller.example.com', [], customStateHome);
+    assert.equal(JSON.stringify(pb).includes('TIP_SECRET_777'), false, 'Manual playbook tip URL secret must be redacted');
+  } finally {
+    if (prevHomeEnv === undefined) delete process.env.CHROME_LIVE_HOME;
+    else process.env.CHROME_LIVE_HOME = prevHomeEnv;
+    fs.rmSync(customHomeRoot, { recursive: true, force: true });
+  }
+
+  // 7. Daemon audit wipe on token rotation, `Sec-Fetch-Site: same-site` 403 block, MCP `batch` screenshot & `playbook` opt-in enforcement, and pre-buffer fake-daemon abort
+  const tempStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-r5-daemon-'));
+  let tok = crypto.randomBytes(32).toString('hex');
+  fs.writeFileSync(path.join(tempStateDir, 'auth.token'), `${tok}\n`, 'utf8');
+  const daemon = createDaemonServer({ host: '127.0.0.1', port: 0, stateDir: tempStateDir, token: () => tok });
+  const port = await daemon.listen();
+  let mcpProc = null;
+  let rogueServer = null;
+  let r5ExtWs = null;
+  try {
+    // Same-site cross-port web request (`http://127.0.0.1:3000` -> `Sec-Fetch-Site: same-site`, no Origin) MUST get 403!
+    const sameSiteProbe = await new Promise((resolve, reject) => {
+      http
+        .get(
+          { host: '127.0.0.1', port, path: '/api/ping', agent: false, headers: { 'Sec-Fetch-Site': 'same-site' } },
+          (res) => {
+            res.resume();
+            resolve(res.statusCode);
+          }
+        )
+        .on('error', reject);
+    });
+    assert.equal(sameSiteProbe, 403, 'Sec-Fetch-Site: same-site cross-port web probe must be rejected with 403');
+
+    // Connect extension peer & generate a blocked audit entry, then rotate token -> auditLog MUST be wiped!
+    r5ExtWs = await connectTestWsClient(port, '/ws/extension', tok);
+    r5ExtWs.sendMaskedJson({ type: 'hello', version: '1.0.0', tabs: [] });
+    await new Promise((r) => setTimeout(r, 20));
+    await httpJson(port, 'POST', '/api/command', { token: tok }, { method: 'open', params: { url: 'https://checkout.stripe.com/pay' } });
+    const auditBefore = await httpJson(port, 'GET', '/api/audit', { token: tok });
+    assert.ok(auditBefore.json.entries.length >= 1);
+
+    tok = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(path.join(tempStateDir, 'auth.token'), `${tok}\n`, 'utf8');
+    const healthAfterRot = await httpJson(port, 'GET', '/api/health', { token: tok });
+    assert.deepEqual(healthAfterRot.json.recentAudit, [], 'Token rotation must wipe recentAudit');
+    const auditAfterRot = await httpJson(port, 'GET', '/api/audit', { token: tok });
+    assert.deepEqual(auditAfterRot.json.entries, [], 'Token rotation must wipe /api/audit entries');
+
+    // MCP server blocks `screenshot` inside `chrome_live_batch` and blocks model-initiated `playbook enable` / opt-out `save`
+    const cliPath = path.join(REPO_ROOT, 'bin', 'chrome-live.mjs');
+    mcpProc = spawn(process.execPath, [cliPath, 'mcp'], {
+      env: { ...process.env, CHROME_LIVE_PORT: String(port), CHROME_LIVE_HOME: tempStateDir },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    let mcpBuf = '';
+    const pendingMcp = new Map();
+    mcpProc.stdout.setEncoding('utf8');
+    mcpProc.stdout.on('data', (chunk) => {
+      mcpBuf += chunk;
+      let idx;
+      while ((idx = mcpBuf.indexOf('\n')) !== -1) {
+        const line = mcpBuf.slice(0, idx).trim();
+        mcpBuf = mcpBuf.slice(idx + 1);
+        if (!line) continue;
+        const msg = JSON.parse(line);
+        if (pendingMcp.has(msg.id)) {
+          pendingMcp.get(msg.id)(msg);
+          pendingMcp.delete(msg.id);
+        }
+      }
+    });
+    const callMcp = (id, method, params) =>
+      new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error(`MCP call ${id} timed out`)), 3000);
+        pendingMcp.set(id, (m) => {
+          clearTimeout(t);
+          resolve(m);
+        });
+        mcpProc.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
+      });
+
+    await callMcp(1, 'initialize', {});
+    const batchShotRes = await callMcp(2, 'tools/call', {
+      name: 'chrome_live_batch',
+      arguments: { steps: [{ action: 'screenshot' }] }
+    });
+    assert.equal(batchShotRes.result.isError, true, 'MCP chrome_live_batch must block raw screenshot exfiltration');
+    assert.match(batchShotRes.result.content[0].text, /GUARDRAIL/);
+
+    const pbEnableRes = await callMcp(3, 'tools/call', {
+      name: 'chrome_live_playbook',
+      arguments: { action: 'enable' }
+    });
+    assert.equal(pbEnableRes.result.isError, true, 'MCP must block model from enabling opt-in playbooks');
+
+    const pbSaveWhileOffRes = await callMcp(4, 'tools/call', {
+      name: 'chrome_live_playbook',
+      arguments: { action: 'save', domain: 'seller.example.com', tip: 'Injected cross-session prompt' }
+    });
+    assert.equal(pbSaveWhileOffRes.result.isError, true, 'MCP must block playbook save while playbooks are disabled');
+
+    // Pre-buffer HTTP response signature check: rogue process streaming infinite body without valid sig is aborted immediately!
+    let rogueChunksWritten = 0;
+    rogueServer = http.createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' }); // NO X-Chrome-Live-Server-Sig!
+      const iv = setInterval(() => {
+        if (res.destroyed) {
+          clearInterval(iv);
+          return;
+        }
+        rogueChunksWritten++;
+        res.write(Buffer.alloc(65536, 0x41));
+      }, 5);
+      res.on('close', () => clearInterval(iv));
+    });
+    await new Promise((resolve) => rogueServer.listen(0, '127.0.0.1', resolve));
+    const roguePort = rogueServer.address().port;
+    const rogueRun = spawnSync(process.execPath, [cliPath, 'stop'], {
+      env: { ...process.env, CHROME_LIVE_PORT: String(roguePort), CHROME_LIVE_HOME: tempStateDir },
+      encoding: 'utf8',
+      timeout: 3000
+    });
+    // `stop` catches unverified daemon error and prints nothing/harmless message without hanging or buffering infinite stream
+    assert.equal(rogueRun.error, undefined, 'CLI must abort unverified streaming response immediately without timing out');
+    assert.ok(rogueChunksWritten <= 3, `CLI must destroy socket on response headers before buffering (wrote ${rogueChunksWritten} chunks)`);
+  } finally {
+    try {
+      r5ExtWs?.socket?.destroy();
+    } catch {}
+    if (mcpProc) {
+      try {
+        mcpProc.stdin?.destroy();
+        mcpProc.stdout?.destroy();
+        mcpProc.stderr?.destroy();
+      } catch {}
+      mcpProc.kill();
+    }
+    if (rogueServer) {
+      rogueServer.closeAllConnections?.();
+      await new Promise((resolve) => rogueServer.close(resolve));
+    }
     await daemon.close();
     fs.rmSync(tempStateDir, { recursive: true, force: true });
   }

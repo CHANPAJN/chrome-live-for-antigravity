@@ -78,17 +78,22 @@ const HASH_SENSITIVE_PAIR_RX =
   /([#?&])([^=&#]*(?:token|secret|passw|pwd|apikey|api[-_]?key|access[-_]?key|private[-_]?key|auth|code|state|sig|jwt|bearer|ticket|session|sid|csrf|xsrf|otp|credential|hmac|(?:^|[-_.])(?:key|pass|pin|hash)(?:$|[-_.]))[^=&#]*)=([^&#]*)/gi;
 
 export function isHighEntropyPathToken(rawSegment) {
-  if (!rawSegment || rawSegment.length < 32) return false;
-  let segment = String(rawSegment);
+  if (!rawSegment) return false;
+  let segment = String(rawSegment).split(';')[0];
+  if (segment.length < 32) return false;
   if (segment.includes('%')) {
-    try {
-      segment = decodeURIComponent(segment);
-    } catch {}
+    segment = segment.replace(/(?:%[0-9A-Fa-f]{2})+/g, (seq) => {
+      try {
+        return decodeURIComponent(seq);
+      } catch {
+        return seq;
+      }
+    });
   }
   if (segment.length < 32) return false;
   if (/^eyJ[A-Za-z0-9._~+/=-]{10,}$/.test(segment)) return true;
   if (/^[0-9a-f]{32,}$/i.test(segment)) return true;
-  if (segment.length >= 36 && /^[A-Za-z0-9._~+/=-]+$/.test(segment)) {
+  if (segment.length >= 32 && /^[A-Za-z0-9._~+/=-]+$/.test(segment)) {
     const hasDigit = /\d/.test(segment);
     const hasUpper = /[A-Z]/.test(segment);
     const hasLower = /[a-z]/.test(segment);
@@ -104,16 +109,86 @@ export function isHighEntropyPathToken(rawSegment) {
   return false;
 }
 
+function redactMatrixParamsInSegment(seg) {
+  if (!seg || !seg.includes(';')) return seg;
+  const pieces = seg.split(';');
+  const head = isHighEntropyPathToken(pieces[0]) ? 'REDACTED' : pieces[0];
+  let changed = head !== pieces[0];
+  for (let i = 1; i < pieces.length; i++) {
+    const eqIdx = pieces[i].indexOf('=');
+    if (eqIdx === -1) continue;
+    const mk = pieces[i].slice(0, eqIdx);
+    const mv = pieces[i].slice(eqIdx + 1);
+    if (AUDIT_SENSITIVE_PARAM_RX.test(mk) || isHighEntropyPathToken(mv)) {
+      pieces[i] = `${mk}=REDACTED`;
+      changed = true;
+    }
+  }
+  pieces[0] = head;
+  return changed ? pieces.join(';') : seg;
+}
+
+function scrubQueryStringTokens(rawQueryWithQuestionMark) {
+  if (!rawQueryWithQuestionMark || !rawQueryWithQuestionMark.startsWith('?')) {
+    return { text: rawQueryWithQuestionMark || '', changed: false };
+  }
+  const rawBody = rawQueryWithQuestionMark.slice(1);
+  if (!rawBody) return { text: rawQueryWithQuestionMark, changed: false };
+  let changed = false;
+  const pairs = rawBody.split('&').map((pair) => {
+    const eq = pair.indexOf('=');
+    if (eq === -1) {
+      if (isHighEntropyPathToken(pair)) {
+        changed = true;
+        return 'REDACTED';
+      }
+      return pair;
+    }
+    const rawK = pair.slice(0, eq);
+    const rawV = pair.slice(eq + 1);
+    let decK = rawK;
+    try {
+      decK = decodeURIComponent(rawK.replace(/\+/g, ' '));
+    } catch {}
+    if (AUDIT_SENSITIVE_PARAM_RX.test(decK) || isHighEntropyPathToken(rawV)) {
+      changed = true;
+      return `${rawK}=REDACTED`;
+    }
+    return pair;
+  });
+  return { text: changed ? `?${pairs.join('&')}` : rawQueryWithQuestionMark, changed };
+}
+
 function canonicalizePathForGuardrail(rawSegment) {
   if (!rawSegment) return { ok: true, rawPath: '/', path: '/' };
   let decoded = String(rawSegment);
-  for (let i = 0; i < 3; i++) {
-    if (!decoded.includes('%')) break;
+  if (decoded.includes('%')) {
+    if (/%(?![0-9A-Fa-f]{2})/.test(decoded)) {
+      return { ok: false, rawPath: '', path: '' };
+    }
     try {
-      const next = decodeURIComponent(decoded);
+      decoded = decodeURIComponent(decoded);
+    } catch {
+      return { ok: false, rawPath: '', path: '' };
+    }
+    for (let round = 1; round < 6; round++) {
+      if (!/%[0-9A-Fa-f]{2}/.test(decoded)) break;
+      let malformedUtf8 = false;
+      const next = decoded.replace(/(?:%[0-9A-Fa-f]{2})+/g, (seq) => {
+        try {
+          return decodeURIComponent(seq);
+        } catch {
+          malformedUtf8 = true;
+          return seq;
+        }
+      });
+      if (malformedUtf8) {
+        return { ok: false, rawPath: '', path: '' };
+      }
       if (next === decoded) break;
       decoded = next;
-    } catch {
+    }
+    if (/%[0-9A-Fa-f]{2}/.test(decoded)) {
       return { ok: false, rawPath: '', path: '' };
     }
   }
@@ -151,11 +226,18 @@ export function redactUrlForAudit(rawUrl) {
       parsed.password = '';
       mutated = true;
     }
-    if (parsed.pathname && parsed.pathname.length >= 32) {
+    if (parsed.pathname) {
       const parts = parsed.pathname.split('/');
       let pathChanged = false;
       for (let i = 0; i < parts.length; i++) {
-        if (isHighEntropyPathToken(parts[i])) {
+        if (!parts[i]) continue;
+        if (parts[i].includes(';')) {
+          const scrubbedSeg = redactMatrixParamsInSegment(parts[i]);
+          if (scrubbedSeg !== parts[i]) {
+            parts[i] = scrubbedSeg;
+            pathChanged = true;
+          }
+        } else if (isHighEntropyPathToken(parts[i])) {
           parts[i] = 'REDACTED';
           pathChanged = true;
         }
@@ -166,8 +248,8 @@ export function redactUrlForAudit(rawUrl) {
       }
     }
     if (parsed.search) {
-      for (const [k] of parsed.searchParams.entries()) {
-        if (AUDIT_SENSITIVE_PARAM_RX.test(k)) {
+      for (const [k, v] of parsed.searchParams.entries()) {
+        if (AUDIT_SENSITIVE_PARAM_RX.test(k) || isHighEntropyPathToken(v)) {
           parsed.searchParams.set(k, 'REDACTED');
           mutated = true;
         }
@@ -175,28 +257,34 @@ export function redactUrlForAudit(rawUrl) {
     }
     if (parsed.hash) {
       let cleanedHash = parsed.hash.replace(HASH_SENSITIVE_PAIR_RX, '$1$2=REDACTED');
-      if (cleanedHash === parsed.hash && /^#!?(:?eyJ[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{32,})$/.test(parsed.hash)) {
+      if (cleanedHash === parsed.hash && /^#!?(?:eyJ[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{32,})$/.test(parsed.hash)) {
         cleanedHash = '#REDACTED';
       } else {
-        // Also scrub high-entropy token segments inside SPA hash paths (e.g. #/invite/9f8e7d... or #/verify/eyJ...?foo=1)
+        // Scrub high-entropy token segments and query values inside SPA hash routes (#/invite/9f8e... or #/verify?v=eyJ...)
         const prefixMatch = cleanedHash.match(/^(#!?)/);
         const hashPrefix = prefixMatch ? prefixMatch[1] : '#';
         const body = cleanedHash.slice(hashPrefix.length);
         const qPos = body.indexOf('?');
         const hPath = qPos === -1 ? body : body.slice(0, qPos);
         const hQuery = qPos === -1 ? '' : body.slice(qPos);
-        if (hPath.length >= 32) {
-          const hParts = hPath.split('/');
-          let hChanged = false;
-          for (let i = 0; i < hParts.length; i++) {
-            if (isHighEntropyPathToken(hParts[i])) {
-              hParts[i] = 'REDACTED';
+        const hParts = hPath.split('/');
+        let hChanged = false;
+        for (let i = 0; i < hParts.length; i++) {
+          if (!hParts[i]) continue;
+          if (hParts[i].includes(';')) {
+            const nextSeg = redactMatrixParamsInSegment(hParts[i]);
+            if (nextSeg !== hParts[i]) {
+              hParts[i] = nextSeg;
               hChanged = true;
             }
+          } else if (isHighEntropyPathToken(hParts[i])) {
+            hParts[i] = 'REDACTED';
+            hChanged = true;
           }
-          if (hChanged) {
-            cleanedHash = `${hashPrefix}${hParts.join('/')}${hQuery}`;
-          }
+        }
+        const scrubbedHQuery = scrubQueryStringTokens(hQuery);
+        if (hChanged || scrubbedHQuery.changed) {
+          cleanedHash = `${hashPrefix}${hParts.join('/')}${scrubbedHQuery.text}`;
         }
       }
       if (cleanedHash !== parsed.hash) {
@@ -212,7 +300,12 @@ export function redactUrlForAudit(rawUrl) {
 
 export function redactUrlsInText(rawText) {
   if (typeof rawText !== 'string' || !/https?:\/\//i.test(rawText)) return rawText;
-  return rawText.replace(/https?:\/\/[^\s"'<>)\]]+/gi, (m) => redactUrlForAudit(m));
+  return rawText.replace(/https?:\/\/[^\s"'<>)\]]+/gi, (match) => {
+    const punctMatch = match.match(/([.,;:!?]+)$/);
+    const coreUrl = punctMatch ? match.slice(0, -punctMatch[1].length) : match;
+    const suffix = punctMatch ? punctMatch[1] : '';
+    return redactUrlForAudit(coreUrl) + suffix;
+  });
 }
 
 export function evaluateUrlSafety(rawUrl, customBlockedDomains = []) {
@@ -309,7 +402,7 @@ export function evaluateUrlSafety(rawUrl, customBlockedDomains = []) {
 const SENSITIVE_FILE_DIR_RX =
   /(?:^|\/)(?:\.ssh|\.gnupg|\.aws|\.kube|\.azure|\.gcloud|\.docker|\.chrome-live-antigravity|gcloud)(?:\/|$)/i;
 const SENSITIVE_FILE_NAME_RX =
-  /^(?:(?!.*\.pub$)id_(?:rsa|ed25519|ecdsa|dsa)(?:$|[._-].+)|authorized_keys|known_hosts|auth\.token|\.local-runtime\.json|agent_vault\.enc|\.env(?:\..+)?|\.npmrc|\.pypirc|\.netrc|\.git-credentials|kubeconfig|credentials(?:\.json)?|application_default_credentials\.json|Local\s+State|Cookies(?:-journal)?|cookies\.sqlite|key[34]\.db|cert9\.db|logins\.json|Login Data(?:\s+For\s+Account)?|Web Data|.*\.(?:pem|key|p12|pfx|kdbx|ovpn|jks|keystore)|.*\.tfstate(?:\.backup)?)$/i;
+  /^(?:(?!.*\.pub$)id_(?:rsa|ed25519|ecdsa|dsa)(?:$|[._-].+)|authorized_keys|known_hosts|auth\.token|site-playbooks\.json|daemon\.pid|spawn\.(?:lock|cooldown)|\.local-runtime\.json|agent_vault\.enc|\.env(?:\..+)?|\.npmrc|\.pypirc|\.netrc|\.git-credentials|kubeconfig|credentials(?:\.json)?|application_default_credentials\.json|Local\s+State|Cookies(?:-journal)?|cookies\.sqlite|key[34]\.db|cert9\.db|logins\.json|Login Data(?:\s+For\s+Account)?|Web Data|.*\.(?:pem|key|p12|pfx|kdbx|ovpn|jks|keystore)|.*\.tfstate(?:\.backup)?)$/i;
 
 function resolveCanonicalPath(targetPath) {
   try {
@@ -387,6 +480,7 @@ export function evaluateUploadFileSafety(rawFilePath, options = {}) {
   // Check sensitive filename/directory patterns BEFORE and AFTER canonicalization,
   // while exempting the dedicated uploads staging subdir inside ~/.chrome-live-antigravity/uploads
   const defaultUploadsDir = resolveCanonicalPath(path.resolve(getDefaultUploadStagingDir()));
+  const activeStateDir = resolveCanonicalPath(path.resolve(getStateDir()));
   for (const candidate of realPath === resolvedPath ? [resolvedPath] : [resolvedPath, realPath]) {
     const normalized = candidate.replace(/\\/g, '/');
     const baseName = path.basename(candidate).replace(/[.\s]+$/, '');
@@ -398,7 +492,9 @@ export function evaluateUploadFileSafety(rawFilePath, options = {}) {
       };
     }
     const inDefaultStaging = isPathInsideDir(candidate, defaultUploadsDir);
-    if (!inDefaultStaging && SENSITIVE_FILE_DIR_RX.test(normalized)) {
+    const inActiveStateDir =
+      isPathInsideDir(candidate, activeStateDir) || path.resolve(candidate) === path.resolve(activeStateDir);
+    if (!inDefaultStaging && (SENSITIVE_FILE_DIR_RX.test(normalized) || inActiveStateDir)) {
       return {
         allowed: false,
         code: 'SENSITIVE_FILE',

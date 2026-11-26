@@ -224,13 +224,13 @@ const MCP_TOOLS = [
           minItems: 1,
           maxItems: 12,
           description:
-            'Ordered steps: each object specifies "action" ("open"|"navigate"|"type"|"click"|"scroll"|"wait"|"snapshot"|"done") plus action parameters (url, target, text, submit, ms, selector, maxItems, etc.)',
+            'Ordered steps: each object specifies "action" ("open"|"navigate"|"type"|"click"|"upload"|"scroll"|"wait"|"snapshot"|"done") plus action parameters (url, target, text, submit, ms, selector, maxItems, etc.)',
           items: {
             type: 'object',
             properties: {
               action: {
                 type: 'string',
-                enum: ['open', 'navigate', 'type', 'click', 'upload', 'scroll', 'wait', 'snapshot', 'screenshot', 'done']
+                enum: ['open', 'navigate', 'type', 'click', 'upload', 'scroll', 'wait', 'snapshot', 'done']
               },
               url: { type: 'string' },
               label: { type: 'string' },
@@ -257,14 +257,14 @@ const MCP_TOOLS = [
   {
     name: 'chrome_live_playbook',
     description:
-      'Manage local opt-in Site Playbooks (direct deep-link routes, stable CSS selectors, and UI widget tips per domain so repeat visits jump in 1 step).',
+      'Inspect or update local opt-in Site Playbooks (direct deep-link routes, stable CSS selectors, and UI widget tips per domain; enabling/disabling requires the user in the Chrome side panel or local CLI).',
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['status', 'enable', 'disable', 'list', 'save', 'clear'],
-          description: 'Playbook operation'
+          enum: ['status', 'list', 'save', 'clear'],
+          description: 'Playbook operation (enabling/disabling is user-controlled in the extension panel or CLI)'
         },
         domain: { type: 'string', description: 'Target domain (e.g. seller.example.com)' },
         routeName: { type: 'string', description: 'Route title when action="save"' },
@@ -291,6 +291,21 @@ const MCP_TOOLS = [
     }
   }
 ];
+
+function stripModelBinaryPayloads(node, depth = 0) {
+  if (!node || typeof node !== 'object' || depth > 8) return node;
+  if (Array.isArray(node)) {
+    return node.map((item) => stripModelBinaryPayloads(item, depth + 1));
+  }
+  const out = {};
+  for (const [k, v] of Object.entries(node)) {
+    if (k === 'frameDataUrl' || k === 'base64' || (k === 'data' && typeof v === 'string' && v.length > 256)) {
+      continue;
+    }
+    out[k] = stripModelBinaryPayloads(v, depth + 1);
+  }
+  return out;
+}
 
 export function startMcpStdioServer({ callDaemon }) {
   let framingMode = 'line'; // 'line' (MCP 2024-11-05+) or 'header' (Content-Length)
@@ -399,6 +414,7 @@ export function startMcpStdioServer({ callDaemon }) {
           });
           return;
         }
+        const safeModelOutput = stripModelBinaryPayloads(output);
         writeMessage({
           jsonrpc: '2.0',
           id,
@@ -406,7 +422,7 @@ export function startMcpStdioServer({ callDaemon }) {
             content: [
               {
                 type: 'text',
-                text: typeof output === 'string' ? output : JSON.stringify(output, null, 2)
+                text: typeof safeModelOutput === 'string' ? safeModelOutput : JSON.stringify(safeModelOutput, null, 2)
               }
             ]
           }
@@ -834,7 +850,6 @@ async function invokeTool(toolName, args, callDaemon) {
         'scroll',
         'wait',
         'snapshot',
-        'screenshot',
         'done'
       ]);
       if (!Array.isArray(args?.steps) || args.steps.length === 0) {
@@ -868,10 +883,17 @@ async function invokeTool(toolName, args, callDaemon) {
         return await callDaemon('GET', `/api/playbook${q}`);
       }
       if (act === 'enable' || act === 'disable') {
-        return await callDaemon('POST', '/api/playbook', {
-          action: 'set_enabled',
-          enabled: act === 'enable'
-        });
+        throw new Error(
+          '[GUARDRAIL] Site Playbooks are strictly opt-in and can only be enabled or disabled by the user in the Chrome extension side panel or local CLI (`chrome-live playbook on`)'
+        );
+      }
+      if (act === 'clear' || act === 'save') {
+        const curStatus = await callDaemon('GET', '/api/playbook');
+        if (!curStatus?.enabled) {
+          throw new Error(
+            '[GUARDRAIL] Site Playbooks are currently disabled (opt-in by default); ask the user to enable Playbooks in the Chrome side panel or via `chrome-live playbook on` first'
+          );
+        }
       }
       if (act === 'clear') {
         return await callDaemon('POST', '/api/playbook', {

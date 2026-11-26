@@ -110,7 +110,7 @@ node ./bin/chrome-live.mjs open "https://example.com"       # Open URL inside co
 node ./bin/chrome-live.mjs snapshot                         # Capture indexed elements [0],[1] & page text
 node ./bin/chrome-live.mjs click 0                          # Click by index, CSS selector, or visible label
 node ./bin/chrome-live.mjs type "Search" "query" --submit   # Type into input field and submit
-node ./bin/chrome-live.mjs upload "./demo.png"              # Attach local file via native CDP
+node ./bin/chrome-live.mjs upload "~/.chrome-live-antigravity/uploads/demo.png" # Attach staged file via native CDP
 node ./bin/chrome-live.mjs batch - --compact                # Run multi-step stdin pipeline in 1 turn
 node ./bin/chrome-live.mjs extract "https://a.com"          # Extract clean text & image URLs in parallel
 node ./bin/chrome-live.mjs relay popout                     # Pop tab into standalone window for manual login/2FA

@@ -246,6 +246,8 @@
               liveImg.style.display = 'none';
               emptyMsg.style.display = 'block';
               focusBtn.disabled = true;
+              refreshBtn.disabled = true;
+              releaseBtn.disabled = true;
               return;
             }
 
@@ -262,6 +264,8 @@
               liveImg.style.display = 'none';
               emptyMsg.style.display = 'block';
               focusBtn.disabled = true;
+              refreshBtn.disabled = true;
+              releaseBtn.disabled = true;
               return;
             }
 
@@ -280,7 +284,10 @@
               pinnedTabId = target ? target.tabId : null;
             }
             activeTabId = target ? target.tabId : null;
-            focusBtn.disabled = activeTabId === null || Boolean(target && target.paused);
+            const isTargetPaused = Boolean(target && target.paused);
+            focusBtn.disabled = activeTabId === null || isTargetPaused;
+            refreshBtn.disabled = activeTabId === null || isTargetPaused;
+            releaseBtn.disabled = activeTabId === null;
 
             // Allow clicking tabBadge to cycle through remaining tabs when multiple tabs are open
             tabBadge.style.cursor = tabs.length > 0 ? 'pointer' : 'default';
@@ -350,11 +357,17 @@
           }
         }
 
+        function sidecarPostAction(bodyObj) {
+          return sidecarFetch('/api/action', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(bodyObj)
+          });
+        }
+
         refreshBtn.addEventListener('click', async () => {
-          if (activeTabId === null) return;
-          const r = await sidecarFetch(`/api/action?cmd=screenshot&tabId=${encodeURIComponent(activeTabId)}`).catch(
-            () => null
-          );
+          if (activeTabId === null || refreshBtn.disabled) return;
+          const r = await sidecarPostAction({ cmd: 'screenshot', tabId: activeTabId }).catch(() => null);
           const j = r ? await r.json().catch(() => null) : null;
           if (!j || j.ok === false) {
             statusTitle.textContent = j?.error || 'Refresh failed';
@@ -365,23 +378,22 @@
 
         releaseBtn.addEventListener('click', async () => {
           if (activeTabId === null) return;
-          const r = await sidecarFetch(`/api/action?cmd=release_tab&tabId=${encodeURIComponent(activeTabId)}`).catch(
-            () => null
-          );
+          const r = await sidecarPostAction({ cmd: 'release_tab', tabId: activeTabId }).catch(() => null);
           const j = r ? await r.json().catch(() => null) : null;
           if (!j || j.ok === false) {
             statusTitle.textContent = j?.error || 'Release failed';
             return;
           }
           lastCapturedAt = 0;
+          liveImg.removeAttribute('src');
           liveImg.style.display = 'none';
           emptyMsg.style.display = 'block';
           await poll();
         });
 
         focusBtn.addEventListener('click', async () => {
-          if (activeTabId !== null) {
-            await sidecarFetch(`/api/action?cmd=focus_tab&tabId=${encodeURIComponent(activeTabId)}`).catch(() => {});
+          if (activeTabId !== null && !focusBtn.disabled) {
+            await sidecarPostAction({ cmd: 'focus_tab', tabId: activeTabId }).catch(() => {});
           }
         });
 

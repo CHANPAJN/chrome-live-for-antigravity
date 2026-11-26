@@ -13,7 +13,8 @@ import {
   DEFAULT_PORT,
   ensureAuthToken,
   getStateDir,
-  getTokenFilePath
+  getTokenFilePath,
+  tightenFileAclSync
 } from '../src/token-store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -42,18 +43,34 @@ function requestDaemon(method, routePath, bodyObj = null, timeoutMs = 30000) {
         headers
       },
       (res) => {
+        const statusCode = res.statusCode || 500;
+        if (!verifySignedHttpResponse(token, statusCode, res.headers, ts, nonce)) {
+          res.destroy();
+          req.destroy();
+          reject(
+            new Error(
+              `Unverified local service on ${DEFAULT_HOST}:${DEFAULT_PORT} (missing or invalid daemon HMAC signature)`
+            )
+          );
+          return;
+        }
+        const MAX_RES_BYTES = 16 * 1024 * 1024;
         const chunks = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () => {
-          const statusCode = res.statusCode || 500;
-          if (!verifySignedHttpResponse(token, statusCode, res.headers, ts, nonce)) {
-            reject(
-              new Error(
-                `Unverified local service on ${DEFAULT_HOST}:${DEFAULT_PORT} (missing or invalid daemon HMAC signature)`
-              )
-            );
+        let receivedBytes = 0;
+        let aborted = false;
+        res.on('data', (c) => {
+          receivedBytes += c.length;
+          if (receivedBytes > MAX_RES_BYTES) {
+            aborted = true;
+            res.destroy();
+            req.destroy();
+            reject(new Error(`Daemon response exceeded 16MB safety cap (${routePath})`));
             return;
           }
+          chunks.push(c);
+        });
+        res.on('end', () => {
+          if (aborted) return;
           const rawBuf = Buffer.concat(chunks);
           const ct = res.headers['content-type'] || '';
           if (ct.includes('application/json')) {
@@ -156,9 +173,7 @@ function writeExtensionLocalRuntimeConfig(token) {
     encoding: 'utf8',
     mode: 0o600
   });
-  try {
-    fs.chmodSync(runtimeFile, 0o600);
-  } catch {}
+  tightenFileAclSync(runtimeFile);
   return runtimeFile;
 }
 
@@ -178,7 +193,7 @@ function copyDirectoryRecursive(srcDir, destDir, replacements = {}) {
           if (ext === '.json') {
             safeVal = JSON.stringify(safeVal).slice(1, -1);
           } else if (ext === '.mjs' || ext === '.js') {
-            safeVal = safeVal.replace(/\\/g, '/').replace(/'/g, "\\'");
+            safeVal = JSON.stringify(safeVal.replace(/\\/g, '/')).slice(1, -1).replace(/'/g, "\\'");
           }
           content = content.split(placeholder).join(safeVal);
         }

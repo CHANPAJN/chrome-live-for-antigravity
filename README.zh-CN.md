@@ -110,7 +110,7 @@ node ./bin/chrome-live.mjs open "https://example.com"       # 在后台青色折
 node ./bin/chrome-live.mjs snapshot                         # 提取带编号元素 [0],[1] 与正文
 node ./bin/chrome-live.mjs click 0                          # 按序号、CSS 选择器或按钮文字点击
 node ./bin/chrome-live.mjs type "搜索" "关键词" --submit    # 填词并提交
-node ./bin/chrome-live.mjs upload "./demo.png"              # 通过原生 CDP 上传本地图片或附件
+node ./bin/chrome-live.mjs upload "~/.chrome-live-antigravity/uploads/demo.png" # 通过原生 CDP 上传暂存目录附件
 node ./bin/chrome-live.mjs batch - --compact                # 从 stdin 单轮执行多步连招
 node ./bin/chrome-live.mjs extract "https://a.com"          # 后台并发提取正文与原图直链
 node ./bin/chrome-live.mjs relay popout                     # 弹出独立副屏供人工处理扫码/验证
