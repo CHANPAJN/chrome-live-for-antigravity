@@ -1221,25 +1221,60 @@ async function execSingleTargetBounded(targetSpec, restOpts, timeoutMs) {
   }
 }
 
+async function wakeCollapsedGroupTabIfFrozen(tabId) {
+  try {
+    const t = await chrome.tabs.get(tabId).catch(() => null);
+    if (!t || typeof t.groupId !== 'number' || t.groupId < 0 || !chrome.tabGroups?.get) return null;
+    const grp = await chrome.tabGroups.get(t.groupId).catch(() => null);
+    if (!grp || !grp.collapsed) return null;
+    await chrome.tabGroups.update(grp.id, { collapsed: false }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 45));
+    return grp.id;
+  } catch {
+    return null;
+  }
+}
+
 async function runHudScriptSafe(tabId, opts, timeoutMs = 1200) {
   const t = await chrome.tabs.get(tabId).catch(() => null);
   if (!t || t.discarded || t.status === 'unloaded') return null;
   const { allFrames, ...restOpts } = opts || {};
   if (!allFrames) {
-    return await execSingleTargetBounded({ tabId }, restOpts, timeoutMs);
+    let singleRes = await execSingleTargetBounded({ tabId }, restOpts, timeoutMs);
+    if ((!Array.isArray(singleRes) || singleRes.length === 0) && timeoutMs >= 450) {
+      const wokenGrpId = await wakeCollapsedGroupTabIfFrozen(tabId);
+      try {
+        const tRetry = await chrome.tabs.get(tabId).catch(() => null);
+        if (tRetry && !tRetry.discarded && tRetry.status !== 'unloaded') {
+          singleRes = await execSingleTargetBounded({ tabId }, restOpts, Math.max(300, timeoutMs - 200));
+        }
+      } finally {
+        if (wokenGrpId !== null) {
+          await chrome.tabGroups.update(wokenGrpId, { collapsed: true }).catch(() => {});
+        }
+      }
+    }
+    return singleRes;
   }
 
   // Per-frame bounded execution when `allFrames: true`:
   // 1) Top-level main frame (`frameId: 0`) MUST succeed within `timeoutMs` (strict Fail-Closed if main page is hung).
-  //    Retry once after 180ms if caught mid-navigation document swap so transient SPA/route commits never false-detach.
+  //    Retry once (waking collapsed tab group if frozen on plain HTTP origins without `navigator.locks`).
   // 2) Cross-origin sub-frames (whose navigation URLs are already verified via C++ `webNavigation.getAllFrames` & `onBeforeNavigate`)
   //    each run with an isolated short timeout so a slow external ad `<iframe>` never times out and detaches a healthy main tab!
   let mainRes = await execSingleTargetBounded({ tabId, frameIds: [0] }, restOpts, timeoutMs);
   if ((!Array.isArray(mainRes) || mainRes.length === 0) && timeoutMs >= 450) {
-    await new Promise((r) => setTimeout(r, 180));
-    const tRetry = await chrome.tabs.get(tabId).catch(() => null);
-    if (!tRetry || tRetry.discarded || tRetry.status === 'unloaded') return null;
-    mainRes = await execSingleTargetBounded({ tabId, frameIds: [0] }, restOpts, Math.max(300, timeoutMs - 200));
+    const wokenGrpId = await wakeCollapsedGroupTabIfFrozen(tabId);
+    try {
+      await new Promise((r) => setTimeout(r, 120));
+      const tRetry = await chrome.tabs.get(tabId).catch(() => null);
+      if (!tRetry || tRetry.discarded || tRetry.status === 'unloaded') return null;
+      mainRes = await execSingleTargetBounded({ tabId, frameIds: [0] }, restOpts, Math.max(300, timeoutMs - 200));
+    } finally {
+      if (wokenGrpId !== null) {
+        await chrome.tabGroups.update(wokenGrpId, { collapsed: true }).catch(() => {});
+      }
+    }
   }
   if (!Array.isArray(mainRes) || mainRes.length === 0) {
     return null;
@@ -1312,7 +1347,7 @@ async function syncHudNow(tabId, payload) {
           }
         };
         const ctrl = window.__chromeLiveHudController__;
-        if (ctrl && ctrl._hudRev === 18 && typeof ctrl.ping === 'function' && ctrl.ping()) {
+        if (ctrl && ctrl._hudRev === 19 && typeof ctrl.ping === 'function' && ctrl.ping()) {
           if (data.visible === false) sweepOrphans(ctrl.hostEl);
           ctrl.update(data);
           return { updated: true };
@@ -1786,7 +1821,7 @@ async function syncLiveTabGroups() {
       const groupUpdateProps = {
         title: nextTitle,
         color: nextColor,
-        ...(allWorkersInBackground ? { collapsed: true } : {})
+        ...(allWorkersInBackground && !g.collapsed ? { collapsed: true } : {})
       };
       await chrome.tabGroups.update(g.id, groupUpdateProps).catch(() => {});
     }
@@ -3197,6 +3232,7 @@ async function executeBridgeRpc(method, params) {
     if (!created || typeof created.id !== 'number') {
       throw new Error('Failed to create browser tab');
     }
+    await chrome.tabs.update(created.id, { autoDiscardable: false }).catch(() => {});
     if (background) {
       await placeInBackgroundTabGroup(created.id, created.windowId);
     }

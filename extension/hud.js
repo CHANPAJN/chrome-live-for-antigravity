@@ -4,7 +4,7 @@
   if (window.top !== window) return;
 
   const REGISTRY_SYMBOL = '__chromeLiveHudController__';
-  const CURRENT_HUD_REV = 18;
+  const CURRENT_HUD_REV = 19;
   const HOST_Z_MARKER = '2147483647';
 
   function isExtensionContextValid() {
@@ -714,7 +714,42 @@
         bottomPx: initBottomPx,
         userActionQueue: []
       };
+      this._releaseFreezeLock = null;
       this._mount();
+    }
+
+    // Hold a lightweight Web Lock while actively controlled so Chromium's `TabGroupsCollapseFreezing`
+    // (`CannotFreezeReason::kHoldingWebLock`) never freezes background worker tabs after 5s in a collapsed group!
+    _syncFreezeExemptionLock() {
+      const shouldHold = Boolean(this._state.visible && this._state.mode !== 'paused');
+      if (shouldHold) {
+        if (!this._releaseFreezeLock && typeof navigator !== 'undefined' && navigator.locks?.request) {
+          let releaseFn = null;
+          const p = new Promise((resolve) => {
+            releaseFn = resolve;
+          });
+          this._releaseFreezeLock = () => {
+            if (releaseFn) {
+              const fn = releaseFn;
+              releaseFn = null;
+              fn();
+            }
+          };
+          try {
+            navigator.locks
+              .request(`clive_active_${Math.random().toString(36).slice(2, 10)}`, () => p)
+              .catch(() => {});
+          } catch {
+            this._releaseFreezeLock = null;
+          }
+        }
+      } else if (this._releaseFreezeLock) {
+        const drop = this._releaseFreezeLock;
+        this._releaseFreezeLock = null;
+        try {
+          drop();
+        } catch {}
+      }
     }
 
     _t() {
@@ -1105,6 +1140,7 @@
       this._clearConfirmState();
       this._state.userPausedLock = true;
       this._state.mode = 'paused';
+      this._syncFreezeExemptionLock();
       this._state.activity = this._t().pausedByUser;
       this._state.flashText = '';
       this._expandAndArmForegroundCollapse();
@@ -1741,6 +1777,7 @@
       if (this._state.visible && (!prevVisible || this._state.mode !== prevMode)) {
         this._expandAndArmForegroundCollapse();
       }
+      this._syncFreezeExemptionLock();
       this._render();
       return { ok: true, mode: this._state.mode, lang: this._state.lang };
     }
@@ -1826,6 +1863,8 @@
     }
 
     destroy() {
+      this._state.visible = false;
+      this._syncFreezeExemptionLock();
       for (const fn of this._cleanups.splice(0)) {
         try {
           fn();

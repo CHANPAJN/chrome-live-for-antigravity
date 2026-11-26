@@ -4593,7 +4593,7 @@ test('23. Collapsed background tab CDP deadlock & worker lifecycle regressions: 
 
   // 3. `detachManagedTab` automatically closes temporary `worker` tabs on guardrail trips instead of dumping ungrouped orphan tabs onto the tab strip
   assert.match(swSource, /shouldCloseGuardrailedWorker[\s\S]*?await chrome\.tabs\.remove\(tabId\)/);
-  assert.match(swSource, /allWorkersInBackground \? \{ collapsed: true \} : \{\}/);
+  assert.match(swSource, /allWorkersInBackground && !g\.collapsed \? \{ collapsed: true \} : \{\}/);
 
   // 4. `mcp-server.mjs` relays worker-to-worker stream rotation during polling while preserving `release_tab` isolation
   assert.match(mcpSource, /workerSuccessor/);
@@ -4602,6 +4602,11 @@ test('23. Collapsed background tab CDP deadlock & worker lifecycle regressions: 
   // 5. Unhydrated `document_start` HUD (`hydrated: false`) during concurrent `navigate` + `screenshot` poll MUST NOT falsely release tab
   assert.match(hudSource, /hydrated:\s*false/);
   assert.match(swSource, /state\.hydrated !== false && !entry\?\.navigating/);
+
+  // 6. Chromium 5s `TabGroupsCollapseFreezing` exemption via `navigator.locks` (`kHoldingWebLock`) + plain-HTTP collapsed group wake fallback
+  assert.match(hudSource, /_syncFreezeExemptionLock\(\)/);
+  assert.match(hudSource, /navigator\.locks[\s\S]*?\.request\(/);
+  assert.match(swSource, /wakeCollapsedGroupTabIfFrozen/);
 });
 
 
