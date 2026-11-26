@@ -169,7 +169,7 @@ const I18N = {
     saveGuard: 'Update Protected Domains',
     toastSaved: 'Settings saved',
     toastCopied: 'Token copied to clipboard',
-    toastTipSaved: 'Widget tip saved to playbook',
+    toastTipSaved: 'Playbook entry saved',
     toastCleared: 'Cleared',
     toastError: 'Daemon offline — action failed',
     blockedSuffix: ' [BLOCKED]',

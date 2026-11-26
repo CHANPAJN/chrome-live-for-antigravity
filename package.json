@@ -15,6 +15,7 @@
     "src/*.mjs",
     "extension/manifest.json",
     "extension/service-worker.js",
+    "extension/hud-early-guard.js",
     "extension/hud.js",
     "extension/icons/*.png",
     "extension/panel/index.html",

@@ -1476,11 +1476,11 @@ test('Security audit hardening: mutual HTTP/WS HMAC, replay defense, runtime boo
 
   // Execute the exact click label snippet from service-worker.js inside a VM against mock filled password/OTP inputs
   const clickLabelMatch = swSource.match(
-    /const elTagLower = safeTagLower\(el\);[\s\S]*?if \(el\.disabled \|\| el\.getAttribute\('aria-disabled'\) === 'true'\) \{\s*const dLabel = safeElemLabel\(60\);\s*return \{ ok: false, error: `Element is disabled: \$\{dLabel\}` \};\s*\}/
+    /const elTagLower = safeTagLower\(el\);[\s\S]*?if \(el\.disabled \|\| safeGetAttr\(el, 'aria-disabled'\) === 'true'\) \{\s*const dLabel = safeElemLabel\(60\);\s*return \{ ok: false, error: `Element is disabled: \$\{dLabel\}` \};\s*\}/
   );
   assert.ok(clickLabelMatch, 'Expected safeElemLabel block in service-worker.js click handler');
   const runClickLabelCheck = vm.runInNewContext(
-    `(function(el) { const safeTagLower = (n) => String(n.tagName || '').toLowerCase(); const safeGetAttr = (n, k) => n.getAttribute(k); const extractCleanContainerText = (n) => n.textContent || ''; ${clickLabelMatch[0]} return { ok: true, label: safeElemLabel(42) }; })`
+    `(function(el) { const safeTagLower = (n) => String(n.tagName || '').toLowerCase(); const safeGetAttr = (n, k) => n.getAttribute(k); const safeId = (n) => String(n.id || ''); const safeIsCE = (n) => Boolean(n.isContentEditable === true); const extractCleanContainerText = (n) => n.textContent || ''; ${clickLabelMatch[0]} return { ok: true, label: safeElemLabel(42) }; })`
   );
 
   const secretValue = 'MyBankSecretPass#2026!';
@@ -3992,4 +3992,182 @@ test('22. Blind-audit round-11 regressions: cross-Shadow editor/aria-hidden ance
   const replayRes = verifier(mockReq, '/api/tabs', null);
   assert.equal(replayRes.ok, false);
   assert.match(replayRes.reason, /Replayed HMAC request nonce rejected/);
+});
+
+test('23. Blind-audit round-12 regressions: <form> DOM Clobbering prototype walkers, document_start slot-0 HUD pointer/click guard, type flat-visibility filter, backslash-free selectors & inline UI teardown', async () => {
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+  const hudSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'hud.js'), 'utf8');
+  const earlyGuardSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'hud-early-guard.js'), 'utf8');
+  const manifestJson = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'extension', 'manifest.json'), 'utf8'));
+  const pkgJson = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8'));
+  const inlineUiSource = fs.readFileSync(path.join(REPO_ROOT, 'src', 'inline-monitor-ui.mjs'), 'utf8');
+  const panelSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'panel', 'panel.js'), 'utf8');
+  const { assertSafeAutomationSelector } = await import('../src/guardrails.mjs');
+
+  // 1. `<form>` DOM Clobbering (`<fieldset name="parentElement">`, `<input name="matches">`, `<input name="closest">`, `<input name="checkVisibility">`)
+  // neither crashes nor truncates cross-Shadow `.ProseMirror` / `opacity:0` ancestor walks!
+  const clickWalkerMatch = swSource.match(
+    /const CLICK_SKIP_SEL =[\s\S]*?function extractCleanContainerText\(rootNode\)[\s\S]*?\n        \}/
+  );
+  assert.ok(clickWalkerMatch);
+
+  class ProtoNode {
+    get parentElement() {
+      return this._realParent ?? null;
+    }
+    getRootNode() {
+      return this._realRoot ?? {};
+    }
+  }
+  class ProtoElement extends ProtoNode {
+    get assignedSlot() {
+      return this._realSlot ?? null;
+    }
+    matches(sel) {
+      return Boolean(this._matchesFn && this._matchesFn(sel));
+    }
+    closest(sel) {
+      return this._closestFn ? this._closestFn(sel) : null;
+    }
+    checkVisibility() {
+      return this._vis !== false;
+    }
+  }
+  class ProtoHTMLElement extends ProtoElement {
+    get isContentEditable() {
+      return Boolean(this._ce);
+    }
+  }
+  class ProtoText extends ProtoNode {
+    get assignedSlot() {
+      return this._realSlot ?? null;
+    }
+  }
+
+  const outerEditor = Object.assign(new ProtoHTMLElement(), {
+    _realParent: null,
+    _realRoot: {},
+    _matchesFn: (sel) => sel.includes('.ProseMirror'),
+    _style: { display: 'block', visibility: 'visible', opacity: '1', webkitTextSecurity: 'none' }
+  });
+  const clobberedShadowForm = new ProtoHTMLElement();
+  clobberedShadowForm._realParent = null;
+  clobberedShadowForm._realRoot = { host: outerEditor };
+  clobberedShadowForm._style = { display: 'block', visibility: 'visible', opacity: '1', webkitTextSecurity: 'none' };
+  const fakeFieldset = new ProtoHTMLElement();
+  // Simulate WebIDL `[LegacyOverrideBuiltIns]` own-property shadowing on `<form>`!
+  Object.defineProperties(clobberedShadowForm, {
+    parentElement: { value: fakeFieldset },
+    assignedSlot: { value: fakeFieldset },
+    matches: { value: fakeFieldset },
+    closest: { value: fakeFieldset },
+    getRootNode: { value: fakeFieldset },
+    checkVisibility: { value: fakeFieldset },
+    isContentEditable: { value: fakeFieldset }
+  });
+  const textInsideClobberedForm = Object.assign(new ProtoText(), {
+    _realParent: clobberedShadowForm,
+    nodeValue: 'CLOBBERED_EDITOR_SECRET_DRAFT_777'
+  });
+
+  const runProtoExtract = vm.runInNewContext(
+    `(function(root) { ${clickWalkerMatch[0]}; return extractCleanContainerText(root); })`,
+    {
+      Node: ProtoNode,
+      Element: ProtoElement,
+      HTMLElement: ProtoHTMLElement,
+      Text: ProtoText,
+      NodeFilter: { SHOW_TEXT: 4 },
+      window: { getComputedStyle: (el) => el._style },
+      document: {
+        createTreeWalker: () => {
+          let done = false;
+          return {
+            nextNode: () => {
+              if (done) return null;
+              done = true;
+              return textInsideClobberedForm;
+            }
+          };
+        }
+      }
+    }
+  );
+  assert.equal(
+    runProtoExtract(clobberedShadowForm).trim(),
+    '',
+    'Prototype-safe walker must cross ShadowRoot past <form> DOM Clobbering without TypeError or draft leak'
+  );
+
+  // 2. `document_start` slot-0 `hud-early-guard.js` preempts hostile page `window.addEventListener('pointerdown'|'click', stopImmediatePropagation, true)`!
+  assert.equal(pkgJson.files.includes('extension/hud-early-guard.js'), true);
+  assert.equal(manifestJson.content_scripts?.[0]?.run_at, 'document_start');
+  assert.equal(manifestJson.content_scripts?.[0]?.world, 'ISOLATED');
+  assert.deepEqual(manifestJson.content_scripts?.[0]?.js, ['hud-early-guard.js']);
+  assert.match(hudSource, /__CLIVE_SET_CAPTURE_GUARD__/);
+  assert.match(hudSource, /\['click', 'pointerdown', 'pointermove', 'pointerup', 'pointercancel'\]/);
+
+  // Simulate slot-0 `hud-early-guard.js` registered BEFORE hostile page `stopImmediatePropagation()`
+  const winCaptureListeners = new Map();
+  const mockWin = {
+    addEventListener(type, fn, capture) {
+      if (!capture) return;
+      if (!winCaptureListeners.has(type)) winCaptureListeners.set(type, []);
+      winCaptureListeners.get(type).push(fn);
+    }
+  };
+  vm.runInNewContext(earlyGuardSource, { window: mockWin, Object });
+  // Hostile page registers capture listeners AFTER `document_start`
+  let hostileSawEvent = false;
+  for (const t of ['pointerdown', 'click']) {
+    mockWin.addEventListener(
+      t,
+      (e) => {
+        hostileSawEvent = true;
+        e.stopImmediatePropagation();
+      },
+      true
+    );
+  }
+  let hudHandledCount = 0;
+  mockWin.__CLIVE_SET_CAPTURE_GUARD__((e) => {
+    hudHandledCount += 1;
+    e.stopImmediatePropagation();
+  });
+  const dispatchCapture = (type) => {
+    let stopped = false;
+    const ev = {
+      type,
+      stopImmediatePropagation() {
+        stopped = true;
+      }
+    };
+    for (const fn of winCaptureListeners.get(type) || []) {
+      if (stopped) break;
+      fn(ev);
+    }
+  };
+  dispatchCapture('pointerdown');
+  dispatchCapture('click');
+  assert.equal(hudHandledCount, 2, 'Slot-0 early guard must receive both pointerdown and click first');
+  assert.equal(hostileSawEvent, false, 'Hostile page capture listener must be preempted on HUD events');
+
+  // 3. `type` enforces `isValidTypeTarget(cand)` + `isNestedInsideEditorOrHidden(cand)` on fuzzy candidate search
+  assert.match(
+    swSource,
+    /for \(const cand of inputs\) \{\s*if \(!isValidTypeTarget\(cand\) \|\| isNestedInsideEditorOrHidden\(cand\)\) continue;/
+  );
+
+  // 4. Generated `data-testid="order:submit"` / `name="user.email"` selectors contain zero `\` escapes and pass `assertSafeAutomationSelector`
+  assert.equal(swSource.includes('[data-testid="${CSS.escape'), false);
+  assert.equal(swSource.includes('[name="${CSS.escape'), false);
+  assertSafeAutomationSelector('[data-testid="order:submit"]');
+  assertSafeAutomationSelector('input[name="user.email"]');
+  assertSafeAutomationSelector('[id="tab:1.panel"]');
+
+  // 5. `inline-monitor-ui.mjs` sets `isTornDown = true`, disconnects `ResizeObserver`, and removes `visibilitychange` on `ui/resource-teardown`
+  assert.match(inlineUiSource, /if \(msg\.method === 'ui\/resource-teardown'\)\s*\{\s*isTornDown = true;/);
+  assert.match(inlineUiSource, /rootResizeObserver\.disconnect\(\)/);
+  assert.match(inlineUiSource, /document\.removeEventListener\('visibilitychange', onVisibilityChange\)/);
+  assert.match(panelSource, /toastTipSaved:\s*'Playbook entry saved'/);
 });

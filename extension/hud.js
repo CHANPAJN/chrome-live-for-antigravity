@@ -877,6 +877,8 @@
 
       const onShieldPointerDown = (ev) => {
         if (!ev.isTrusted) return;
+        if (ev._cliveShieldDone) return;
+        ev._cliveShieldDone = true;
         if (selfDestructIfOrphan()) return;
         ev.preventDefault();
         ev.stopPropagation();
@@ -963,11 +965,14 @@
 
       // Drag capsule to snap to 6 positions (top/bottom left/center/right; require >= 8px movement)
       let dragging = false;
+      let dragPointerId = null;
       let dragStartX = 0;
       let dragStartY = 0;
       const onGripDown = (ev) => {
-        if (ev.button !== 0) return;
+        if (!ev.isTrusted || ev._cliveGripDone || ev.button !== 0) return;
+        ev._cliveGripDone = true;
         dragging = true;
+        dragPointerId = ev.pointerId;
         dragStartX = ev.clientX;
         dragStartY = ev.clientY;
         this.capsuleEl.dataset.pressing = 'true';
@@ -977,8 +982,9 @@
       };
 
       const onGripUp = (ev) => {
-        if (!dragging) return;
+        if (!dragging || (dragPointerId !== null && ev.pointerId !== dragPointerId)) return;
         dragging = false;
+        dragPointerId = null;
         this.capsuleEl.dataset.pressing = 'false';
         try {
           this.gripEl.releasePointerCapture(ev.pointerId);
@@ -995,18 +1001,19 @@
       };
 
       const onGripCancel = (ev) => {
-        if (!dragging) return;
+        if (!dragging || (dragPointerId !== null && ev.pointerId !== dragPointerId)) return;
         dragging = false;
+        dragPointerId = null;
         this.capsuleEl.dataset.pressing = 'false';
         try {
           this.gripEl.releasePointerCapture(ev.pointerId);
         } catch {}
       };
 
-      const hitHudButton = (btn, visible) => {
-        if (!visible || !btn || typeof btn.getBoundingClientRect !== 'function') return false;
+      const hitHudBox = (elBox, visible) => {
+        if (!visible || !elBox || typeof elBox.getBoundingClientRect !== 'function') return false;
         if (typeof evClientX !== 'number' || typeof evClientY !== 'number') return false;
-        const r = btn.getBoundingClientRect();
+        const r = elBox.getBoundingClientRect();
         return (
           r.width > 0 &&
           r.height > 0 &&
@@ -1016,20 +1023,90 @@
           evClientY <= r.bottom
         );
       };
+      const hitHudButton = hitHudBox;
       let evClientX = null;
       let evClientY = null;
 
-      // Guard HUD host interactions in window capture phase so hostile page `window.addEventListener(..., e => e.stopPropagation(), true)`
-      // registered later cannot block the user's Pause / Release / 3s Hold-to-Unlock gestures (even across `mode: 'closed'` ShadowRoot retargeting)!
+      // Guard HUD host interactions in window capture phase (via `document_start` slot 0 when available)
+      // so hostile page `window.addEventListener(..., e => e.stopImmediatePropagation(), true)` can never lock out
+      // Pause / Disconnect buttons, capsule drag, or the 3s Hold-to-Unlock gesture!
       const captureHostGuard = (ev) => {
-        if (!ev || !ev.isTrusted || ev._cliveHandled || typeof ev.composedPath !== 'function') return;
+        if (!ev || !ev.isTrusted || ev._cliveHandled) return;
+        const evtType = ev.type;
+        if (evtType === 'pointermove') {
+          if (holdingPointerId !== null && ev.pointerId === holdingPointerId) {
+            ev._cliveHandled = true;
+            ev.stopImmediatePropagation?.();
+            onShieldPointerMove(ev);
+            return;
+          }
+          if (dragging && dragPointerId !== null && ev.pointerId === dragPointerId) {
+            ev._cliveHandled = true;
+            ev.stopImmediatePropagation?.();
+            return;
+          }
+          return;
+        }
+        if (evtType === 'pointerup' || evtType === 'pointercancel') {
+          if (holdingPointerId !== null && ev.pointerId === holdingPointerId) {
+            ev._cliveHandled = true;
+            ev.stopImmediatePropagation?.();
+            endShieldHold(ev);
+            return;
+          }
+          if (dragging && dragPointerId !== null && ev.pointerId === dragPointerId) {
+            ev._cliveHandled = true;
+            ev.stopImmediatePropagation?.();
+            if (evtType === 'pointerup') onGripUp(ev);
+            else onGripCancel(ev);
+            return;
+          }
+          return;
+        }
+
+        if (typeof ev.composedPath !== 'function') return;
         const pathNodes = ev.composedPath();
         if (!pathNodes || !pathNodes.includes(this.hostEl)) return;
         const topTarget = pathNodes[0];
         evClientX = typeof ev.clientX === 'number' ? ev.clientX : null;
         evClientY = typeof ev.clientY === 'number' ? ev.clientY : null;
         const isConfirming = Boolean(this._state.confirmingDisconnect);
-        if (ev.type === 'click') {
+
+        if (evtType === 'pointerdown') {
+          const onActiveBtn = isConfirming
+            ? topTarget === this.cancelConfirmBtn ||
+              this.cancelConfirmBtn.contains(topTarget) ||
+              hitHudButton(this.cancelConfirmBtn, true) ||
+              topTarget === this.confirmDisconnectBtn ||
+              this.confirmDisconnectBtn.contains(topTarget) ||
+              hitHudButton(this.confirmDisconnectBtn, true)
+            : topTarget === this.pauseBtn ||
+              this.pauseBtn.contains(topTarget) ||
+              hitHudButton(this.pauseBtn, true) ||
+              topTarget === this.closeBtn ||
+              this.closeBtn.contains(topTarget) ||
+              hitHudButton(this.closeBtn, true);
+          if (onActiveBtn) {
+            // Preempt hostile page pointerdown capture listeners without calling preventDefault so click still synthesizes
+            ev._cliveHandled = true;
+            ev.stopImmediatePropagation?.();
+            return;
+          }
+          if (topTarget === this.gripEl || this.gripEl.contains(topTarget) || hitHudBox(this.gripEl, this._state.visible)) {
+            ev._cliveHandled = true;
+            ev.stopImmediatePropagation?.();
+            onGripDown(ev);
+            return;
+          }
+          if (this._state.visible && this._state.mode === 'working') {
+            ev._cliveHandled = true;
+            ev.stopImmediatePropagation?.();
+            onShieldPointerDown(ev);
+          }
+          return;
+        }
+
+        if (evtType === 'click') {
           if (
             !isConfirming &&
             (topTarget === this.pauseBtn || this.pauseBtn.contains(topTarget) || hitHudButton(this.pauseBtn, true))
@@ -1065,7 +1142,16 @@
           }
         }
       };
-      window.addEventListener('click', captureHostGuard, true);
+
+      const CAPTURE_GUARD_EVENTS = ['click', 'pointerdown', 'pointermove', 'pointerup', 'pointercancel'];
+      const usedEarlyGuard = typeof window.__CLIVE_SET_CAPTURE_GUARD__ === 'function';
+      if (usedEarlyGuard) {
+        window.__CLIVE_SET_CAPTURE_GUARD__(captureHostGuard);
+      } else {
+        for (const tName of CAPTURE_GUARD_EVENTS) {
+          window.addEventListener(tName, captureHostGuard, true);
+        }
+      }
 
       this.pauseBtn.addEventListener('click', onPauseClick);
       this.closeBtn.addEventListener('click', onCloseAskClick);
@@ -1088,7 +1174,13 @@
         if (this._flashTimer) clearTimeout(this._flashTimer);
         if (this._cursorIdleTimer) clearTimeout(this._cursorIdleTimer);
         if (this._cursorPressTimer) clearTimeout(this._cursorPressTimer);
-        window.removeEventListener('click', captureHostGuard, true);
+        if (usedEarlyGuard && typeof window.__CLIVE_SET_CAPTURE_GUARD__ === 'function') {
+          window.__CLIVE_SET_CAPTURE_GUARD__(null);
+        } else {
+          for (const tName of CAPTURE_GUARD_EVENTS) {
+            window.removeEventListener(tName, captureHostGuard, true);
+          }
+        }
         this.pauseBtn.removeEventListener('click', onPauseClick);
         this.closeBtn.removeEventListener('click', onCloseAskClick);
         this.cancelConfirmBtn.removeEventListener('click', onCancelConfirmClick);

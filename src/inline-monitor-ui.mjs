@@ -933,7 +933,16 @@ export function buildInlineMonitorHtml() {
         }
 
         if (msg.method === 'ui/resource-teardown') {
-          if (pollTimer) clearTimeout(pollTimer);
+          isTornDown = true;
+          if (pollTimer) {
+            clearTimeout(pollTimer);
+            pollTimer = null;
+          }
+          if (rootResizeObserver) {
+            rootResizeObserver.disconnect();
+            rootResizeObserver = null;
+          }
+          document.removeEventListener('visibilitychange', onVisibilityChange);
           if (msg.id !== undefined) postJson({ jsonrpc: '2.0', id: msg.id, result: {} });
           return;
         }
@@ -944,6 +953,7 @@ export function buildInlineMonitorHtml() {
         }
 
         if (msg.method === 'ui/notifications/tool-result') {
+          if (isTornDown) return;
           const metaObj = msg.params && msg.params._meta;
           const metaSecret = metaObj && metaObj.uiSecret;
           if (typeof metaSecret === 'string' && metaSecret) {
@@ -967,8 +977,11 @@ export function buildInlineMonitorHtml() {
       });
 
       let uiSecret = '';
+      let isTornDown = false;
+      let rootResizeObserver = null;
 
       async function pollLoop() {
+        if (isTornDown) return;
         if (!uiSecret || document.hidden || pollInFlight) {
           scheduleNextPoll();
           return;
@@ -981,16 +994,20 @@ export function buildInlineMonitorHtml() {
             name: 'chrome_live_monitor',
             arguments: pollArgs
           });
-          if (res && res.structuredContent) {
+          if (!isTornDown && res && res.structuredContent) {
             renderSnapshot(res.structuredContent);
           }
         } catch {}
         pollInFlight = false;
-        scheduleNextPoll();
+        if (!isTornDown) scheduleNextPoll();
       }
 
       function scheduleNextPoll() {
         if (pollTimer) clearTimeout(pollTimer);
+        if (isTornDown) {
+          pollTimer = null;
+          return;
+        }
         pollTimer = setTimeout(pollLoop, hasActiveTabs ? 720 : 2400);
       }
 
@@ -1264,10 +1281,14 @@ export function buildInlineMonitorHtml() {
         }).catch(() => {});
       });
 
-      new ResizeObserver(() => reportSize()).observe(rootBox);
-      document.addEventListener('visibilitychange', () => {
-        if (!document.hidden) pollLoop();
+      rootResizeObserver = new ResizeObserver(() => {
+        if (!isTornDown) reportSize();
       });
+      rootResizeObserver.observe(rootBox);
+      const onVisibilityChange = () => {
+        if (!isTornDown && !document.hidden) pollLoop();
+      };
+      document.addEventListener('visibilitychange', onVisibilityChange);
 
       (async () => {
         try {

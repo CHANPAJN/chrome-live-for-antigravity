@@ -26,6 +26,19 @@
   "side_panel": {
     "default_path": "panel/index.html"
   },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "hud-early-guard.js"
+      ],
+      "run_at": "document_start",
+      "world": "ISOLATED"
+    }
+  ],
   "permissions": [
     "debugger",
     "scripting",

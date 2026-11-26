@@ -2051,7 +2051,10 @@ async function inspectEmbeddedFramesSafety(tabId) {
             }
             for (const btn of root.querySelectorAll('button, input')) {
               if (!safeHasAttr(btn, 'formtarget') && !safeHasAttr(btn, 'formaction')) continue;
-              const ownerForm = btn.form instanceof HTMLFormElement ? btn.form : btn.closest?.('form') || null;
+              const ownerForm =
+                btn.form instanceof HTMLFormElement
+                  ? btn.form
+                  : Element.prototype.closest?.call(btn, 'form') || null;
               const effTarget = safeHasAttr(btn, 'formtarget')
                 ? safeAttr(btn, 'formtarget')
                 : ownerForm
@@ -2411,11 +2414,14 @@ async function executeBridgeRpc(method, params) {
           while (el && getOpenShadow(el) && getOpenShadow(el).activeElement) {
             el = getOpenShadow(el).activeElement;
           }
-          const getTag = (n) => String(n?.tagName || '').toLowerCase();
+          const _tagGet = Object.getOwnPropertyDescriptor(Element.prototype, 'tagName')?.get;
+          const _ceGet = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'isContentEditable')?.get;
+          const getTag = (n) => String((n instanceof Element && _tagGet ? _tagGet.call(n) : n?.tagName) || '').toLowerCase();
+          const isCE = (n) => Boolean(n instanceof HTMLElement && _ceGet ? _ceGet.call(n) : false);
           if (
             !el ||
             el === activeDoc.body ||
-            (getTag(el) !== 'input' && getTag(el) !== 'textarea' && !el.isContentEditable)
+            (getTag(el) !== 'input' && getTag(el) !== 'textarea' && !isCE(el))
           ) {
             if (startedInFrame) {
               return { ok: false, error: 'No active input field inside focused iframe' };
@@ -2427,7 +2433,7 @@ async function executeBridgeRpc(method, params) {
           if (!el) return { ok: false, error: 'No active input field' };
           const ownerWin = el.ownerDocument?.defaultView || window;
           el.focus?.();
-          if (el.isContentEditable) {
+          if (isCE(el)) {
             const sel = ownerWin.getSelection?.();
             if (sel) {
               const range = (el.ownerDocument || document).createRange();
@@ -2515,30 +2521,83 @@ async function executeBridgeRpc(method, params) {
           return acc;
         }
 
+        const _pGet = typeof Node !== 'undefined' ? Object.getOwnPropertyDescriptor(Node.prototype, 'parentElement')?.get : null;
+        const _sGet = typeof Element !== 'undefined' ? Object.getOwnPropertyDescriptor(Element.prototype, 'assignedSlot')?.get : null;
+        const _tsGet = typeof Text !== 'undefined' ? Object.getOwnPropertyDescriptor(Text.prototype, 'assignedSlot')?.get : null;
+        const _tagGet = typeof Element !== 'undefined' ? Object.getOwnPropertyDescriptor(Element.prototype, 'tagName')?.get : null;
+        const _idGet = typeof Element !== 'undefined' ? Object.getOwnPropertyDescriptor(Element.prototype, 'id')?.get : null;
+        const _ceGet =
+          typeof HTMLElement !== 'undefined'
+            ? Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'isContentEditable')?.get
+            : null;
+        const _rootFn = typeof Node !== 'undefined' ? Node.prototype.getRootNode : null;
+        const _matchFn = typeof Element !== 'undefined' ? Element.prototype.matches : null;
+        const _closeFn = typeof Element !== 'undefined' ? Element.prototype.closest : null;
+        const _visFn = typeof Element !== 'undefined' ? Element.prototype.checkVisibility : null;
+        const _attrFn = typeof Element !== 'undefined' ? Element.prototype.getAttribute : null;
+
         const safeTagLower = (n) => {
+          if (!n) return '';
           const raw =
-            (typeof Element !== 'undefined' && Object.getOwnPropertyDescriptor(Element.prototype, 'tagName')?.get?.call(n)) ||
-            (typeof n?.tagName === 'string' ? n.tagName : '');
+            _tagGet && typeof Element !== 'undefined' && n instanceof Element
+              ? _tagGet.call(n)
+              : typeof n.tagName === 'string'
+                ? n.tagName
+                : '';
           return String(raw).toLowerCase();
+        };
+        const safeId = (n) => {
+          if (!n) return '';
+          if (_idGet && typeof Element !== 'undefined' && n instanceof Element) return String(_idGet.call(n) || '');
+          return typeof n.id === 'string' ? n.id : '';
+        };
+        const safeIsCE = (n) => {
+          if (!n) return false;
+          if (_ceGet && typeof HTMLElement !== 'undefined' && n instanceof HTMLElement) return Boolean(_ceGet.call(n));
+          return n.isContentEditable === true;
+        };
+        const safeParent = (n) => {
+          if (!n) return null;
+          if (_pGet && typeof Node !== 'undefined' && n instanceof Node) return _pGet.call(n);
+          return n.parentElement && !(safeTagLower(n) === 'form' && 'form' in n.parentElement) ? n.parentElement : null;
+        };
+        const safeSlot = (n) => {
+          if (!n) return null;
+          if (_sGet && typeof Element !== 'undefined' && n instanceof Element) return _sGet.call(n);
+          if (_tsGet && typeof Text !== 'undefined' && n instanceof Text) return _tsGet.call(n);
+          return n.assignedSlot && !(safeTagLower(n) === 'form' && 'form' in n.assignedSlot) ? n.assignedSlot : null;
+        };
+        const safeRoot = (n) => {
+          if (!n) return null;
+          if (_rootFn && typeof Node !== 'undefined' && n instanceof Node) return _rootFn.call(n);
+          return typeof n.getRootNode === 'function' ? n.getRootNode() : null;
+        };
+        const safeMatches = (n, sel) => {
+          if (!n) return false;
+          if (_matchFn && typeof Element !== 'undefined' && n instanceof Element) return _matchFn.call(n, sel);
+          return typeof n.matches === 'function' ? n.matches(sel) : false;
         };
         const safeClosest = (n, sel) => {
           if (!n) return null;
-          if (typeof n.closest === 'function') return n.closest(sel);
-          return typeof Element !== 'undefined' ? Element.prototype.closest?.call(n, sel) || null : null;
+          if (_closeFn && typeof Element !== 'undefined' && n instanceof Element) return _closeFn.call(n, sel);
+          return typeof n.closest === 'function' ? n.closest(sel) : null;
+        };
+        const safeCheckVis = (n) => {
+          if (!n) return false;
+          if (_visFn && typeof Element !== 'undefined' && n instanceof Element) {
+            return _visFn.call(n, { checkVisibilityCSS: true, checkOpacity: true });
+          }
+          return typeof n.checkVisibility === 'function'
+            ? n.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
+            : true;
         };
         const safeGetAttr = (n, k) => {
           if (!n) return null;
-          if (typeof n.getAttribute === 'function') return n.getAttribute(k);
-          return typeof Element !== 'undefined' ? Element.prototype.getAttribute?.call(n, k) ?? null : null;
+          if (_attrFn && typeof Element !== 'undefined' && n instanceof Element) return _attrFn.call(n, k);
+          return typeof n.getAttribute === 'function' ? n.getAttribute(k) : null;
         };
         const isElementFlatVisible = (node) => {
-          if (!node) return false;
-          if (
-            typeof node.checkVisibility === 'function' &&
-            !node.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
-          ) {
-            return false;
-          }
+          if (!node || !safeCheckVis(node)) return false;
           const seen = new Set();
           let cur = node;
           while (cur && !seen.has(cur)) {
@@ -2547,12 +2606,13 @@ async function executeBridgeRpc(method, params) {
             if (cs && (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse' || cs.opacity === '0')) {
               return false;
             }
-            if (cur.assignedSlot) {
-              cur = cur.assignedSlot;
+            const sl = safeSlot(cur);
+            if (sl) {
+              cur = sl;
               continue;
             }
-            const rn = cur.getRootNode?.();
-            cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+            const rn = safeRoot(cur);
+            cur = safeParent(cur) || (rn && rn.host ? rn.host : null);
           }
           return true;
         };
@@ -2560,19 +2620,20 @@ async function executeBridgeRpc(method, params) {
           '.CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], [data-chrome-live-hud]';
         const isNestedInsideEditorOrHidden = (elNode) => {
           const seen = new Set();
-          const startRn = elNode?.getRootNode?.();
-          let cur = elNode?.assignedSlot || elNode?.parentElement || (startRn && startRn.host ? startRn.host : null);
+          const startRn = safeRoot(elNode);
+          let cur = safeSlot(elNode) || safeParent(elNode) || (startRn && startRn.host ? startRn.host : null);
           while (cur && !seen.has(cur)) {
             seen.add(cur);
-            if (cur.isContentEditable || cur.matches?.(NESTED_EDITOR_OR_HIDDEN_SEL)) {
+            if (safeIsCE(cur) || safeMatches(cur, NESTED_EDITOR_OR_HIDDEN_SEL) || safeClosest(cur, NESTED_EDITOR_OR_HIDDEN_SEL)) {
               return true;
             }
-            if (cur.assignedSlot) {
-              cur = cur.assignedSlot;
+            const sl = safeSlot(cur);
+            if (sl) {
+              cur = sl;
               continue;
             }
-            const rn = cur.getRootNode?.();
-            cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+            const rn = safeRoot(cur);
+            cur = safeParent(cur) || (rn && rn.host ? rn.host : null);
           }
           return false;
         };
@@ -2606,7 +2667,7 @@ async function executeBridgeRpc(method, params) {
             (tagLower === 'input' && !isButtonInput) ||
             tagLower === 'textarea' ||
             tagLower === 'select' ||
-            el.isContentEditable ||
+            safeIsCE(el) ||
             /^(?:textbox|searchbox|combobox|spinbutton)$/.test(roleLower);
           // Never read user-typed .value, nested <textarea>/contenteditable/editor drafts, or hidden text across Shadow DOM
           const REGION_SKIP_SEL =
@@ -2615,26 +2676,17 @@ async function executeBridgeRpc(method, params) {
             '[contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
           const isInsideSkipped = (node, stopRoot) => {
             const seen = new Set();
-            let cur = node instanceof Element ? node : node?.assignedSlot || node?.parentElement;
+            let cur = node instanceof Element ? node : safeSlot(node) || safeParent(node);
             let passedStop = false;
             while (cur && !seen.has(cur)) {
               seen.add(cur);
-              if (!passedStop && (cur.isContentEditable || cur.matches?.(REGION_SKIP_SEL) || cur.closest?.(REGION_SKIP_SEL))) {
+              if (!passedStop && (safeIsCE(cur) || safeMatches(cur, REGION_SKIP_SEL) || safeClosest(cur, REGION_SKIP_SEL))) {
                 return true;
               }
-              if (
-                cur.isContentEditable ||
-                cur.matches?.(REGION_ANCESTOR_SKIP_SEL) ||
-                cur.closest?.(REGION_ANCESTOR_SKIP_SEL)
-              ) {
+              if (safeIsCE(cur) || safeMatches(cur, REGION_ANCESTOR_SKIP_SEL) || safeClosest(cur, REGION_ANCESTOR_SKIP_SEL)) {
                 return true;
               }
-              if (
-                typeof cur.checkVisibility === 'function' &&
-                !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
-              ) {
-                return true;
-              }
+              if (!safeCheckVis(cur)) return true;
               const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
               const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue?.('-webkit-text-security') || '').toLowerCase();
               if (
@@ -2646,15 +2698,16 @@ async function executeBridgeRpc(method, params) {
               ) {
                 return true;
               }
-              if (cur.assignedSlot) {
-                cur = cur.assignedSlot;
+              const sl = safeSlot(cur);
+              if (sl) {
+                cur = sl;
                 continue;
               }
               if (cur === stopRoot) {
                 passedStop = true;
               }
-              const rn = cur.getRootNode?.();
-              cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+              const rn = safeRoot(cur);
+              cur = safeParent(cur) || (rn && rn.host ? rn.host : null);
             }
             return false;
           };
@@ -2664,7 +2717,7 @@ async function executeBridgeRpc(method, params) {
             const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
             let tn;
             while ((tn = tw.nextNode())) {
-              const startEl = tn.assignedSlot || tn.parentElement;
+              const startEl = safeSlot(tn) || safeParent(tn);
               if (startEl && !isInsideSkipped(startEl, rootNode)) {
                 outParts.push(tn.nodeValue || '');
               }
@@ -2673,6 +2726,7 @@ async function executeBridgeRpc(method, params) {
           };
           const safeValueLabel = isButtonInput ? el.value || '' : '';
           const safeTextLabel = isUserValueField || isSensitiveInput ? '' : extractCleanText(el);
+          const elIdStr = safeId(el);
           const rawLabel = (
             safeGetAttr(el, 'aria-label') ||
             safeGetAttr(el, 'placeholder') ||
@@ -2680,27 +2734,29 @@ async function executeBridgeRpc(method, params) {
             safeValueLabel ||
             safeGetAttr(el, 'title') ||
             safeGetAttr(el, 'name') ||
-            (typeof el.id === 'string' ? el.id : '') ||
+            elIdStr ||
             (isSensitiveInput ? '(password)' : '')
           )
             .replace(/\s+/g, ' ')
             .trim()
             .slice(0, 72);
           const isFormField =
-            tagLower === 'input' || tagLower === 'textarea' || tagLower === 'select' || el.isContentEditable;
+            tagLower === 'input' || tagLower === 'textarea' || tagLower === 'select' || safeIsCE(el);
           const label =
             rawLabel || (isFormField ? `<${tagLower}${el.type ? `[type=${el.type}]` : ''}>` : '');
           if (!label) continue;
           const tid = safeGetAttr(el, 'data-testid');
-          const elIdStr = typeof el.id === 'string' ? el.id : '';
           const elNameStr = safeGetAttr(el, 'name') || '';
-          const selector = tid
-            ? `[data-testid="${CSS.escape(tid)}"]`
-            : elIdStr
-              ? `#${CSS.escape(elIdStr)}`
-              : elNameStr
-                ? `${tagLower}[name="${CSS.escape(elNameStr)}"]`
-                : tagLower;
+          const selector =
+            tid && /^[\w.:-]{1,64}$/.test(tid)
+              ? `[data-testid="${tid}"]`
+              : elIdStr && /^[a-zA-Z][\w-]{1,48}$/.test(elIdStr)
+                ? `#${elIdStr}`
+                : elIdStr && /^[\w.:-]{1,64}$/.test(elIdStr)
+                  ? `[id="${elIdStr}"]`
+                  : elNameStr && /^[\w.:-]{1,64}$/.test(elNameStr)
+                    ? `${tagLower}[name="${elNameStr}"]`
+                    : tagLower;
           const area = Math.max(16, r.width * r.height);
           scored.push({
             area,
@@ -2964,20 +3020,49 @@ async function executeBridgeRpc(method, params) {
                   'SELECT',
                   'OPTION'
                 ]);
+                const _pGet = Object.getOwnPropertyDescriptor(Node.prototype, 'parentElement')?.get;
+                const _sGet = Object.getOwnPropertyDescriptor(Element.prototype, 'assignedSlot')?.get;
+                const _tsGet = Object.getOwnPropertyDescriptor(Text.prototype, 'assignedSlot')?.get;
+                const _tagGet = Object.getOwnPropertyDescriptor(Element.prototype, 'tagName')?.get;
+                const _ceGet = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'isContentEditable')?.get;
+                const _rootFn = Node.prototype.getRootNode;
+                const _matchFn = Element.prototype.matches;
+                const _closeFn = Element.prototype.closest;
+                const _visFn = Element.prototype.checkVisibility;
+                const sParent = (x) => (x && _pGet && x instanceof Node ? _pGet.call(x) : null);
+                const sSlot = (x) =>
+                  !x
+                    ? null
+                    : _sGet && x instanceof Element
+                      ? _sGet.call(x)
+                      : _tsGet && x instanceof Text
+                        ? _tsGet.call(x)
+                        : null;
+                const sRoot = (x) => (x && _rootFn && x instanceof Node ? _rootFn.call(x) : null);
+                const sTag = (x) => (x && _tagGet && x instanceof Element ? String(_tagGet.call(x) || '').toUpperCase() : '');
+                const sIsCE = (x) => Boolean(x && _ceGet && x instanceof HTMLElement && _ceGet.call(x));
+
                 const SKIP_CLOSEST =
                   'style, script, noscript, template, textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], [data-chrome-live-hud]';
                 const isInsideSkipped = (node) => {
                   const seen = new Set();
-                  let cur = node instanceof Element ? node : node?.assignedSlot || node?.parentElement;
+                  let cur = node instanceof Element ? node : sSlot(node) || sParent(node);
                   while (cur && !seen.has(cur)) {
                     seen.add(cur);
-                    if (cur.isContentEditable || cur.matches?.(SKIP_CLOSEST) || cur.closest?.(SKIP_CLOSEST)) return true;
-                    if (cur.assignedSlot) {
-                      cur = cur.assignedSlot;
+                    if (
+                      sIsCE(cur) ||
+                      (_matchFn && cur instanceof Element && _matchFn.call(cur, SKIP_CLOSEST)) ||
+                      (_closeFn && cur instanceof Element && _closeFn.call(cur, SKIP_CLOSEST))
+                    ) {
+                      return true;
+                    }
+                    const sl = sSlot(cur);
+                    if (sl) {
+                      cur = sl;
                       continue;
                     }
-                    const rn = cur.getRootNode?.();
-                    cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+                    const rn = sRoot(cur);
+                    cur = sParent(cur) || (rn && rn.host ? rn.host : null);
                   }
                   return false;
                 };
@@ -2987,8 +3072,8 @@ async function executeBridgeRpc(method, params) {
                   const cs = window.getComputedStyle(el);
                   const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue('-webkit-text-security') || '').toLowerCase();
                   let v = (!tSec || tSec === 'none') && cs.opacity !== '0' && cs.display !== 'none' && cs.visibility !== 'hidden' && cs.visibility !== 'collapse';
-                  if (v && typeof el.checkVisibility === 'function') {
-                    v = el.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true });
+                  if (v && typeof _visFn === 'function' && el instanceof Element) {
+                    v = _visFn.call(el, { checkVisibilityCSS: true, checkOpacity: true });
                   }
                   visCache.set(el, v);
                   return v;
@@ -2999,12 +3084,13 @@ async function executeBridgeRpc(method, params) {
                   while (cur && !seen.has(cur)) {
                     seen.add(cur);
                     if (!isSingleElemVisible(cur)) return false;
-                    if (cur.assignedSlot) {
-                      cur = cur.assignedSlot;
+                    const sl = sSlot(cur);
+                    if (sl) {
+                      cur = sl;
                       continue;
                     }
-                    const rn = cur.getRootNode?.();
-                    cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+                    const rn = sRoot(cur);
+                    cur = sParent(cur) || (rn && rn.host ? rn.host : null);
                   }
                   return true;
                 };
@@ -3015,10 +3101,10 @@ async function executeBridgeRpc(method, params) {
                   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
                   let node;
                   while ((node = walker.nextNode())) {
-                    const p = node.parentElement;
-                    const startEl = node.assignedSlot || p;
+                    const p = sParent(node);
+                    const startEl = sSlot(node) || p;
                     if (!startEl) continue;
-                    if ((p && SKIP_TAGS.has(p.tagName)) || isInsideSkipped(startEl) || !isFlatVisible(startEl)) {
+                    if ((p && SKIP_TAGS.has(sTag(p))) || isInsideSkipped(startEl) || !isFlatVisible(startEl)) {
                       continue;
                     }
                     const chunk = node.nodeValue || '';
@@ -3198,35 +3284,100 @@ async function executeBridgeRpc(method, params) {
           return acc;
         }
 
+        const _pGet = typeof Node !== 'undefined' ? Object.getOwnPropertyDescriptor(Node.prototype, 'parentElement')?.get : null;
+        const _sGet = typeof Element !== 'undefined' ? Object.getOwnPropertyDescriptor(Element.prototype, 'assignedSlot')?.get : null;
+        const _tsGet = typeof Text !== 'undefined' ? Object.getOwnPropertyDescriptor(Text.prototype, 'assignedSlot')?.get : null;
+        const _tagGet = typeof Element !== 'undefined' ? Object.getOwnPropertyDescriptor(Element.prototype, 'tagName')?.get : null;
+        const _idGet = typeof Element !== 'undefined' ? Object.getOwnPropertyDescriptor(Element.prototype, 'id')?.get : null;
+        const _ceGet =
+          typeof HTMLElement !== 'undefined'
+            ? Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'isContentEditable')?.get
+            : null;
+        const _rootFn = typeof Node !== 'undefined' ? Node.prototype.getRootNode : null;
+        const _matchFn = typeof Element !== 'undefined' ? Element.prototype.matches : null;
+        const _closeFn = typeof Element !== 'undefined' ? Element.prototype.closest : null;
+        const _visFn = typeof Element !== 'undefined' ? Element.prototype.checkVisibility : null;
+        const _attrFn = typeof Element !== 'undefined' ? Element.prototype.getAttribute : null;
+        const _setAttrFn = typeof Element !== 'undefined' ? Element.prototype.setAttribute : null;
+
         const safeTagLower = (n) => {
+          if (!n) return '';
           const raw =
-            (typeof Element !== 'undefined' && Object.getOwnPropertyDescriptor(Element.prototype, 'tagName')?.get?.call(n)) ||
-            (typeof n?.tagName === 'string' ? n.tagName : '');
+            _tagGet && typeof Element !== 'undefined' && n instanceof Element
+              ? _tagGet.call(n)
+              : typeof n.tagName === 'string'
+                ? n.tagName
+                : '';
           return String(raw).toLowerCase();
+        };
+        const safeId = (n) => {
+          if (!n) return '';
+          if (_idGet && typeof Element !== 'undefined' && n instanceof Element) return String(_idGet.call(n) || '');
+          return typeof n.id === 'string' ? n.id : '';
+        };
+        const safeIsCE = (n) => {
+          if (!n) return false;
+          if (_ceGet && typeof HTMLElement !== 'undefined' && n instanceof HTMLElement) return Boolean(_ceGet.call(n));
+          return n.isContentEditable === true;
+        };
+        const safeParent = (n) => {
+          if (!n) return null;
+          if (_pGet && typeof Node !== 'undefined' && n instanceof Node) return _pGet.call(n);
+          return n.parentElement && !(safeTagLower(n) === 'form' && 'form' in n.parentElement) ? n.parentElement : null;
+        };
+        const safeSlot = (n) => {
+          if (!n) return null;
+          if (_sGet && typeof Element !== 'undefined' && n instanceof Element) return _sGet.call(n);
+          if (_tsGet && typeof Text !== 'undefined' && n instanceof Text) return _tsGet.call(n);
+          return n.assignedSlot && !(safeTagLower(n) === 'form' && 'form' in n.assignedSlot) ? n.assignedSlot : null;
+        };
+        const safeRoot = (n) => {
+          if (!n) return null;
+          if (_rootFn && typeof Node !== 'undefined' && n instanceof Node) return _rootFn.call(n);
+          return typeof n.getRootNode === 'function' ? n.getRootNode() : null;
+        };
+        const safeMatches = (n, sel) => {
+          if (!n) return false;
+          if (_matchFn && typeof Element !== 'undefined' && n instanceof Element) return _matchFn.call(n, sel);
+          return typeof n.matches === 'function' ? n.matches(sel) : false;
         };
         const safeClosest = (n, sel) => {
           if (!n) return null;
-          if (typeof n.closest === 'function') return n.closest(sel);
-          return typeof Element !== 'undefined' ? Element.prototype.closest?.call(n, sel) || null : null;
+          if (_closeFn && typeof Element !== 'undefined' && n instanceof Element) return _closeFn.call(n, sel);
+          return typeof n.closest === 'function' ? n.closest(sel) : null;
+        };
+        const safeCheckVis = (n) => {
+          if (!n) return false;
+          if (_visFn && typeof Element !== 'undefined' && n instanceof Element) {
+            return _visFn.call(n, { checkVisibilityCSS: true, checkOpacity: true });
+          }
+          return typeof n.checkVisibility === 'function'
+            ? n.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
+            : true;
         };
         const safeGetAttr = (n, k) => {
           if (!n) return null;
-          if (typeof n.getAttribute === 'function') return n.getAttribute(k);
-          return typeof Element !== 'undefined' ? Element.prototype.getAttribute?.call(n, k) ?? null : null;
+          if (_attrFn && typeof Element !== 'undefined' && n instanceof Element) return _attrFn.call(n, k);
+          return typeof n.getAttribute === 'function' ? n.getAttribute(k) : null;
         };
         const safeSetAttr = (n, k, v) => {
           if (!n) return;
-          if (typeof n.setAttribute === 'function') n.setAttribute(k, v);
-          else if (typeof Element !== 'undefined') Element.prototype.setAttribute?.call(n, k, v);
+          if (_setAttrFn && typeof Element !== 'undefined' && n instanceof Element) _setAttrFn.call(n, k, v);
+          else if (typeof n.setAttribute === 'function') n.setAttribute(k, v);
         };
         const isElementFlatVisible = (elNode) => {
           if (!elNode) return false;
-          if (
-            typeof elNode.checkVisibility === 'function' &&
-            !elNode.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
-          ) {
-            return false;
-          }
+          const vFn = typeof Element !== 'undefined' ? Element.prototype.checkVisibility : null;
+          const pGet = typeof Node !== 'undefined' ? Object.getOwnPropertyDescriptor(Node.prototype, 'parentElement')?.get : null;
+          const sGet = typeof Element !== 'undefined' ? Object.getOwnPropertyDescriptor(Element.prototype, 'assignedSlot')?.get : null;
+          const rFn = typeof Node !== 'undefined' ? Node.prototype.getRootNode : null;
+          const okVis =
+            vFn && typeof Element !== 'undefined' && elNode instanceof Element
+              ? vFn.call(elNode, { checkVisibilityCSS: true, checkOpacity: true })
+              : typeof elNode.checkVisibility === 'function'
+                ? elNode.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
+                : true;
+          if (!okVis) return false;
           const seen = new Set();
           let cur = elNode;
           while (cur && !seen.has(cur)) {
@@ -3235,12 +3386,29 @@ async function executeBridgeRpc(method, params) {
             if (cs && (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse' || cs.opacity === '0')) {
               return false;
             }
-            if (cur.assignedSlot) {
-              cur = cur.assignedSlot;
+            const sl =
+              sGet && typeof Element !== 'undefined' && cur instanceof Element
+                ? sGet.call(cur)
+                : cur.assignedSlot && !(String(cur.tagName || '').toLowerCase() === 'form' && 'form' in cur.assignedSlot)
+                  ? cur.assignedSlot
+                  : null;
+            if (sl) {
+              cur = sl;
               continue;
             }
-            const rn = cur.getRootNode?.();
-            cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+            const rn =
+              rFn && typeof Node !== 'undefined' && cur instanceof Node
+                ? rFn.call(cur)
+                : typeof cur.getRootNode === 'function'
+                  ? cur.getRootNode()
+                  : null;
+            const par =
+              pGet && typeof Node !== 'undefined' && cur instanceof Node
+                ? pGet.call(cur)
+                : cur.parentElement && !(String(cur.tagName || '').toLowerCase() === 'form' && 'form' in cur.parentElement)
+                  ? cur.parentElement
+                  : null;
+            cur = par || (rn && rn.host ? rn.host : null);
           }
           return true;
         };
@@ -3248,19 +3416,24 @@ async function executeBridgeRpc(method, params) {
           '.CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], [data-chrome-live-hud]';
         const isNestedInsideEditorOrHidden = (elNode) => {
           const seen = new Set();
-          const startRn = elNode?.getRootNode?.();
-          let cur = elNode?.assignedSlot || elNode?.parentElement || (startRn && startRn.host ? startRn.host : null);
+          const startRn = safeRoot(elNode);
+          let cur = safeSlot(elNode) || safeParent(elNode) || (startRn && startRn.host ? startRn.host : null);
           while (cur && !seen.has(cur)) {
             seen.add(cur);
-            if (cur.isContentEditable || cur.matches?.(SNAP_NESTED_EDITOR_OR_HIDDEN_SEL)) {
+            if (
+              safeIsCE(cur) ||
+              safeMatches(cur, SNAP_NESTED_EDITOR_OR_HIDDEN_SEL) ||
+              safeClosest(cur, SNAP_NESTED_EDITOR_OR_HIDDEN_SEL)
+            ) {
               return true;
             }
-            if (cur.assignedSlot) {
-              cur = cur.assignedSlot;
+            const sl = safeSlot(cur);
+            if (sl) {
+              cur = sl;
               continue;
             }
-            const rn = cur.getRootNode?.();
-            cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+            const rn = safeRoot(cur);
+            cur = safeParent(cur) || (rn && rn.host ? rn.host : null);
           }
           return false;
         };
@@ -3302,7 +3475,7 @@ async function executeBridgeRpc(method, params) {
             (tagLower === 'input' && !isButtonInput) ||
             tagLower === 'textarea' ||
             tagLower === 'select' ||
-            node.isContentEditable ||
+            safeIsCE(node) ||
             /^(?:textbox|searchbox|combobox|spinbutton)$/.test(roleAttr);
           // Never expose user-entered password/OTP/input values or nested editor draft text as element labels
           const SNAP_SKIP_SEL =
@@ -3311,26 +3484,17 @@ async function executeBridgeRpc(method, params) {
             '[contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
           const isSnapSkipped = (n, stopRoot) => {
             const seen = new Set();
-            let cur = n instanceof Element ? n : n?.assignedSlot || n?.parentElement;
+            let cur = n instanceof Element ? n : safeSlot(n) || safeParent(n);
             let passedStop = false;
             while (cur && !seen.has(cur)) {
               seen.add(cur);
-              if (!passedStop && (cur.isContentEditable || cur.matches?.(SNAP_SKIP_SEL) || cur.closest?.(SNAP_SKIP_SEL))) {
+              if (!passedStop && (safeIsCE(cur) || safeMatches(cur, SNAP_SKIP_SEL) || safeClosest(cur, SNAP_SKIP_SEL))) {
                 return true;
               }
-              if (
-                cur.isContentEditable ||
-                cur.matches?.(SNAP_ANCESTOR_SKIP_SEL) ||
-                cur.closest?.(SNAP_ANCESTOR_SKIP_SEL)
-              ) {
+              if (safeIsCE(cur) || safeMatches(cur, SNAP_ANCESTOR_SKIP_SEL) || safeClosest(cur, SNAP_ANCESTOR_SKIP_SEL)) {
                 return true;
               }
-              if (
-                typeof cur.checkVisibility === 'function' &&
-                !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
-              ) {
-                return true;
-              }
+              if (!safeCheckVis(cur)) return true;
               const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
               const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue?.('-webkit-text-security') || '').toLowerCase();
               if (
@@ -3342,15 +3506,16 @@ async function executeBridgeRpc(method, params) {
               ) {
                 return true;
               }
-              if (cur.assignedSlot) {
-                cur = cur.assignedSlot;
+              const sl = safeSlot(cur);
+              if (sl) {
+                cur = sl;
                 continue;
               }
               if (cur === stopRoot) {
                 passedStop = true;
               }
-              const rn = cur.getRootNode?.();
-              cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+              const rn = safeRoot(cur);
+              cur = safeParent(cur) || (rn && rn.host ? rn.host : null);
             }
             return false;
           };
@@ -3360,7 +3525,7 @@ async function executeBridgeRpc(method, params) {
             const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
             let tn;
             while ((tn = tw.nextNode())) {
-              const startEl = tn.assignedSlot || tn.parentElement;
+              const startEl = safeSlot(tn) || safeParent(tn);
               if (startEl && !isSnapSkipped(startEl, rootNode)) {
                 outParts.push(tn.nodeValue || '');
               }
@@ -3385,9 +3550,9 @@ async function executeBridgeRpc(method, params) {
               tagLower === 'button' ||
               /^(?:textbox|searchbox|combobox|switch|radio|checkbox|option|menuitem)$/.test(roleAttr));
           const testId = safeGetAttr(node, 'data-testid');
-          const nodeIdStr = typeof node.id === 'string' ? node.id : '';
+          const nodeIdStr = safeId(node);
           if (isControl && testId && /^[\w.:-]{1,64}$/.test(testId)) {
-            stableSelector = `[data-testid="${CSS.escape(testId)}"]`;
+            stableSelector = `[data-testid="${testId}"]`;
           } else if (
             isControl &&
             nodeIdStr &&
@@ -3398,8 +3563,8 @@ async function executeBridgeRpc(method, params) {
             stableSelector = `#${nodeIdStr}`;
           } else if (isControl) {
             const nameAttr = safeGetAttr(node, 'name');
-            if (nameAttr && /^[\w.-]{1,48}$/.test(nameAttr)) {
-              stableSelector = `${tagLower}[name="${CSS.escape(nameAttr)}"]`;
+            if (nameAttr && /^[\w.:-]{1,48}$/.test(nameAttr)) {
+              stableSelector = `${tagLower}[name="${nameAttr}"]`;
             }
           }
 
@@ -3448,9 +3613,8 @@ async function executeBridgeRpc(method, params) {
         const alertSet = new Set();
         for (const aNode of alertNodes) {
           if (alertSet.size >= 5) break;
-          if (aNode.closest && aNode.closest('[data-chrome-live-hud]')) continue;
-          const aStyle = window.getComputedStyle(aNode);
-          if (aStyle.display === 'none' || aStyle.visibility === 'hidden' || aStyle.opacity === '0') continue;
+          if (safeClosest(aNode, '[data-chrome-live-hud]') || isNestedInsideEditorOrHidden(aNode)) continue;
+          if (!isElementFlatVisible(aNode)) continue;
           const aRect = aNode.getBoundingClientRect();
           if (aRect.width < 4 || aRect.height < 4) continue;
           const ALERT_SKIP_SEL =
@@ -3459,26 +3623,17 @@ async function executeBridgeRpc(method, params) {
             '[contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
           const isAlertSkipped = (n, stopRoot) => {
             const seen = new Set();
-            let cur = n instanceof Element ? n : n?.assignedSlot || n?.parentElement;
+            let cur = n instanceof Element ? n : safeSlot(n) || safeParent(n);
             let passedStop = false;
             while (cur && !seen.has(cur)) {
               seen.add(cur);
-              if (!passedStop && (cur.isContentEditable || cur.matches?.(ALERT_SKIP_SEL) || cur.closest?.(ALERT_SKIP_SEL))) {
+              if (!passedStop && (safeIsCE(cur) || safeMatches(cur, ALERT_SKIP_SEL) || safeClosest(cur, ALERT_SKIP_SEL))) {
                 return true;
               }
-              if (
-                cur.isContentEditable ||
-                cur.matches?.(ALERT_ANCESTOR_SKIP_SEL) ||
-                cur.closest?.(ALERT_ANCESTOR_SKIP_SEL)
-              ) {
+              if (safeIsCE(cur) || safeMatches(cur, ALERT_ANCESTOR_SKIP_SEL) || safeClosest(cur, ALERT_ANCESTOR_SKIP_SEL)) {
                 return true;
               }
-              if (
-                typeof cur.checkVisibility === 'function' &&
-                !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
-              ) {
-                return true;
-              }
+              if (!safeCheckVis(cur)) return true;
               const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
               const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue?.('-webkit-text-security') || '').toLowerCase();
               if (
@@ -3490,15 +3645,16 @@ async function executeBridgeRpc(method, params) {
               ) {
                 return true;
               }
-              if (cur.assignedSlot) {
-                cur = cur.assignedSlot;
+              const sl = safeSlot(cur);
+              if (sl) {
+                cur = sl;
                 continue;
               }
               if (cur === stopRoot) {
                 passedStop = true;
               }
-              const rn = cur.getRootNode?.();
-              cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+              const rn = safeRoot(cur);
+              cur = safeParent(cur) || (rn && rn.host ? rn.host : null);
             }
             return false;
           };
@@ -3506,7 +3662,7 @@ async function executeBridgeRpc(method, params) {
           const aWalker = document.createTreeWalker(aNode, NodeFilter.SHOW_TEXT);
           let aTn;
           while ((aTn = aWalker.nextNode())) {
-            const ap = aTn.assignedSlot || aTn.parentElement;
+            const ap = safeSlot(aTn) || safeParent(aTn);
             if (ap && !isAlertSkipped(ap, aNode)) {
               cleanAlertParts.push(aTn.nodeValue || '');
             }
@@ -3531,16 +3687,17 @@ async function executeBridgeRpc(method, params) {
           'style, script, noscript, template, textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], [data-chrome-live-hud]';
         const isInsideSkipped = (n) => {
           const seen = new Set();
-          let cur = n instanceof Element ? n : n?.assignedSlot || n?.parentElement;
+          let cur = n instanceof Element ? n : safeSlot(n) || safeParent(n);
           while (cur && !seen.has(cur)) {
             seen.add(cur);
-            if (cur.isContentEditable || cur.matches?.(SKIP_CLOSEST) || cur.closest?.(SKIP_CLOSEST)) return true;
-            if (cur.assignedSlot) {
-              cur = cur.assignedSlot;
+            if (safeIsCE(cur) || safeMatches(cur, SKIP_CLOSEST) || safeClosest(cur, SKIP_CLOSEST)) return true;
+            const sl = safeSlot(cur);
+            if (sl) {
+              cur = sl;
               continue;
             }
-            const rn = cur.getRootNode?.();
-            cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+            const rn = safeRoot(cur);
+            cur = safeParent(cur) || (rn && rn.host ? rn.host : null);
           }
           return false;
         };
@@ -3550,8 +3707,8 @@ async function executeBridgeRpc(method, params) {
           const cs = window.getComputedStyle(el);
           const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue('-webkit-text-security') || '').toLowerCase();
           let v = (!tSec || tSec === 'none') && cs.opacity !== '0' && cs.display !== 'none' && cs.visibility !== 'hidden' && cs.visibility !== 'collapse';
-          if (v && typeof el.checkVisibility === 'function') {
-            v = el.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true });
+          if (v) {
+            v = safeCheckVis(el);
           }
           visCache.set(el, v);
           return v;
@@ -3562,12 +3719,13 @@ async function executeBridgeRpc(method, params) {
           while (cur && !seen.has(cur)) {
             seen.add(cur);
             if (!isSingleElemVisible(cur)) return false;
-            if (cur.assignedSlot) {
-              cur = cur.assignedSlot;
+            const sl = safeSlot(cur);
+            if (sl) {
+              cur = sl;
               continue;
             }
-            const rn = cur.getRootNode?.();
-            cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+            const rn = safeRoot(cur);
+            cur = safeParent(cur) || (rn && rn.host ? rn.host : null);
           }
           return true;
         };
@@ -3578,10 +3736,10 @@ async function executeBridgeRpc(method, params) {
           const walker = document.createTreeWalker(mainRoot, NodeFilter.SHOW_TEXT);
           let tNode;
           while ((tNode = walker.nextNode())) {
-            const p = tNode.parentElement;
-            const startEl = tNode.assignedSlot || p;
+            const p = safeParent(tNode);
+            const startEl = safeSlot(tNode) || p;
             if (!startEl) continue;
-            if ((p && SKIP_TAGS.has(p.tagName)) || isInsideSkipped(startEl) || !isFlatVisible(startEl)) {
+            if ((p && SKIP_TAGS.has(safeTagLower(p).toUpperCase())) || isInsideSkipped(startEl) || !isFlatVisible(startEl)) {
               continue;
             }
             const v = tNode.nodeValue || '';
@@ -3673,27 +3831,85 @@ async function executeBridgeRpc(method, params) {
         const CLICK_ANCESTOR_SKIP_SEL =
           '[contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
         const isClickSkipped = (n, stopRoot) => {
+          const pGet = typeof Node !== 'undefined' ? Object.getOwnPropertyDescriptor(Node.prototype, 'parentElement')?.get : null;
+          const sGet = typeof Element !== 'undefined' ? Object.getOwnPropertyDescriptor(Element.prototype, 'assignedSlot')?.get : null;
+          const tsGet = typeof Text !== 'undefined' ? Object.getOwnPropertyDescriptor(Text.prototype, 'assignedSlot')?.get : null;
+          const ceGet =
+            typeof HTMLElement !== 'undefined'
+              ? Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'isContentEditable')?.get
+              : null;
+          const rFn = typeof Node !== 'undefined' ? Node.prototype.getRootNode : null;
+          const mFn = typeof Element !== 'undefined' ? Element.prototype.matches : null;
+          const cFn = typeof Element !== 'undefined' ? Element.prototype.closest : null;
+          const vFn = typeof Element !== 'undefined' ? Element.prototype.checkVisibility : null;
+          const getPar = (x) =>
+            !x
+              ? null
+              : pGet && typeof Node !== 'undefined' && x instanceof Node
+                ? pGet.call(x)
+                : x.parentElement && !(String(x.tagName || '').toLowerCase() === 'form' && 'form' in x.parentElement)
+                  ? x.parentElement
+                  : null;
+          const getSl = (x) =>
+            !x
+              ? null
+              : sGet && typeof Element !== 'undefined' && x instanceof Element
+                ? sGet.call(x)
+                : tsGet && typeof Text !== 'undefined' && x instanceof Text
+                  ? tsGet.call(x)
+                  : x.assignedSlot && !(String(x.tagName || '').toLowerCase() === 'form' && 'form' in x.assignedSlot)
+                    ? x.assignedSlot
+                    : null;
+          const getRt = (x) =>
+            !x
+              ? null
+              : rFn && typeof Node !== 'undefined' && x instanceof Node
+                ? rFn.call(x)
+                : typeof x.getRootNode === 'function'
+                  ? x.getRootNode()
+                  : null;
+          const matchSel = (x, sel) =>
+            !x
+              ? false
+              : mFn && typeof Element !== 'undefined' && x instanceof Element
+                ? mFn.call(x, sel)
+                : typeof x.matches === 'function'
+                  ? x.matches(sel)
+                  : false;
+          const closeSel = (x, sel) =>
+            !x
+              ? null
+              : cFn && typeof Element !== 'undefined' && x instanceof Element
+                ? cFn.call(x, sel)
+                : typeof x.closest === 'function'
+                  ? x.closest(sel)
+                  : null;
+          const isCE = (x) =>
+            !x
+              ? false
+              : ceGet && typeof HTMLElement !== 'undefined' && x instanceof HTMLElement
+                ? Boolean(ceGet.call(x))
+                : x.isContentEditable === true;
+          const chkVis = (x) =>
+            !x
+              ? false
+              : vFn && typeof Element !== 'undefined' && x instanceof Element
+                ? vFn.call(x, { checkVisibilityCSS: true, checkOpacity: true })
+                : typeof x.checkVisibility === 'function'
+                  ? x.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
+                  : true;
           const seen = new Set();
-          let cur = n instanceof Element ? n : n?.assignedSlot || n?.parentElement;
+          let cur = n instanceof Element ? n : getSl(n) || getPar(n);
           let passedStop = false;
           while (cur && !seen.has(cur)) {
             seen.add(cur);
-            if (!passedStop && (cur.isContentEditable || cur.matches?.(CLICK_SKIP_SEL) || cur.closest?.(CLICK_SKIP_SEL))) {
+            if (!passedStop && (isCE(cur) || matchSel(cur, CLICK_SKIP_SEL) || closeSel(cur, CLICK_SKIP_SEL))) {
               return true;
             }
-            if (
-              cur.isContentEditable ||
-              cur.matches?.(CLICK_ANCESTOR_SKIP_SEL) ||
-              cur.closest?.(CLICK_ANCESTOR_SKIP_SEL)
-            ) {
+            if (isCE(cur) || matchSel(cur, CLICK_ANCESTOR_SKIP_SEL) || closeSel(cur, CLICK_ANCESTOR_SKIP_SEL)) {
               return true;
             }
-            if (
-              typeof cur.checkVisibility === 'function' &&
-              !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
-            ) {
-              return true;
-            }
+            if (!chkVis(cur)) return true;
             const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
             const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue?.('-webkit-text-security') || '').toLowerCase();
             if (
@@ -3705,26 +3921,33 @@ async function executeBridgeRpc(method, params) {
             ) {
               return true;
             }
-            if (cur.assignedSlot) {
-              cur = cur.assignedSlot;
+            const sl = getSl(cur);
+            if (sl) {
+              cur = sl;
               continue;
             }
             if (cur === stopRoot) {
               passedStop = true;
             }
-            const rn = cur.getRootNode?.();
-            cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+            const rn = getRt(cur);
+            cur = getPar(cur) || (rn && rn.host ? rn.host : null);
           }
           return false;
         };
 
         function extractCleanContainerText(rootNode) {
           if (!rootNode) return '';
+          const pGet = typeof Node !== 'undefined' ? Object.getOwnPropertyDescriptor(Node.prototype, 'parentElement')?.get : null;
+          const tsGet = typeof Text !== 'undefined' ? Object.getOwnPropertyDescriptor(Text.prototype, 'assignedSlot')?.get : null;
           const outParts = [];
           const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
           let tn;
           while ((tn = tw.nextNode())) {
-            const p = tn.assignedSlot || tn.parentElement;
+            const sl =
+              tsGet && typeof Text !== 'undefined' && tn instanceof Text ? tsGet.call(tn) : tn.assignedSlot || null;
+            const par =
+              pGet && typeof Node !== 'undefined' && tn instanceof Node ? pGet.call(tn) : tn.parentElement || null;
+            const p = sl || par;
             if (p && !isClickSkipped(p, rootNode)) {
               outParts.push(tn.nodeValue || '');
             }
@@ -3732,46 +3955,116 @@ async function executeBridgeRpc(method, params) {
           return outParts.join(' ');
         }
 
+        const _pGet = typeof Node !== 'undefined' ? Object.getOwnPropertyDescriptor(Node.prototype, 'parentElement')?.get : null;
+        const _sGet = typeof Element !== 'undefined' ? Object.getOwnPropertyDescriptor(Element.prototype, 'assignedSlot')?.get : null;
+        const _tagGet = typeof Element !== 'undefined' ? Object.getOwnPropertyDescriptor(Element.prototype, 'tagName')?.get : null;
+        const _idGet = typeof Element !== 'undefined' ? Object.getOwnPropertyDescriptor(Element.prototype, 'id')?.get : null;
+        const _ceGet =
+          typeof HTMLElement !== 'undefined'
+            ? Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'isContentEditable')?.get
+            : null;
+        const _rootFn = typeof Node !== 'undefined' ? Node.prototype.getRootNode : null;
+        const _matchFn = typeof Element !== 'undefined' ? Element.prototype.matches : null;
+        const _closeFn = typeof Element !== 'undefined' ? Element.prototype.closest : null;
+        const _visFn = typeof Element !== 'undefined' ? Element.prototype.checkVisibility : null;
+        const _attrFn = typeof Element !== 'undefined' ? Element.prototype.getAttribute : null;
+
         const safeTagLower = (n) => {
+          if (!n) return '';
           const raw =
-            (typeof Element !== 'undefined' && Object.getOwnPropertyDescriptor(Element.prototype, 'tagName')?.get?.call(n)) ||
-            (typeof n?.tagName === 'string' ? n.tagName : '');
+            _tagGet && typeof Element !== 'undefined' && n instanceof Element
+              ? _tagGet.call(n)
+              : typeof n.tagName === 'string'
+                ? n.tagName
+                : '';
           return String(raw).toLowerCase();
+        };
+        const safeId = (n) => {
+          if (!n) return '';
+          if (_idGet && typeof Element !== 'undefined' && n instanceof Element) return String(_idGet.call(n) || '');
+          return typeof n.id === 'string' ? n.id : '';
+        };
+        const safeIsCE = (n) => {
+          if (!n) return false;
+          if (_ceGet && typeof HTMLElement !== 'undefined' && n instanceof HTMLElement) return Boolean(_ceGet.call(n));
+          return n.isContentEditable === true;
+        };
+        const safeParent = (n) => {
+          if (!n) return null;
+          if (_pGet && typeof Node !== 'undefined' && n instanceof Node) return _pGet.call(n);
+          return n.parentElement && !(safeTagLower(n) === 'form' && 'form' in n.parentElement) ? n.parentElement : null;
+        };
+        const safeSlot = (n) => {
+          if (!n) return null;
+          if (_sGet && typeof Element !== 'undefined' && n instanceof Element) return _sGet.call(n);
+          return n.assignedSlot && !(safeTagLower(n) === 'form' && 'form' in n.assignedSlot) ? n.assignedSlot : null;
+        };
+        const safeRoot = (n) => {
+          if (!n) return null;
+          if (_rootFn && typeof Node !== 'undefined' && n instanceof Node) return _rootFn.call(n);
+          return typeof n.getRootNode === 'function' ? n.getRootNode() : null;
+        };
+        const safeMatches = (n, sel) => {
+          if (!n) return false;
+          if (_matchFn && typeof Element !== 'undefined' && n instanceof Element) return _matchFn.call(n, sel);
+          return typeof n.matches === 'function' ? n.matches(sel) : false;
         };
         const safeClosest = (n, sel) => {
           if (!n) return null;
-          if (typeof n.closest === 'function') return n.closest(sel);
-          return typeof Element !== 'undefined' ? Element.prototype.closest?.call(n, sel) || null : null;
+          if (_closeFn && typeof Element !== 'undefined' && n instanceof Element) return _closeFn.call(n, sel);
+          return typeof n.closest === 'function' ? n.closest(sel) : null;
         };
         const safeGetAttr = (n, k) => {
           if (!n) return null;
-          if (typeof n.getAttribute === 'function') return n.getAttribute(k);
-          return typeof Element !== 'undefined' ? Element.prototype.getAttribute?.call(n, k) ?? null : null;
+          if (_attrFn && typeof Element !== 'undefined' && n instanceof Element) return _attrFn.call(n, k);
+          return typeof n.getAttribute === 'function' ? n.getAttribute(k) : null;
         };
         const isElementFlatVisible = (elNode) => {
           if (!elNode) return false;
-          if (
-            typeof elNode.checkVisibility === 'function' &&
-            !elNode.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
-          ) {
-            return false;
-          }
+          const okVis =
+            _visFn && typeof Element !== 'undefined' && elNode instanceof Element
+              ? _visFn.call(elNode, { checkVisibilityCSS: true, checkOpacity: true })
+              : typeof elNode.checkVisibility === 'function'
+                ? elNode.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
+                : true;
+          if (!okVis) return false;
           const seen = new Set();
           let cur = elNode;
           while (cur && !seen.has(cur)) {
             seen.add(cur);
+            if (safeMatches(cur, '[hidden], [aria-hidden="true"]')) return false;
             const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
             if (cs && (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse' || cs.opacity === '0')) {
               return false;
             }
-            if (cur.assignedSlot) {
-              cur = cur.assignedSlot;
+            const sl = safeSlot(cur);
+            if (sl) {
+              cur = sl;
               continue;
             }
-            const rn = cur.getRootNode?.();
-            cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+            const rn = safeRoot(cur);
+            cur = safeParent(cur) || (rn && rn.host ? rn.host : null);
           }
           return true;
+        };
+        const isNestedInsideEditor = (elNode) => {
+          const EDITOR_ANC_SEL =
+            '.CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror';
+          const seen = new Set();
+          const startRn = safeRoot(elNode);
+          let cur = safeSlot(elNode) || safeParent(elNode) || (startRn && startRn.host ? startRn.host : null);
+          while (cur && !seen.has(cur)) {
+            seen.add(cur);
+            if (safeIsCE(cur) || safeMatches(cur, EDITOR_ANC_SEL) || safeClosest(cur, EDITOR_ANC_SEL)) return true;
+            const sl = safeSlot(cur);
+            if (sl) {
+              cur = sl;
+              continue;
+            }
+            const rn = safeRoot(cur);
+            cur = safeParent(cur) || (rn && rn.host ? rn.host : null);
+          }
+          return false;
         };
 
         function isInteractableElement(cand) {
@@ -3805,7 +4098,7 @@ async function executeBridgeRpc(method, params) {
             );
             let fuzzyMatch = null;
             for (const item of all) {
-              if (safeClosest(item, '[data-chrome-live-hud]')) continue;
+              if (safeClosest(item, '[data-chrome-live-hud]') || isNestedInsideEditor(item)) continue;
               if (!isElementFlatVisible(item)) continue;
               const rc = item.getBoundingClientRect();
               if (rc.width < 4 || rc.height < 4) continue;
@@ -3816,7 +4109,7 @@ async function executeBridgeRpc(method, params) {
                 (iTag === 'input' && !iBtn) ||
                 iTag === 'textarea' ||
                 iTag === 'select' ||
-                item.isContentEditable ||
+                safeIsCE(item) ||
                 /^(?:textbox|searchbox|combobox|spinbutton)$/.test(iRole);
               const txt = (
                 (iUserVal ? '' : extractCleanContainerText(item)) ||
@@ -3860,27 +4153,28 @@ async function executeBridgeRpc(method, params) {
           (elTagLower === 'input' && !elIsButtonInput) ||
           elTagLower === 'textarea' ||
           elTagLower === 'select' ||
-          el.isContentEditable ||
+          safeIsCE(el) ||
           /^(?:textbox|searchbox|combobox|spinbutton)$/.test(elRoleAttr);
         const extractSafeNodeText = (rootNode) => extractCleanContainerText(rootNode);
+        const elSafeId = safeId(el);
         // Never leak user-entered password/OTP/input values or nested drafts in disabled errors or click receipts
         const safeElemLabel = (maxLen) =>
           (
-            el.getAttribute('aria-label') ||
-            el.getAttribute('placeholder') ||
+            safeGetAttr(el, 'aria-label') ||
+            safeGetAttr(el, 'placeholder') ||
             (elIsUserValueField || elIsSensitive ? '' : extractSafeNodeText(el)) ||
             (elIsButtonInput ? el.value : '') ||
-            el.getAttribute('title') ||
+            safeGetAttr(el, 'title') ||
             (elIsSensitive ? '(password)' : '') ||
-            el.getAttribute('name') ||
-            el.id ||
+            safeGetAttr(el, 'name') ||
+            elSafeId ||
             elTagLower
           )
             .replace(/\s+/g, ' ')
             .trim()
             .slice(0, maxLen);
 
-        if (el.disabled || el.getAttribute('aria-disabled') === 'true') {
+        if (el.disabled || safeGetAttr(el, 'aria-disabled') === 'true') {
           const dLabel = safeElemLabel(60);
           return { ok: false, error: `Element is disabled: ${dLabel}` };
         }
@@ -3902,20 +4196,21 @@ async function executeBridgeRpc(method, params) {
         }
 
         function deriveStableSelector(node) {
-          const tag = node.tagName.toLowerCase();
-          const tid = node.getAttribute('data-testid');
-          if (tid && /^[\w.:-]{1,64}$/.test(tid)) return `[data-testid="${CSS.escape(tid)}"]`;
+          const tag = safeTagLower(node);
+          const tid = safeGetAttr(node, 'data-testid');
+          if (tid && /^[\w.:-]{1,64}$/.test(tid)) return `[data-testid="${tid}"]`;
+          const nid = safeId(node);
           if (
-            node.id &&
-            /^[a-zA-Z][\w-]{1,48}$/.test(node.id) &&
-            !/^(?:ember\d+|rc-|radix-|headlessui-|mui-|el-id-)/i.test(node.id) &&
-            !/\d{4,}/.test(node.id)
+            nid &&
+            /^[a-zA-Z][\w-]{1,48}$/.test(nid) &&
+            !/^(?:ember\d+|rc-|radix-|headlessui-|mui-|el-id-)/i.test(nid) &&
+            !/\d{4,}/.test(nid)
           ) {
-            return `#${node.id}`;
+            return `#${nid}`;
           }
-          const nm = node.getAttribute('name');
-          if (nm && /^[\w.-]{1,48}$/.test(nm)) return `${tag}[name="${CSS.escape(nm)}"]`;
-          const aria = (node.getAttribute('aria-label') || '').trim();
+          const nm = safeGetAttr(node, 'name');
+          if (nm && /^[\w.:-]{1,48}$/.test(nm)) return `${tag}[name="${nm}"]`;
+          const aria = (safeGetAttr(node, 'aria-label') || '').trim();
           if (aria && aria.length <= 40 && !/["\\\n]/.test(aria)) return `${tag}[aria-label="${aria}"]`;
           return '';
         }
@@ -3941,7 +4236,7 @@ async function executeBridgeRpc(method, params) {
             y: cy,
             startX: Math.max(12, Math.round(cx + (Math.random() - 0.5) * 90)),
             startY: Math.max(12, Math.round(cy + 40 + Math.random() * 50)),
-            tag: el.tagName.toLowerCase(),
+            tag: elTagLower,
             label,
             learnedSelector
           };
@@ -3956,7 +4251,7 @@ async function executeBridgeRpc(method, params) {
           needHardwareClick: false,
           x: cx,
           y: cy,
-          tag: el.tagName.toLowerCase(),
+          tag: elTagLower,
           label,
           learnedSelector
         };
@@ -4155,16 +4450,137 @@ async function executeBridgeRpc(method, params) {
           return acc;
         }
 
+        const _pGet = typeof Node !== 'undefined' ? Object.getOwnPropertyDescriptor(Node.prototype, 'parentElement')?.get : null;
+        const _sGet = typeof Element !== 'undefined' ? Object.getOwnPropertyDescriptor(Element.prototype, 'assignedSlot')?.get : null;
+        const _tsGet = typeof Text !== 'undefined' ? Object.getOwnPropertyDescriptor(Text.prototype, 'assignedSlot')?.get : null;
+        const _tagGet = typeof Element !== 'undefined' ? Object.getOwnPropertyDescriptor(Element.prototype, 'tagName')?.get : null;
+        const _idGet = typeof Element !== 'undefined' ? Object.getOwnPropertyDescriptor(Element.prototype, 'id')?.get : null;
+        const _ceGet =
+          typeof HTMLElement !== 'undefined'
+            ? Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'isContentEditable')?.get
+            : null;
+        const _rootFn = typeof Node !== 'undefined' ? Node.prototype.getRootNode : null;
+        const _matchFn = typeof Element !== 'undefined' ? Element.prototype.matches : null;
+        const _closeFn = typeof Element !== 'undefined' ? Element.prototype.closest : null;
+        const _visFn = typeof Element !== 'undefined' ? Element.prototype.checkVisibility : null;
+        const _attrFn = typeof Element !== 'undefined' ? Element.prototype.getAttribute : null;
+
+        const safeTagLower = (n) => {
+          if (!n) return '';
+          const raw =
+            _tagGet && typeof Element !== 'undefined' && n instanceof Element
+              ? _tagGet.call(n)
+              : typeof n.tagName === 'string'
+                ? n.tagName
+                : '';
+          return String(raw).toLowerCase();
+        };
+        const safeId = (n) => {
+          if (!n) return '';
+          if (_idGet && typeof Element !== 'undefined' && n instanceof Element) return String(_idGet.call(n) || '');
+          return typeof n.id === 'string' ? n.id : '';
+        };
+        const safeIsCE = (n) => {
+          if (!n) return false;
+          if (_ceGet && typeof HTMLElement !== 'undefined' && n instanceof HTMLElement) return Boolean(_ceGet.call(n));
+          return n.isContentEditable === true;
+        };
+        const safeParent = (n) => {
+          if (!n) return null;
+          if (_pGet && typeof Node !== 'undefined' && n instanceof Node) return _pGet.call(n);
+          return n.parentElement && !(safeTagLower(n) === 'form' && 'form' in n.parentElement) ? n.parentElement : null;
+        };
+        const safeSlot = (n) => {
+          if (!n) return null;
+          if (_sGet && typeof Element !== 'undefined' && n instanceof Element) return _sGet.call(n);
+          if (_tsGet && typeof Text !== 'undefined' && n instanceof Text) return _tsGet.call(n);
+          return n.assignedSlot && !(safeTagLower(n) === 'form' && 'form' in n.assignedSlot) ? n.assignedSlot : null;
+        };
+        const safeRoot = (n) => {
+          if (!n) return null;
+          if (_rootFn && typeof Node !== 'undefined' && n instanceof Node) return _rootFn.call(n);
+          return typeof n.getRootNode === 'function' ? n.getRootNode() : null;
+        };
+        const safeMatches = (n, sel) => {
+          if (!n) return false;
+          if (_matchFn && typeof Element !== 'undefined' && n instanceof Element) return _matchFn.call(n, sel);
+          return typeof n.matches === 'function' ? n.matches(sel) : false;
+        };
+        const safeClosest = (n, sel) => {
+          if (!n) return null;
+          if (_closeFn && typeof Element !== 'undefined' && n instanceof Element) return _closeFn.call(n, sel);
+          return typeof n.closest === 'function' ? n.closest(sel) : null;
+        };
+        const safeCheckVis = (n) => {
+          if (!n) return false;
+          if (_visFn && typeof Element !== 'undefined' && n instanceof Element) {
+            return _visFn.call(n, { checkVisibilityCSS: true, checkOpacity: true });
+          }
+          return typeof n.checkVisibility === 'function'
+            ? n.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
+            : true;
+        };
+        const safeGetAttr = (n, k) => {
+          if (!n) return null;
+          if (_attrFn && typeof Element !== 'undefined' && n instanceof Element) return _attrFn.call(n, k);
+          return typeof n.getAttribute === 'function' ? n.getAttribute(k) : null;
+        };
+        const isElementFlatVisible = (elNode) => {
+          if (!elNode || !safeCheckVis(elNode)) return false;
+          const seen = new Set();
+          let cur = elNode;
+          while (cur && !seen.has(cur)) {
+            seen.add(cur);
+            if (safeMatches(cur, '[hidden], [aria-hidden="true"]')) return false;
+            const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
+            if (cs && (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse' || cs.opacity === '0')) {
+              return false;
+            }
+            const sl = safeSlot(cur);
+            if (sl) {
+              cur = sl;
+              continue;
+            }
+            const rn = safeRoot(cur);
+            cur = safeParent(cur) || (rn && rn.host ? rn.host : null);
+          }
+          return true;
+        };
+        const TYPE_NESTED_EDITOR_OR_HIDDEN_SEL =
+          '.CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], [data-chrome-live-hud]';
+        const isNestedInsideEditorOrHidden = (elNode) => {
+          const seen = new Set();
+          const startRn = safeRoot(elNode);
+          let cur = safeSlot(elNode) || safeParent(elNode) || (startRn && startRn.host ? startRn.host : null);
+          while (cur && !seen.has(cur)) {
+            seen.add(cur);
+            if (
+              safeIsCE(cur) ||
+              safeMatches(cur, TYPE_NESTED_EDITOR_OR_HIDDEN_SEL) ||
+              safeClosest(cur, TYPE_NESTED_EDITOR_OR_HIDDEN_SEL)
+            ) {
+              return true;
+            }
+            const sl = safeSlot(cur);
+            if (sl) {
+              cur = sl;
+              continue;
+            }
+            const rn = safeRoot(cur);
+            cur = safeParent(cur) || (rn && rn.host ? rn.host : null);
+          }
+          return false;
+        };
+
         function isValidTypeTarget(cand) {
           if (!cand || !(cand instanceof Element)) return false;
-          const tg = cand.tagName.toLowerCase();
+          const tg = safeTagLower(cand);
           if (tg === 'meta' || tg === 'script' || tg === 'style' || tg === 'link' || tg === 'template' || tg === 'head') {
             return false;
           }
           if (tg === 'input' && String(cand.type || '').toLowerCase() === 'hidden') return false;
-          if (cand.closest?.('[data-chrome-live-hud]')) return false;
-          const st = window.getComputedStyle(cand);
-          if (st.display === 'none' || st.visibility === 'hidden') return false;
+          if (safeClosest(cand, '[data-chrome-live-hud]')) return false;
+          if (!isElementFlatVisible(cand)) return false;
           const rc = cand.getBoundingClientRect();
           return rc.width >= 2 && rc.height >= 2;
         }
@@ -4198,24 +4614,21 @@ async function executeBridgeRpc(method, params) {
               const tw = document.createTreeWalker(lbl, NodeFilter.SHOW_TEXT);
               let tn;
               while ((tn = tw.nextNode())) {
-                let cur = tn.assignedSlot || tn.parentElement;
+                let cur = safeSlot(tn) || safeParent(tn);
                 let blocked = false;
                 let passedRoot = false;
                 const seen = new Set();
                 while (cur && !seen.has(cur)) {
                   seen.add(cur);
-                  if (!passedRoot && (cur.isContentEditable || cur.matches?.(skipSel) || cur.closest?.(skipSel))) {
+                  if (!passedRoot && (safeIsCE(cur) || safeMatches(cur, skipSel) || safeClosest(cur, skipSel))) {
                     blocked = true;
                     break;
                   }
-                  if (cur.isContentEditable || cur.matches?.(ancestorSkipSel) || cur.closest?.(ancestorSkipSel)) {
+                  if (safeIsCE(cur) || safeMatches(cur, ancestorSkipSel) || safeClosest(cur, ancestorSkipSel)) {
                     blocked = true;
                     break;
                   }
-                  if (
-                    typeof cur.checkVisibility === 'function' &&
-                    !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
-                  ) {
+                  if (!safeCheckVis(cur)) {
                     blocked = true;
                     break;
                   }
@@ -4225,15 +4638,16 @@ async function executeBridgeRpc(method, params) {
                     blocked = true;
                     break;
                   }
-                  if (cur.assignedSlot) {
-                    cur = cur.assignedSlot;
+                  const sl = safeSlot(cur);
+                  if (sl) {
+                    cur = sl;
                     continue;
                   }
                   if (cur === lbl) {
                     passedRoot = true;
                   }
-                  const rn = cur.getRootNode?.();
-                  cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+                  const rn = safeRoot(cur);
+                  cur = safeParent(cur) || (rn && rn.host ? rn.host : null);
                 }
                 if (blocked) continue;
                 if (tn.nodeValue) parts.push(tn.nodeValue);
@@ -4242,15 +4656,16 @@ async function executeBridgeRpc(method, params) {
             };
             let partialMatch = null;
             for (const cand of inputs) {
+              if (!isValidTypeTarget(cand) || isNestedInsideEditorOrHidden(cand)) continue;
               const rect = cand.getBoundingClientRect();
               if (rect.width < 4 || rect.height < 4) continue;
               const labelText = readCleanLabel(cand.labels?.[0]);
               const haystacks = [
-                cand.getAttribute('placeholder'),
-                cand.getAttribute('aria-label'),
-                cand.getAttribute('name'),
-                cand.id,
-                cand.getAttribute('title'),
+                safeGetAttr(cand, 'placeholder'),
+                safeGetAttr(cand, 'aria-label'),
+                safeGetAttr(cand, 'name'),
+                safeId(cand),
+                safeGetAttr(cand, 'title'),
                 labelText
               ]
                 .filter(Boolean)
@@ -4272,14 +4687,14 @@ async function executeBridgeRpc(method, params) {
           el &&
           !(el instanceof HTMLInputElement) &&
           !(el instanceof HTMLTextAreaElement) &&
-          !el.isContentEditable
+          !safeIsCE(el)
         ) {
           const openSr = getOpenShadow(el);
           const inner =
             (openSr &&
               openSr.querySelector('input, textarea, [contenteditable]:not([contenteditable="false"])')) ||
             el.querySelector?.('input, textarea, [contenteditable]:not([contenteditable="false"])');
-          if (inner) el = inner;
+          if (inner && isValidTypeTarget(inner)) el = inner;
         }
 
         if (!el) return { ok: false, error: `Input element not found: ${tgt}` };
@@ -4314,7 +4729,7 @@ async function executeBridgeRpc(method, params) {
         // Humanized non-uniform keystroke cadence for visible short queries (<= 28 chars)
         const chars = Array.from(val);
         const useCadence = !document.hidden && chars.length > 0 && chars.length <= 28;
-        if (el.isContentEditable) {
+        if (safeIsCE(el)) {
           el.textContent = '';
           if (useCadence) {
             let built = '';
@@ -4379,30 +4794,34 @@ async function executeBridgeRpc(method, params) {
             bubbles: true
           });
           el.dispatchEvent(enterDown);
-          if (el.form) {
-            if (typeof el.form.requestSubmit === 'function') el.form.requestSubmit();
-            else el.form.submit();
+          if (el.form && typeof HTMLFormElement !== 'undefined' && el.form instanceof HTMLFormElement) {
+            if (typeof HTMLFormElement.prototype.requestSubmit === 'function') {
+              HTMLFormElement.prototype.requestSubmit.call(el.form);
+            } else {
+              HTMLFormElement.prototype.submit.call(el.form);
+            }
           }
         }
         function deriveInputSelector(node) {
-          const tag = node.tagName.toLowerCase();
-          const tid = node.getAttribute('data-testid');
-          if (tid && /^[\w.:-]{1,64}$/.test(tid)) return `[data-testid="${CSS.escape(tid)}"]`;
+          const tag = safeTagLower(node);
+          const tid = safeGetAttr(node, 'data-testid');
+          if (tid && /^[\w.:-]{1,64}$/.test(tid)) return `[data-testid="${tid}"]`;
+          const nid = safeId(node);
           if (
-            node.id &&
-            /^[a-zA-Z][\w-]{1,48}$/.test(node.id) &&
-            !/^(?:ember\d+|rc-|radix-|headlessui-|mui-|el-id-)/i.test(node.id) &&
-            !/\d{4,}/.test(node.id)
+            nid &&
+            /^[a-zA-Z][\w-]{1,48}$/.test(nid) &&
+            !/^(?:ember\d+|rc-|radix-|headlessui-|mui-|el-id-)/i.test(nid) &&
+            !/\d{4,}/.test(nid)
           ) {
-            return `#${node.id}`;
+            return `#${nid}`;
           }
-          const nm = node.getAttribute('name');
-          if (nm && /^[\w.-]{1,48}$/.test(nm)) return `${tag}[name="${CSS.escape(nm)}"]`;
-          if (String(node.getAttribute('type') || '').toLowerCase() === 'search') {
+          const nm = safeGetAttr(node, 'name');
+          if (nm && /^[\w.:-]{1,48}$/.test(nm)) return `${tag}[name="${nm}"]`;
+          if (String(safeGetAttr(node, 'type') || '').toLowerCase() === 'search') {
             return `${tag}[type="search"]`;
           }
           // Only use static UI placeholders (avoid rotating e-commerce promo hotwords like "丹东大草莓")
-          const ph = (node.getAttribute('placeholder') || '').trim();
+          const ph = (safeGetAttr(node, 'placeholder') || '').trim();
           if (
             ph &&
             ph.length <= 24 &&
@@ -4411,22 +4830,24 @@ async function executeBridgeRpc(method, params) {
           ) {
             return `${tag}[placeholder="${ph}"]`;
           }
-          const aria = (node.getAttribute('aria-label') || '').trim();
+          const aria = (safeGetAttr(node, 'aria-label') || '').trim();
           if (aria && aria.length <= 40 && !/["\\\n]/.test(aria)) return `${tag}[aria-label="${aria}"]`;
           return '';
         }
 
-        const tInputType = String(el.getAttribute?.('type') || el.type || '').toLowerCase();
-        const tAutoAttr = String(el.getAttribute?.('autocomplete') || '').toLowerCase();
-        const tMeta = `${el.id || ''} ${el.name || ''} ${el.getAttribute?.('placeholder') || ''} ${el.getAttribute?.('aria-label') || ''}`;
+        const elSafeId = safeId(el);
+        const elSafeName = safeGetAttr(el, 'name') || '';
+        const tInputType = String(safeGetAttr(el, 'type') || el.type || '').toLowerCase();
+        const tAutoAttr = String(safeGetAttr(el, 'autocomplete') || '').toLowerCase();
+        const tMeta = `${elSafeId} ${elSafeName} ${safeGetAttr(el, 'placeholder') || ''} ${safeGetAttr(el, 'aria-label') || ''}`;
         const isSensitiveTypeTarget =
           tInputType === 'password' ||
           /(?:password|one-time-code|cc-number|cc-csc|cc-exp)/i.test(tAutoAttr) ||
           /(?:password|passwd|passcode|pwd|one-time|otp|2fa|totp|cvv|cvc|secret|pin|token|sms|verify|captcha|密码|口令|验证码|动态码|安全码|密钥|支付)/i.test(tMeta);
         const learnedSelector = isSensitiveTypeTarget ? '' : deriveInputSelector(el);
-        const idAndCls = `${el.id || ''} ${el.name || ''} ${el.className || ''}`;
+        const idAndCls = `${elSafeId} ${elSafeName} ${safeGetAttr(el, 'class') || ''}`;
         const isSearchField =
-          /(?:search|query|^s$|^q$|^kw$)/i.test(el.name || '') ||
+          /(?:search|query|^s$|^q$|^kw$)/i.test(elSafeName) ||
           /search/i.test(idAndCls) ||
           tInputType === 'search';
         const extractSafeLabelNode = (lblNode) => {
@@ -4439,24 +4860,21 @@ async function executeBridgeRpc(method, params) {
           const tw = document.createTreeWalker(lblNode, NodeFilter.SHOW_TEXT);
           let tn;
           while ((tn = tw.nextNode())) {
-            let cur = tn.assignedSlot || tn.parentElement;
+            let cur = safeSlot(tn) || safeParent(tn);
             let blocked = false;
             let passedRoot = false;
             const seen = new Set();
             while (cur && !seen.has(cur)) {
               seen.add(cur);
-              if (!passedRoot && (cur.isContentEditable || cur.matches?.(skipSel) || cur.closest?.(skipSel))) {
+              if (!passedRoot && (safeIsCE(cur) || safeMatches(cur, skipSel) || safeClosest(cur, skipSel))) {
                 blocked = true;
                 break;
               }
-              if (cur.isContentEditable || cur.matches?.(ancestorSkipSel) || cur.closest?.(ancestorSkipSel)) {
+              if (safeIsCE(cur) || safeMatches(cur, ancestorSkipSel) || safeClosest(cur, ancestorSkipSel)) {
                 blocked = true;
                 break;
               }
-              if (
-                typeof cur.checkVisibility === 'function' &&
-                !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
-              ) {
+              if (!safeCheckVis(cur)) {
                 blocked = true;
                 break;
               }
@@ -4466,15 +4884,16 @@ async function executeBridgeRpc(method, params) {
                 blocked = true;
                 break;
               }
-              if (cur.assignedSlot) {
-                cur = cur.assignedSlot;
+              const sl = safeSlot(cur);
+              if (sl) {
+                cur = sl;
                 continue;
               }
               if (cur === lblNode) {
                 passedRoot = true;
               }
-              const rn = cur.getRootNode?.();
-              cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+              const rn = safeRoot(cur);
+              cur = safeParent(cur) || (rn && rn.host ? rn.host : null);
             }
             if (!blocked) {
               parts.push(tn.nodeValue || '');
@@ -4487,21 +4906,21 @@ async function executeBridgeRpc(method, params) {
           : isSearchField
             ? '站内搜索框'
             : (
-                el.getAttribute('aria-label') ||
+                safeGetAttr(el, 'aria-label') ||
                 extractSafeLabelNode(el.labels?.[0]) ||
-                el.getAttribute('name') ||
-                el.id ||
-                el.getAttribute('placeholder') ||
+                elSafeName ||
+                elSafeId ||
+                safeGetAttr(el, 'placeholder') ||
                 '输入框'
               )
                 .replace(/\s+/g, ' ')
                 .trim()
                 .slice(0, 32);
-        const cmHost = el.closest?.('.CodeMirror') || null;
+        const cmHost = safeClosest(el, '.CodeMirror');
         let cmTargetToken = '';
         if (cmHost) {
           cmTargetToken = `cm-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-          cmHost.setAttribute('data-clive-cm-target', cmTargetToken);
+          Element.prototype.setAttribute.call(cmHost, 'data-clive-cm-target', cmTargetToken);
         }
         return { ok: true, x: cx, y: cy, learnedSelector, learnedName, cmTargetToken };
       },
@@ -4657,23 +5076,47 @@ async function executeBridgeRpc(method, params) {
         return acc;
       }
 
+      const _pGet = Object.getOwnPropertyDescriptor(Node.prototype, 'parentElement')?.get;
+      const _sGet = Object.getOwnPropertyDescriptor(Element.prototype, 'assignedSlot')?.get;
+      const _tsGet = Object.getOwnPropertyDescriptor(Text.prototype, 'assignedSlot')?.get;
+      const _tagGet = Object.getOwnPropertyDescriptor(Element.prototype, 'tagName')?.get;
+      const _ceGet = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'isContentEditable')?.get;
+      const _rootFn = Node.prototype.getRootNode;
+      const _matchFn = Element.prototype.matches;
+      const _closeFn = Element.prototype.closest;
+      const _visFn = Element.prototype.checkVisibility;
+      const _attrFn = Element.prototype.getAttribute;
+      const uParent = (x) => (x && _pGet && x instanceof Node ? _pGet.call(x) : null);
+      const uSlot = (x) =>
+        !x
+          ? null
+          : _sGet && x instanceof Element
+            ? _sGet.call(x)
+            : _tsGet && x instanceof Text
+              ? _tsGet.call(x)
+              : null;
+      const uRoot = (x) => (x && _rootFn && x instanceof Node ? _rootFn.call(x) : null);
+      const uTag = (x) => (x && _tagGet && x instanceof Element ? String(_tagGet.call(x) || '').toUpperCase() : '');
+      const uIsCE = (x) => Boolean(x && _ceGet && x instanceof HTMLElement && _ceGet.call(x));
+      const uAttr = (x, k) => (x && _attrFn && x instanceof Element ? _attrFn.call(x, k) : null);
+
       function findRelatedFileInput(node) {
         if (!node) return null;
-        if (node.tagName === 'INPUT' && String(node.type).toLowerCase() === 'file') return node;
-        if (node.tagName === 'LABEL' && node.htmlFor) {
+        if (uTag(node) === 'INPUT' && String(node.type).toLowerCase() === 'file') return node;
+        if (uTag(node) === 'LABEL' && node.htmlFor) {
           const byFor = queryDeep(document, '#' + CSS.escape(node.htmlFor));
-          if (byFor && byFor.tagName === 'INPUT' && String(byFor.type).toLowerCase() === 'file') return byFor;
+          if (byFor && uTag(byFor) === 'INPUT' && String(byFor.type).toLowerCase() === 'file') return byFor;
         }
         const openSr = getOpenShadow(node);
         const inner =
           (openSr && openSr.querySelector('input[type="file"]:not(:disabled)')) ||
           (node.querySelector && node.querySelector('input[type="file"]:not(:disabled)'));
         if (inner) return inner;
-        let cur = node.parentElement;
+        let cur = uParent(node);
         for (let i = 0; i < 3 && cur; i++) {
-          const near = cur.querySelector('input[type="file"]:not(:disabled)');
+          const near = cur.querySelector && cur.querySelector('input[type="file"]:not(:disabled)');
           if (near) return near;
-          cur = cur.parentElement;
+          cur = uParent(cur);
         }
         return null;
       }
@@ -4699,24 +5142,30 @@ async function executeBridgeRpc(method, params) {
             const tw = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
             let tn;
             while ((tn = tw.nextNode())) {
-              let cur = tn.assignedSlot || tn.parentElement;
+              let cur = uSlot(tn) || uParent(tn);
               let blocked = false;
               let passedRoot = false;
               const seen = new Set();
               while (cur && !seen.has(cur)) {
                 seen.add(cur);
-                if (!passedRoot && (cur.isContentEditable || cur.matches?.(skipSel) || cur.closest?.(skipSel))) {
-                  blocked = true;
-                  break;
-                }
-                if (cur.isContentEditable || cur.matches?.(ancestorSkipSel) || cur.closest?.(ancestorSkipSel)) {
+                if (
+                  !passedRoot &&
+                  (uIsCE(cur) ||
+                    (_matchFn && cur instanceof Element && _matchFn.call(cur, skipSel)) ||
+                    (_closeFn && cur instanceof Element && _closeFn.call(cur, skipSel)))
+                ) {
                   blocked = true;
                   break;
                 }
                 if (
-                  typeof cur.checkVisibility === 'function' &&
-                  !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
+                  uIsCE(cur) ||
+                  (_matchFn && cur instanceof Element && _matchFn.call(cur, ancestorSkipSel)) ||
+                  (_closeFn && cur instanceof Element && _closeFn.call(cur, ancestorSkipSel))
                 ) {
+                  blocked = true;
+                  break;
+                }
+                if (typeof _visFn === 'function' && cur instanceof Element && !_visFn.call(cur, { checkVisibilityCSS: true, checkOpacity: true })) {
                   blocked = true;
                   break;
                 }
@@ -4726,15 +5175,16 @@ async function executeBridgeRpc(method, params) {
                   blocked = true;
                   break;
                 }
-                if (cur.assignedSlot) {
-                  cur = cur.assignedSlot;
+                const sl = uSlot(cur);
+                if (sl) {
+                  cur = sl;
                   continue;
                 }
                 if (cur === node) {
                   passedRoot = true;
                 }
-                const rn = cur.getRootNode?.();
-                cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+                const rn = uRoot(cur);
+                cur = uParent(cur) || (rn && rn.host ? rn.host : null);
               }
               if (blocked) continue;
               if (tn.nodeValue) out.push(tn.nodeValue);
@@ -4743,7 +5193,7 @@ async function executeBridgeRpc(method, params) {
           };
           const clickables = collectDeep(document, 'label, button, a, [role="button"]');
           for (const item of clickables) {
-            const txt = (readSafeClickableText(item) || item.getAttribute('aria-label') || item.getAttribute('title') || '')
+            const txt = (readSafeClickableText(item) || uAttr(item, 'aria-label') || uAttr(item, 'title') || '')
               .replace(/\\s+/g, ' ')
               .trim()
               .toLowerCase();
@@ -4808,11 +5258,13 @@ async function executeBridgeRpc(method, params) {
           awaitPromise: true,
           returnByValue: true,
           functionDeclaration: `async function() {
+            const _pGet = Object.getOwnPropertyDescriptor(Node.prototype, 'parentElement')?.get;
+            const pOf = (x) => (x && _pGet && x instanceof Node ? _pGet.call(x) : null);
             const inp = this;
             let anchor = inp;
             let rect = anchor.getBoundingClientRect();
-            while (anchor && (rect.width < 4 || rect.height < 4) && anchor.parentElement) {
-              anchor = anchor.parentElement;
+            while (anchor && (rect.width < 4 || rect.height < 4) && pOf(anchor)) {
+              anchor = pOf(anchor);
               rect = anchor.getBoundingClientRect();
             }
             const cx = rect.width >= 4 ? rect.left + rect.width / 2 : (window.innerWidth || 1200) * 0.5;
@@ -5101,22 +5553,39 @@ async function executeBridgeRpc(method, params) {
             }
             const found = queryDeep(document, sel);
             if (!found || !(found instanceof Element)) return false;
-            const rawTg =
-              (typeof Element !== 'undefined' && Object.getOwnPropertyDescriptor(Element.prototype, 'tagName')?.get?.call(found)) ||
-              (typeof found.tagName === 'string' ? found.tagName : '');
-            const tg = String(rawTg).toLowerCase();
+            const _pGet = Object.getOwnPropertyDescriptor(Node.prototype, 'parentElement')?.get;
+            const _sGet = Object.getOwnPropertyDescriptor(Element.prototype, 'assignedSlot')?.get;
+            const _tagGet = Object.getOwnPropertyDescriptor(Element.prototype, 'tagName')?.get;
+            const _rootFn = Node.prototype.getRootNode;
+            const _matchFn = Element.prototype.matches;
+            const _visFn = Element.prototype.checkVisibility;
+            const tg = String((_tagGet && _tagGet.call(found)) || '').toLowerCase();
             if (tg === 'meta' || tg === 'script' || tg === 'style' || tg === 'link' || tg === 'template' || tg === 'head') {
               return false;
             }
             if (tg === 'input' && String(found.type || '').toLowerCase() === 'hidden') return false;
-            if (
-              typeof found.checkVisibility === 'function' &&
-              !found.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
-            ) {
+            if (typeof _visFn === 'function' && !_visFn.call(found, { checkVisibilityCSS: true, checkOpacity: true })) {
               return false;
             }
-            const st = window.getComputedStyle(found);
-            if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+            const seen = new Set();
+            let cur = found;
+            while (cur && !seen.has(cur)) {
+              seen.add(cur);
+              if (_matchFn && cur instanceof Element && _matchFn.call(cur, '[hidden], [aria-hidden="true"], [data-chrome-live-hud]')) {
+                return false;
+              }
+              const st = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
+              if (st.display === 'none' || st.visibility === 'hidden' || st.visibility === 'collapse' || st.opacity === '0') {
+                return false;
+              }
+              const sl = _sGet && cur instanceof Element ? _sGet.call(cur) : null;
+              if (sl) {
+                cur = sl;
+                continue;
+              }
+              const rn = _rootFn && cur instanceof Node ? _rootFn.call(cur) : null;
+              cur = (_pGet && cur instanceof Node ? _pGet.call(cur) : null) || (rn && rn.host ? rn.host : null);
+            }
             const rect = found.getBoundingClientRect();
             return rect.width > 0 && rect.height > 0;
           },
