@@ -101,7 +101,7 @@ function requestDaemon(method, routePath, bodyObj = null, timeoutMs = 30000) {
   });
 }
 
-async function ensureDaemonRunning() {
+async function ensureDaemonRunning(forceSpawn = false) {
   try {
     return await requestDaemon('GET', '/api/health', null, 1200);
   } catch {
@@ -109,14 +109,16 @@ async function ensureDaemonRunning() {
   }
 
   ensureSecureDirSync(getStateDir());
-  try {
-    const st = fs.statSync(SPAWN_LOCK_FILE);
-    if (Date.now() - st.mtimeMs < SPAWN_COOLDOWN_MS) {
-      // Wait briefly in case another CLI invocation just spawned it.
-      await new Promise((r) => setTimeout(r, 450));
-      return await requestDaemon('GET', '/api/health', null, 2000);
-    }
-  } catch {}
+  if (!forceSpawn) {
+    try {
+      const st = fs.statSync(SPAWN_LOCK_FILE);
+      if (Date.now() - st.mtimeMs < SPAWN_COOLDOWN_MS) {
+        // Wait briefly in case another CLI invocation just spawned it.
+        await new Promise((r) => setTimeout(r, 450));
+        return await requestDaemon('GET', '/api/health', null, 2000);
+      }
+    } catch {}
+  }
 
   fs.writeFileSync(SPAWN_LOCK_FILE, `${Date.now()}\n`, { encoding: 'utf8', mode: 0o600 });
   tightenFileAclSync(SPAWN_LOCK_FILE);
@@ -128,13 +130,38 @@ async function ensureDaemonRunning() {
   });
   child.unref();
 
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < 15; i++) {
     await new Promise((r) => setTimeout(r, 180));
     try {
       return await requestDaemon('GET', '/api/health', null, 1000);
     } catch {}
   }
   throw new Error(`Daemon did not become reachable on ${DEFAULT_HOST}:${DEFAULT_PORT}`);
+}
+
+async function restartDaemonCleanly(alwaysStart = false) {
+  let wasRunning = false;
+  try {
+    await requestDaemon('GET', '/api/health', null, 900);
+    wasRunning = true;
+  } catch {}
+
+  if (wasRunning) {
+    await requestDaemon('POST', '/api/shutdown', {}, 2000).catch(() => {});
+    for (let i = 0; i < 15; i++) {
+      await new Promise((r) => setTimeout(r, 120));
+      try {
+        await requestDaemon('GET', '/api/health', null, 500);
+      } catch {
+        break;
+      }
+    }
+  }
+
+  if (wasRunning || alwaysStart) {
+    return await ensureDaemonRunning(true);
+  }
+  return null;
 }
 
 async function callDaemonWithAutoStart(method, routePath, bodyObj = null, timeoutMs = 30000) {
@@ -394,24 +421,44 @@ async function main() {
         `[Info] Global ~/.gemini/config was NOT modified (opt-in by default). Pass --with-plugin to install the Antigravity Skill & Live Sidecar.\n`
       );
     }
-    if (cmd === 'install') {
-      // If a local daemon is already running, restart it seamlessly so updated daemon code & extension bundle hash sync immediately
-      try {
-        await requestDaemon('POST', '/api/shutdown', {}, 1500);
-        await new Promise((r) => setTimeout(r, 250));
-        await ensureDaemonRunning();
+    // If a local daemon is already running, restart it cleanly (bypassing 15s spawn cooldown) so updated code & bundle hash take effect immediately
+    try {
+      const restarted = await restartDaemonCleanly(false);
+      if (restarted) {
         process.stdout.write(`[OK] Restarted local daemon; connected Chrome extension will hot-reload automatically.\n`);
-      } catch {}
-    }
+      }
+    } catch {}
     return;
   }
 
-  if (cmd === 'reload') {
-    const res = await callDaemonWithAutoStart('POST', '/api/command', {
-      method: 'reload_extension',
-      params: {}
-    });
-    process.stdout.write(`${JSON.stringify(res.result, null, 2)}\n`);
+  if (cmd === 'reload' || cmd === 'restart') {
+    const snap = await restartDaemonCleanly(true);
+    let extConnected = Boolean(snap?.extensionConnected);
+    if (!extConnected) {
+      for (let i = 0; i < 25; i++) {
+        await new Promise((r) => setTimeout(r, 200));
+        try {
+          const h = await requestDaemon('GET', '/api/health', null, 1000);
+          if (h?.extensionConnected) {
+            extConnected = true;
+            break;
+          }
+        } catch {}
+      }
+    }
+    if (extConnected) {
+      try {
+        const res = await requestDaemon('POST', '/api/command', {
+          method: 'reload_extension',
+          params: {}
+        });
+        process.stdout.write(`${JSON.stringify({ daemonRestarted: true, ...res.result }, null, 2)}\n`);
+        return;
+      } catch {}
+    }
+    process.stdout.write(
+      `${JSON.stringify({ ok: true, daemonRestarted: true, extensionConnected: extConnected }, null, 2)}\n`
+    );
     return;
   }
 

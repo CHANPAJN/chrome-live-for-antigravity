@@ -89,6 +89,8 @@ node ./bin/chrome-live.mjs health
 node ./bin/chrome-live.mjs install --with-plugin
 ```
 
+> **Updating an existing checkout**: Run `git pull && node ./bin/chrome-live.mjs reload` (or `git pull && node ./bin/chrome-live.mjs install --with-plugin` if using the plugin) to seamlessly restart the local daemon and hot-reload the unpacked Chrome extension in background.
+
 Or mount manually as a standard `stdio` MCP server:
 
 ```json

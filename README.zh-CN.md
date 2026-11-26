@@ -89,6 +89,8 @@ node ./bin/chrome-live.mjs health
 node ./bin/chrome-live.mjs install --with-plugin
 ```
 
+> **后续拉取新版本热更新**：执行 `git pull && node ./bin/chrome-live.mjs reload`（若装了插件则跑 `git pull && node ./bin/chrome-live.mjs install --with-plugin`），会自动重启本地守护进程并后台热重载 Chrome 扩展，无需去 `chrome://extensions` 手动点刷新。
+
 或手动挂载为标准 `stdio` MCP Server：
 
 ```json
