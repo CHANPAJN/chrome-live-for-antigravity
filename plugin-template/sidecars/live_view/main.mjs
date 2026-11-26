@@ -196,10 +196,14 @@ app.api(
     maybeBootstrapDaemon();
     try {
       const includeFrame = data && data.includeFrame === '1' ? '1' : '0';
-      const tabParam =
-        data && data.tabId !== undefined && data.tabId !== ''
-          ? `&tabId=${encodeURIComponent(String(data.tabId))}`
-          : '';
+      let tabParam = '';
+      if (data && data.tabId !== undefined && data.tabId !== null && data.tabId !== '') {
+        const rawTid = String(data.tabId).trim();
+        if (!/^[1-9]\d*$/.test(rawTid)) {
+          return { ok: false, error: 'Invalid tabId' };
+        }
+        tabParam = `&tabId=${rawTid}`;
+      }
       const r = await callDaemon('GET', `/api/state?includeFrame=${includeFrame}${tabParam}`, null, 3000);
       return JSON.parse(r.buffer.toString('utf8'));
     } catch (err) {
@@ -218,10 +222,14 @@ app.api(
   '/api/live_frame',
   async (data) => {
     try {
-      const tabQuery =
-        data && data.tabId !== undefined && data.tabId !== ''
-          ? `?tabId=${encodeURIComponent(String(data.tabId))}`
-          : '';
+      let tabQuery = '';
+      if (data && data.tabId !== undefined && data.tabId !== null && data.tabId !== '') {
+        const rawTid = String(data.tabId).trim();
+        if (!/^[1-9]\d*$/.test(rawTid)) {
+          return new Response('invalid tabId', { status: 400 });
+        }
+        tabQuery = `?tabId=${rawTid}`;
+      }
       const r = await callDaemon('GET', `/api/frame${tabQuery}`, null, 3500);
       if (r.status !== 200 || !r.buffer.length) {
         return new Response('no frame', { status: 404 });

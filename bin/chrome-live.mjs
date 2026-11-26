@@ -706,7 +706,20 @@ async function main() {
         process.stdout.write(`\n--- Page Excerpt ---\n${snap.excerpt}\n`);
       }
     } else {
-      process.stdout.write(`${JSON.stringify(out, null, 2)}\n`);
+      const stripLargeBlobs = (node) => {
+        if (!node || typeof node !== 'object') return node;
+        if (Array.isArray(node)) return node.map(stripLargeBlobs);
+        const copy = {};
+        for (const [k, v] of Object.entries(node)) {
+          if ((k === 'dataBase64' || k === 'base64') && typeof v === 'string' && v.length > 256) {
+            copy[k] = `[omitted ${v.length} base64 chars]`;
+          } else {
+            copy[k] = stripLargeBlobs(v);
+          }
+        }
+        return copy;
+      };
+      process.stdout.write(`${JSON.stringify(stripLargeBlobs(out), null, 2)}\n`);
     }
     return;
   }

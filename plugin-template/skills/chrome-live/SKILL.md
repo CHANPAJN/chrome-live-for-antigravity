@@ -61,7 +61,8 @@ node "__CHROME_LIVE_CLI_PATH__" release --all
 
 ## Safety Boundaries
 
-- Payment gateways, retail banking, cloud billing consoles, and `/checkout`, `/pay`, `/billing` routes are blocked locally by default; never attempt to bypass financial guardrails.
+- Payment gateways, retail banking portals, and `/checkout`, `/pay`, `/billing` routes are blocked locally by default; never attempt to bypass financial guardrails.
+- Existing input `.value` fields, password inputs, and editor drafts are redacted from snapshots and receipts for credential safety, while typing/clicking actions follow your own safety policies and explicit user instructions.
 - File uploads are restricted by default to `~/.chrome-live-antigravity/uploads` (or `CHROME_LIVE_UPLOAD_DIR`); copy user-approved upload assets into that staging directory first rather than pointing at arbitrary desktop/document paths.
 - Site Playbooks are strictly opt-in (`false` by default); never run `playbook on` unless the user explicitly asks to enable them.
 - When a tab is paused by the user (`paused: true`), stop attempting browser actions until the user resumes inside Chrome.

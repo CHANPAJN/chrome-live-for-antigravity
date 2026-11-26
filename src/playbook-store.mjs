@@ -200,6 +200,8 @@ export function sanitizeRouteUrl(rawUrl, customBlockedDomains = []) {
   }
 
   for (const [key, val] of Array.from(u.searchParams.entries())) {
+    const keyPlus = key.replace(/ /g, '+');
+    const valPlus = val.replace(/ /g, '+');
     let decVal = val;
     for (let r = 0; r < 4 && decVal.includes('%'); r++) {
       try {
@@ -210,12 +212,17 @@ export function sanitizeRouteUrl(rawUrl, customBlockedDomains = []) {
         break;
       }
     }
+    const decValPlus = decVal.replace(/ /g, '+');
     if (
       STRIP_QUERY_PATTERNS.some((rx) => rx.test(key)) ||
       AUDIT_SENSITIVE_PARAM_RX.test(key) ||
-      (val === '' && isHighEntropyPathToken(key, { splitMatrix: false })) ||
+      ((val === '' || /^=+$/.test(val)) &&
+        (isHighEntropyPathToken(key, { splitMatrix: false }) ||
+          isHighEntropyPathToken(keyPlus, { splitMatrix: false }))) ||
       isHighEntropyPathToken(val, { splitMatrix: false }) ||
+      isHighEntropyPathToken(valPlus, { splitMatrix: false }) ||
       isHighEntropyPathToken(decVal, { splitMatrix: false }) ||
+      isHighEntropyPathToken(decValPlus, { splitMatrix: false }) ||
       AUDIT_SENSITIVE_PARAM_RX.test(decVal) ||
       /https?:\/\/|[?#=&]/i.test(decVal)
     ) {

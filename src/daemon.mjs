@@ -237,10 +237,18 @@ export function createDaemonServer(options = {}) {
 
   function resolveFrame(tabIdParam) {
     if (tabIdParam !== null && tabIdParam !== undefined && tabIdParam !== '') {
-      const tid = Number.parseInt(String(tabIdParam), 10);
-      if (Number.isInteger(tid)) {
-        return state.framesByTab.get(tid) || null;
+      const rawTid = String(tabIdParam).trim();
+      if (!/^[1-9]\d*$/.test(rawTid)) {
+        return null;
       }
+      const tid = Number(rawTid);
+      if (!Number.isSafeInteger(tid) || tid <= 0) {
+        return null;
+      }
+      return state.framesByTab.get(tid) || null;
+    }
+    if (Array.isArray(state.tabs) && state.tabs.length > 1) {
+      return null;
     }
     return state.latestFrame;
   }
@@ -453,7 +461,11 @@ export function createDaemonServer(options = {}) {
 
     for (let idx = 0; idx < rawList.length; idx++) {
       const item = rawList[idx];
-      const check = evaluateUploadFileSafety(String(item || ''), { stateDir: resolveInstanceStateDir() });
+      if (typeof item !== 'string') {
+        recordAudit('upload', { file: String(item ?? ''), code: 'INVALID_FILE' }, 'blocked');
+        throw new Error('[GUARDRAIL:INVALID_FILE] Upload file path must be a string');
+      }
+      const check = evaluateUploadFileSafety(item, { stateDir: resolveInstanceStateDir() });
       if (!check.allowed) {
         recordAudit('upload', { file: String(item || ''), code: check.code }, 'blocked');
         throw new Error(`[GUARDRAIL:${check.code}] ${check.reason}`);
@@ -543,7 +555,16 @@ export function createDaemonServer(options = {}) {
         return;
       }
 
-      if (params && typeof params.url === 'string') {
+      if (
+        method === 'open' ||
+        method === 'navigate' ||
+        (params && params.url !== undefined && params.url !== null)
+      ) {
+        if (!params || typeof params.url !== 'string') {
+          recordAudit(method, { url: String(params?.url ?? ''), code: 'INVALID_URL' }, 'blocked');
+          reject(new Error('[GUARDRAIL:INVALID_URL] URL parameter must be a non-empty string'));
+          return;
+        }
         const safety = evaluateUrlSafety(params.url, state.customBlockedDomains);
         if (!safety.allowed) {
           recordAudit(method, { url: params.url, code: safety.code }, 'blocked');
@@ -566,12 +587,21 @@ export function createDaemonServer(options = {}) {
       try {
         if (method === 'upload') {
           prepareUploadParams(params, uploadCleanupDirs, uploadBudget);
-        } else if (method === 'extract' && Array.isArray(params.urls)) {
+        } else if (method === 'extract' && params && params.urls !== undefined && params.urls !== null) {
+          if (!Array.isArray(params.urls) || params.urls.length === 0) {
+            recordAudit('extract', { url: String(params.urls), code: 'INVALID_URL' }, 'blocked');
+            reject(new Error('[GUARDRAIL:INVALID_URL] extract urls must be a non-empty array of strings'));
+            return;
+          }
           for (const rawUrl of params.urls) {
-            const urlStr = String(rawUrl || '');
-            const safety = evaluateUrlSafety(urlStr, state.customBlockedDomains);
+            if (typeof rawUrl !== 'string') {
+              recordAudit('extract', { url: String(rawUrl ?? ''), code: 'INVALID_URL' }, 'blocked');
+              reject(new Error('[GUARDRAIL:INVALID_URL] Every extract URL must be a string'));
+              return;
+            }
+            const safety = evaluateUrlSafety(rawUrl, state.customBlockedDomains);
             if (!safety.allowed) {
-              recordAudit('extract', { url: urlStr, code: safety.code }, 'blocked');
+              recordAudit('extract', { url: rawUrl, code: safety.code }, 'blocked');
               reject(new Error(`[GUARDRAIL:${safety.code}] ${safety.reason}`));
               return;
             }
@@ -586,7 +616,6 @@ export function createDaemonServer(options = {}) {
             'scroll',
             'wait',
             'snapshot',
-            'screenshot',
             'done'
           ]);
           for (const step of params.steps) {
@@ -601,7 +630,17 @@ export function createDaemonServer(options = {}) {
               );
               return;
             }
-            if (typeof step.url === 'string') {
+            if (
+              stepAction === 'open' ||
+              stepAction === 'navigate' ||
+              (step.url !== undefined && step.url !== null)
+            ) {
+              if (typeof step.url !== 'string') {
+                purgeUploadSnapshots();
+                recordAudit('batch', { url: String(step.url ?? ''), code: 'INVALID_URL' }, 'blocked');
+                reject(new Error('[GUARDRAIL:INVALID_URL] Batch step url must be a string'));
+                return;
+              }
               const safety = evaluateUrlSafety(step.url, state.customBlockedDomains);
               if (!safety.allowed) {
                 purgeUploadSnapshots();
@@ -1194,7 +1233,7 @@ export function createDaemonServer(options = {}) {
         buffer,
         title: cleanFrameTitle,
         url: cleanFrameUrl,
-        activity: String(msg.activity || ''),
+        activity: redactUrlsInText(String(msg.activity || '')),
         capturedAt: Date.now()
       };
       storeTabFrame(frame);
@@ -1213,6 +1252,12 @@ export function createDaemonServer(options = {}) {
     }
 
     if (msg.type === 'guardrail_trip') {
+      if (typeof msg.tabId === 'number') {
+        state.framesByTab.delete(msg.tabId);
+        if (state.latestFrame && state.latestFrame.tabId === msg.tabId) {
+          state.latestFrame = null;
+        }
+      }
       recordAudit('guardrail_trip', {
         tabId: msg.tabId ?? null,
         url: msg.url ?? '',

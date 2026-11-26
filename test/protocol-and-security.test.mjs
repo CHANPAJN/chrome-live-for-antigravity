@@ -1286,6 +1286,27 @@ test('Security audit hardening: mutual HTTP/WS HMAC, replay defense, runtime boo
       });
       assert.equal(symEscapeCheck.allowed, false);
       assert.equal(symEscapeCheck.code, 'UPLOAD_DIR_RESTRICTED');
+
+      // In-directory symlink & junction pointing to a valid file INSIDE sandboxDir MUST return SYMLINK_BLOCKED!
+      const inDirSub = path.join(sandboxDir, 'real-sub');
+      fs.mkdirSync(inDirSub, { recursive: true });
+      const inDirRealFile = path.join(inDirSub, 'asset.png');
+      fs.writeFileSync(inDirRealFile, 'png-bytes', 'utf8');
+      const inDirJumpDir = path.join(sandboxDir, 'jump-sub');
+      fs.symlinkSync(inDirSub, inDirJumpDir, process.platform === 'win32' ? 'junction' : 'dir');
+      const inDirJumpCheck = evaluateUploadFileSafety(path.join(inDirJumpDir, 'asset.png'), {
+        allowedDirs: [sandboxDir]
+      });
+      assert.equal(inDirJumpCheck.allowed, false);
+      assert.equal(inDirJumpCheck.code, 'SYMLINK_BLOCKED');
+
+      if (process.platform !== 'win32') {
+        const inDirFileLink = path.join(sandboxDir, 'direct-link.png');
+        fs.symlinkSync(inDirRealFile, inDirFileLink, 'file');
+        const fileLinkCheck = evaluateUploadFileSafety(inDirFileLink, { allowedDirs: [sandboxDir] });
+        assert.equal(fileLinkCheck.allowed, false);
+        assert.equal(fileLinkCheck.code, 'SYMLINK_BLOCKED');
+      }
     } finally {
       fs.rmSync(sandboxDir, { recursive: true, force: true });
       fs.rmSync(outsideDir, { recursive: true, force: true });
@@ -2265,43 +2286,14 @@ test('Blind-audit round-3 regressions: matrix/encoded dot-segment checkout bypas
   extVm.assertSafeModelSelector('button[type="submit"]');
   extVm.assertSafeModelSelector('[data-testid="confirm"][aria-expanded="false"]');
 
-  // 3. CamelCase, underscore, Chinese & <label>-associated OTP/password typing block
-  const typeGuardMatch = swSource.match(
-    /if \(!el\) return \{ ok: false, error: `Input element not found: \$\{tgt\}` \};\s*(const elStyle = window\.getComputedStyle\(el\);[\s\S]*?return \{\s*ok: false,\s*error:\s*'\[GUARDRAIL\] Automated typing into password[\s\S]*?\};\s*\})/
+  // 3. Automated typing does not heuristically block OTP/password/token fields (delegated to model safety policies),
+  //    while Playbook selector learning still skips sensitive password/OTP targets!
+  assert.equal(
+    /Automated typing into password|Remote typing into password/.test(swSource),
+    false,
+    'Bridge must not impose heuristic typing blocks over user-authorized model actions'
   );
-  assert.ok(typeGuardMatch, 'Expected type field security guard block');
-  const checkTypeField = vm.runInNewContext(
-    `(function(el, document, window, HTMLInputElement) { ${typeGuardMatch[1]} return { ok: true }; })`
-  );
-  class MockInput {}
-  const evalMockField = ({ type = 'text', name = '', id = '', placeholder = '', labelText = '', ariaLabel = '' }) => {
-    const inst = Object.assign(new MockInput(), {
-      type,
-      id,
-      labels: labelText ? [{ textContent: labelText }] : [],
-      closest: () => null,
-      getAttribute(k) {
-        const m = { name, placeholder, 'aria-label': ariaLabel, autocomplete: '', 'aria-labelledby': '', title: '' };
-        return m[k] || '';
-      }
-    });
-    return checkTypeField(
-      inst,
-      { getElementById: () => null },
-      { getComputedStyle: () => ({ webkitTextSecurity: 'none', getPropertyValue: () => 'none' }) },
-      MockInput
-    );
-  };
-
-  assert.equal(evalMockField({ name: 'otpCode' }).ok, false);
-  assert.equal(evalMockField({ id: 'user_password' }).ok, false);
-  assert.equal(evalMockField({ placeholder: '请输入验证码' }).ok, false);
-  assert.equal(evalMockField({ ariaLabel: 'Verification code' }).ok, false);
-  assert.equal(evalMockField({ id: 'c1', type: 'tel', labelText: '短信验证码' }).ok, false);
-  assert.equal(evalMockField({ name: 'payPin' }).ok, false);
-  // Benign fields must NOT false-positive
-  assert.equal(evalMockField({ name: 'pinnedItem', placeholder: '搜索商品名称' }).ok, true);
-  assert.equal(evalMockField({ name: 'spinnerCount' }).ok, true);
+  assert.match(swSource, /const learnedSelector = isSensitiveTypeTarget \? '' : deriveInputSelector\(el\);/);
 
   // 4. High-entropy path token redaction, snapshot title/label URL scrubbing, token-rotation state wipe, WS fragment cap & fatal UTF-8
   const habrTokenUrl =
@@ -2510,78 +2502,8 @@ test('Blind-audit round-4 regressions: quote-aware CSS comment/pseudo lexer, bat
   const { redactUrlsInText } = await import('../src/guardrails.mjs');
   assert.equal(redactUrlsInText(upperTextUrl).includes('UPPER_SECRET_123'), false);
 
-  // 3. Shadow DOM Web Component (`<x-otp-input name="smsCode">`) host-chain & ShadowRoot `aria-labelledby` OTP typing block
-  const typeGuardMatch = swSource.match(
-    /if \(!el\) return \{ ok: false, error: `Input element not found: \$\{tgt\}` \};\s*(const elStyle = window\.getComputedStyle\(el\);[\s\S]*?return \{\s*ok: false,\s*error:\s*'\[GUARDRAIL\] Automated typing into password[\s\S]*?\};\s*\})/
-  );
-  assert.ok(typeGuardMatch);
-  const checkShadowType = vm.runInNewContext(
-    `(function(el, outerMatchedEl, document, window, HTMLInputElement) { ${typeGuardMatch[1]} return { ok: true }; })`
-  );
-  class MockInput {}
-  const shadowHost = {
-    id: '',
-    labels: [],
-    parentElement: null,
-    closest: () => null,
-    getRootNode: () => ({}),
-    getAttribute(k) {
-      return k === 'name' ? 'smsCode' : '';
-    }
-  };
-  const shadowRootWithHost = {
-    host: shadowHost,
-    getElementById(id) {
-      return id === 'inner-lbl' ? { textContent: '动态验证码' } : null;
-    }
-  };
-  const anonymousInnerInput = Object.assign(new MockInput(), {
-    type: 'text',
-    id: '',
-    labels: [],
-    parentElement: null,
-    closest: () => null,
-    getRootNode: () => shadowRootWithHost,
-    getAttribute: () => ''
-  });
-  assert.equal(
-    checkShadowType(
-      anonymousInnerInput,
-      shadowHost,
-      { getElementById: () => null },
-      { getComputedStyle: () => ({ webkitTextSecurity: 'none', getPropertyValue: () => 'none' }) },
-      MockInput
-    ).ok,
-    false,
-    'Anonymous inner input inside <x-otp-input name="smsCode"> Shadow DOM must inherit host OTP block'
-  );
-
-  // Also test inner ShadowRoot `aria-labelledby="inner-lbl"` when host has zero attributes
-  const plainHost = { id: '', labels: [], parentElement: null, closest: () => null, getRootNode: () => ({}), getAttribute: () => '' };
-  const shadowRootLabelOnly = {
-    host: plainHost,
-    getElementById: (id) => (id === 'inner-lbl' ? { textContent: '请输入安全码' } : null)
-  };
-  const innerLabelledInput = Object.assign(new MockInput(), {
-    type: 'tel',
-    id: '',
-    labels: [],
-    parentElement: null,
-    closest: () => null,
-    getRootNode: () => shadowRootLabelOnly,
-    getAttribute: (k) => (k === 'aria-labelledby' ? 'inner-lbl' : '')
-  });
-  assert.equal(
-    checkShadowType(
-      innerLabelledInput,
-      plainHost,
-      { getElementById: () => null },
-      { getComputedStyle: () => ({ webkitTextSecurity: 'none', getPropertyValue: () => 'none' }) },
-      MockInput
-    ).ok,
-    false,
-    'ShadowRoot-local aria-labelledby must be resolved and blocked'
-  );
+  // 3. Shadow DOM Web Component (`<x-otp-input>`) drills into inner open ShadowRoot `<input>` cleanly without heuristic typing block
+  assert.match(swSource, /const openSr = getOpenShadow\(el\);/);
 
   // 4. `syncHudNow` MUST NOT re-lock a tab after it has been removed from `managedTabs` (`!entry`)
   const syncHudNowMatch = swSource.match(/async function syncHudNow\(tabId, payload\)[\s\S]*?\n\}/);
@@ -2734,129 +2656,8 @@ test('Blind-audit round-5 regressions: MCP batch screenshot & playbook opt-in lo
   assert.match(scrubbedSentence, /REDACTED\./);
   assert.equal(extVm.redactUrlsInTextLocal(punctSentence).includes('9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c'), false);
 
-  // 3. Automated typing blocks AntD sibling labels, 6-box split OTP inputs, and `#sms-input`/`access_token`/`api_key` without bleeding across form rows
-  const typeGuardMatch = swSource.match(
-    /if \(!el\) return \{ ok: false, error: `Input element not found: \$\{tgt\}` \};\s*(const elStyle = window\.getComputedStyle\(el\);[\s\S]*?return \{\s*ok: false,\s*error:\s*'\[GUARDRAIL\] Automated typing into password[\s\S]*?\};\s*\})/
-  );
-  assert.ok(typeGuardMatch);
-  const evalTypeGuard = vm.runInNewContext(
-    `(function(el, outerMatchedEl, document, window, HTMLInputElement) { ${typeGuardMatch[1]} return { ok: true }; })`
-  );
-  class MockInputEl {}
-  const mockWin = { getComputedStyle: () => ({ webkitTextSecurity: 'none', getPropertyValue: () => 'none' }) };
-  const mockDoc = { getElementById: () => null };
-
-  // 3a. AntD / ElementPlus sibling label (`<div class="form-item"><div class="lbl">短信验证码</div><div class="ctrl"><input></div></div>`)
-  const siblingLabelDiv = { textContent: '短信验证码', previousElementSibling: null, querySelector: () => null };
-  const ctrlWrapperDiv = {
-    id: '',
-    labels: [],
-    previousElementSibling: siblingLabelDiv,
-    parentElement: null,
-    closest: () => null,
-    getRootNode: () => ({}),
-    getAttribute: () => ''
-  };
-  const antdOtpInput = Object.assign(new MockInputEl(), {
-    tagName: 'INPUT',
-    type: 'text',
-    id: '',
-    maxLength: -1,
-    labels: [],
-    previousElementSibling: null,
-    parentElement: ctrlWrapperDiv,
-    closest: () => null,
-    getRootNode: () => ({}),
-    getAttribute: () => ''
-  });
-  assert.equal(evalTypeGuard(antdOtpInput, antdOtpInput, mockDoc, mockWin, MockInputEl).ok, false, 'Must block AntD sibling label OTP field');
-
-  // 3b. Adjacent normal form row right after a password form row MUST NOT be false-positively blocked!
-  const prevPasswordRow = {
-    textContent: '登录密码',
-    previousElementSibling: null,
-    querySelector: (sel) => (sel.includes('input') ? {} : null) // contains its own <input>
-  };
-  const normalRowLabel = { textContent: '商品标题', previousElementSibling: null, querySelector: () => null };
-  const normalRowCtrl = {
-    id: '',
-    labels: [],
-    previousElementSibling: normalRowLabel,
-    parentElement: null,
-    closest: () => null,
-    getRootNode: () => ({}),
-    getAttribute: () => ''
-  };
-  const normalFormRow = {
-    id: '',
-    labels: [],
-    previousElementSibling: prevPasswordRow,
-    parentElement: null,
-    closest: () => null,
-    getRootNode: () => ({}),
-    getAttribute: () => ''
-  };
-  normalRowCtrl.parentElement = normalFormRow;
-  const normalTitleInput = Object.assign(new MockInputEl(), {
-    tagName: 'INPUT',
-    type: 'text',
-    id: 'product-title',
-    maxLength: -1,
-    labels: [],
-    previousElementSibling: null,
-    parentElement: normalRowCtrl,
-    closest: () => null,
-    getRootNode: () => ({}),
-    getAttribute: (k) => (k === 'name' ? 'productTitle' : '')
-  });
-  assert.equal(evalTypeGuard(normalTitleInput, normalTitleInput, mockDoc, mockWin, MockInputEl).ok, true, 'Must NOT bleed previous row password label into normal input');
-
-  // 3c. 6-box single-character split OTP input (`maxlength="1"` x 6)
-  const otpRowContainer = {
-    id: '',
-    labels: [],
-    previousElementSibling: null,
-    parentElement: null,
-    closest: () => null,
-    getRootNode: () => ({}),
-    getAttribute: () => '',
-    querySelectorAll: (sel) => (sel === 'input[maxlength="1"]' ? [{}, {}, {}, {}, {}, {}] : [])
-  };
-  const splitBoxInput = Object.assign(new MockInputEl(), {
-    tagName: 'INPUT',
-    type: 'tel',
-    id: '',
-    maxLength: 1,
-    labels: [],
-    previousElementSibling: null,
-    parentElement: otpRowContainer,
-    closest: () => null,
-    getRootNode: () => ({}),
-    getAttribute: (k) => (k === 'maxlength' ? '1' : '')
-  });
-  assert.equal(evalTypeGuard(splitBoxInput, splitBoxInput, mockDoc, mockWin, MockInputEl).ok, false, 'Must block 6-box split OTP input');
-
-  // 3d. `#sms-input`, `name="access_token"`, `name="api_key"`
-  for (const [idVal, nameVal] of [
-    ['sms-input', ''],
-    ['', 'access_token'],
-    ['', 'api_key'],
-    ['', 'clientSecret']
-  ]) {
-    const tokenInput = Object.assign(new MockInputEl(), {
-      tagName: 'INPUT',
-      type: 'text',
-      id: idVal,
-      maxLength: -1,
-      labels: [],
-      previousElementSibling: null,
-      parentElement: null,
-      closest: () => null,
-      getRootNode: () => ({}),
-      getAttribute: (k) => (k === 'name' ? nameVal : '')
-    });
-    assert.equal(evalTypeGuard(tokenInput, tokenInput, mockDoc, mockWin, MockInputEl).ok, false, `Must block ${idVal || nameVal}`);
-  }
+  // 3. Typing into OTP/API-key/form inputs is permitted while read-side snapshot/receipt value redaction remains active
+  assert.equal(/countSplitOtpDigits|countSingleCharBoxes/.test(swSource), false);
 
   // 4. `shareTab` blocks pages with embedded cross-origin payment iframes BEFORE managedTabs.set or captureQuickFrame
   const shareTabMatch = swSource.match(/async function shareTab\(tab, toggleIfAlreadyShared = false\)[\s\S]*?\n\}/);
@@ -3393,67 +3194,8 @@ test('Blind-audit round-6 regressions: OAuth2 multi-param & percent-key #fragmen
   assert.equal(uiVm.__get().pinnedTabClosed, false);
   assert.equal(uiVm.__get().currentTab?.tabId, 102);
 
-  // 7. 6-digit Web Component split OTP (`<otp-digit>` with open `shadowRoot` containing `<input maxlength="1">`, 5 hops deep) is blocked!
-  const typeGuardMatch = swSource.match(
-    /if \(!el\) return \{ ok: false, error: `Input element not found: \$\{tgt\}` \};\s*(const elStyle = window\.getComputedStyle\(el\);[\s\S]*?return \{\s*ok: false,\s*error:\s*'\[GUARDRAIL\] Automated typing into password[\s\S]*?\};\s*\})/
-  );
-  assert.ok(typeGuardMatch);
-  const evalTypeGuard = vm.runInNewContext(
-    `(function(el, outerMatchedEl, document, window, HTMLInputElement) { ${typeGuardMatch[1]} return { ok: true }; })`
-  );
-  class MockInput6 {}
-  const makeOtpDigitHost = () => ({
-    shadowRoot: {
-      querySelectorAll: (sel) => (sel === 'input[maxlength="1"]' ? [{}] : [])
-    }
-  });
-  const otpBoard = {
-    id: '',
-    labels: [],
-    previousElementSibling: null,
-    parentElement: null,
-    closest: () => null,
-    getRootNode: () => ({}),
-    getAttribute: () => '',
-    querySelectorAll: (sel) => (sel === '*' ? Array.from({ length: 6 }, makeOtpDigitHost) : [])
-  };
-  // Wrap inside 4 intermediate wrapper divs + ShadowRoot host (5 hops total)
-  let curParent = otpBoard;
-  for (let i = 0; i < 4; i++) {
-    curParent = {
-      id: '',
-      labels: [],
-      previousElementSibling: null,
-      parentElement: curParent,
-      closest: () => null,
-      getRootNode: () => ({}),
-      getAttribute: () => '',
-      querySelectorAll: () => []
-    };
-  }
-  const deepSplitInput = Object.assign(new MockInput6(), {
-    tagName: 'INPUT',
-    type: 'tel',
-    id: '',
-    maxLength: 1,
-    labels: [],
-    previousElementSibling: null,
-    parentElement: curParent,
-    closest: () => null,
-    getRootNode: () => ({}),
-    getAttribute: (k) => (k === 'maxlength' ? '1' : '')
-  });
-  assert.equal(
-    evalTypeGuard(
-      deepSplitInput,
-      deepSplitInput,
-      { getElementById: () => null },
-      { getComputedStyle: () => ({ webkitTextSecurity: 'none', getPropertyValue: () => 'none' }) },
-      MockInput6
-    ).ok,
-    false,
-    'Must block 5-hop deep Web Component <otp-digit> split OTP input'
-  );
+  // 7. Split OTP / PIN inputs are no longer blocked by bridge-level heuristics; read-side redaction stays intact
+  assert.equal(swSource.includes('[GUARDRAIL] Automated typing into password'), false);
 });
 
 test('Sub-frame guardrail allows passive 0x0 Stripe anti-fraud beacons on community forums while blocking real payment Elements & Checkout iframes', () => {
@@ -3580,45 +3322,10 @@ test('Blind-audit round-7 regressions: MV3 dormancy HUD state sync, UNC path NTL
     'Playbook sanitizeRouteUrl must strip nested redirect_uri callback params'
   );
 
-  // 5. Web Component `<slot>` projected label (`<x-field><span slot="label">短信验证码</span></x-field>`) blocks automated typing!
-  const typeGuardMatch = swSource.match(
-    /if \(!el\) return \{ ok: false, error: `Input element not found: \$\{tgt\}` \};\s*(const elStyle = window\.getComputedStyle\(el\);[\s\S]*?return \{\s*ok: false,\s*error:\s*'\[GUARDRAIL\] Automated typing into password[\s\S]*?\};\s*\})/
-  );
-  assert.ok(typeGuardMatch);
-  const evalTypeSlot = vm.runInNewContext(
-    `(function(el, outerMatchedEl, document, window, HTMLInputElement) { ${typeGuardMatch[1]} return { ok: true }; })`
-  );
-  class MockInput7 {}
-  const projectedSlotEl = {
-    assignedNodes: () => [{ textContent: '短信验证码' }]
-  };
-  const shadowInnerLabel = {
-    textContent: '', // Per W3C DOM spec, `<label><slot></slot></label>.textContent` is ""!
-    querySelectorAll: (sel) => (sel === 'slot' ? [projectedSlotEl] : [])
-  };
-  const slottedInput = Object.assign(new MockInput7(), {
-    tagName: 'INPUT',
-    type: 'text',
-    id: '',
-    maxLength: -1,
-    labels: [shadowInnerLabel],
-    previousElementSibling: null,
-    parentElement: null,
-    closest: () => null,
-    getRootNode: () => ({}),
-    getAttribute: () => ''
-  });
-  assert.equal(
-    evalTypeSlot(
-      slottedInput,
-      slottedInput,
-      { getElementById: () => null },
-      { getComputedStyle: () => ({ webkitTextSecurity: 'none', getPropertyValue: () => 'none' }) },
-      MockInput7
-    ).ok,
-    false,
-    'Must block OTP input labelled via Web Component <slot> assignedNodes'
-  );
+  // 5. README & SKILL accurately state typing is governed by model safety policies while read-side values remain redacted
+  const readmeEn = fs.readFileSync(path.join(REPO_ROOT, 'README.md'), 'utf8');
+  assert.equal(readmeEn.includes('password/OTP inputs block automated typing'), false);
+  assert.ok(readmeEn.includes('read-side credential values are strictly redacted'));
 
   // 6. CLI rejects invalid `--tab abc` immediately instead of serializing `NaN -> null` and drifting to sole shared tab
   const badTabRun = spawnSync(process.execPath, [cliPath, 'click', '0', '--tab', 'abc'], {
@@ -3786,50 +3493,55 @@ test('Blind-audit round-8 regressions: TreeWalker -webkit-text-security/CSS chil
   const cleanBtnLabel = runContainerExtract(btnRoot).trim();
   assert.equal(cleanBtnLabel, '复制密钥', 'TreeWalker must strip -webkit-text-security and display:none child text');
 
-  // 4. Custom Web Component `<otp-input><span>短信验证码</span></otp-input>` (default unnamed slot & custom tag name) blocks automated typing
-  const typeGuardMatch = swSource.match(
-    /if \(!el\) return \{ ok: false, error: `Input element not found: \$\{tgt\}` \};\s*(const elStyle = window\.getComputedStyle\(el\);[\s\S]*?return \{\s*ok: false,\s*error:\s*'\[GUARDRAIL\] Automated typing into password[\s\S]*?\};\s*\})/
-  );
-  assert.ok(typeGuardMatch);
-  const evalTypeWc = vm.runInNewContext(
-    `(function(el, outerMatchedEl, document, window, HTMLInputElement) { ${typeGuardMatch[1]} return { ok: true }; })`
-  );
-  class MockInput8 {}
-  const unnamedSlotSpan = { textContent: '支付密码', querySelector: () => null };
-  const customFieldHost = {
-    tagName: 'X-PLAIN-BOX',
-    id: '',
-    labels: [],
-    childNodes: [unnamedSlotSpan],
-    shadowRoot: { querySelectorAll: () => [] },
-    previousElementSibling: null,
-    parentElement: null,
-    closest: () => null,
-    getRootNode: () => ({}),
-    getAttribute: () => ''
-  };
-  const innerAnonInput = Object.assign(new MockInput8(), {
-    tagName: 'INPUT',
-    type: 'text',
-    id: '',
-    maxLength: -1,
-    labels: [],
-    previousElementSibling: null,
-    parentElement: null,
-    closest: () => null,
-    getRootNode: () => ({ host: customFieldHost }),
-    getAttribute: () => ''
+  // 4. Custom Web Component `<x-secret>sk_live_999</x-secret>` projected into `<span style="-webkit-text-security:disc"><slot></slot></span>` is redacted on read!
+  class SlottedElem extends FakeElemNode {
+    constructor(opts = {}) {
+      super();
+      this.isContentEditable = false;
+      this.matches = () => false;
+      this.closest = () => null;
+      this.parentElement = opts.parentElement || null;
+      this.assignedSlot = opts.assignedSlot || null;
+      this.getRootNode = () => opts.rootNode || {};
+      this._style = {
+        display: 'inline',
+        visibility: 'visible',
+        opacity: opts.opacity || '1',
+        webkitTextSecurity: opts.textSecurity || 'none'
+      };
+    }
+  }
+  const secretHost = new SlottedElem();
+  const maskedShadowSpan = new SlottedElem({
+    textSecurity: 'disc',
+    rootNode: { host: secretHost }
   });
+  const innerSlot = new SlottedElem({
+    parentElement: maskedShadowSpan,
+    rootNode: { host: secretHost }
+  });
+  const slottedTextNodes = [
+    { nodeValue: '查看详情', parentElement: secretHost, assignedSlot: null },
+    { nodeValue: 'sk_live_SLOTTED_SECRET', parentElement: secretHost, assignedSlot: innerSlot }
+  ];
+  const runSlottedExtract = vm.runInNewContext(
+    `(function(root) { ${clickWalkerMatch[0]}; return extractCleanContainerText(root); })`,
+    {
+      Element: FakeElemNode,
+      NodeFilter: { SHOW_TEXT: 4 },
+      window: { getComputedStyle: (el) => el._style },
+      document: {
+        createTreeWalker: () => {
+          let i = 0;
+          return { nextNode: () => (i < slottedTextNodes.length ? slottedTextNodes[i++] : null) };
+        }
+      }
+    }
+  );
   assert.equal(
-    evalTypeWc(
-      innerAnonInput,
-      customFieldHost,
-      { getElementById: () => null },
-      { getComputedStyle: () => ({ webkitTextSecurity: 'none', getPropertyValue: () => 'none' }) },
-      MockInput8
-    ).ok,
-    false,
-    'Must block unnamed light-DOM child label inside Web Component host'
+    runSlottedExtract(secretHost).trim(),
+    '查看详情',
+    'Light-DOM text projected via <slot> into -webkit-text-security container must be stripped'
   );
 
   // 5. `reconcileHudAfterStartup` runtime state machine pulls `pollHudUserEvents` BEFORE `syncHud`!
@@ -3935,4 +3647,168 @@ test('Blind-audit round-8 regressions: TreeWalker -webkit-text-security/CSS chil
     await daemon.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
+});
+
+test('Blind-audit round-9 regressions: array type confusion, Base64/backtick/CJK URL scrubbing, opacity:0 excerpt, resolveFrame tabId isolation, batch screenshot ban & relay popout state sync', async () => {
+  const { redactUrlsInText } = await import('../src/guardrails.mjs');
+  const { sanitizeRouteUrl } = await import('../src/playbook-store.mjs');
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+  const extHelperMatch = swSource.match(
+    /const CHECKOUT_SEGMENT_RX =[\s\S]*?function canonicalizeRouteForGuardrail[\s\S]*?\n\}/
+  );
+  const extRedactorMatch = swSource.match(
+    /const LOCAL_AUDIT_SENSITIVE_PARAM_RX =[\s\S]*?function redactUrlsInTextLocal[\s\S]*?\n\}/
+  );
+  const extCheckTabMatch = swSource.match(/function checkTabUrlAllowed\(rawUrl\)[\s\S]*?\n\}/);
+  assert.ok(extHelperMatch && extRedactorMatch && extCheckTabMatch);
+  const extVm = vm.createContext({
+    URL,
+    decodeURIComponent,
+    encodeURIComponent,
+    BUILTIN_PROTECTED_DOMAINS: ['stripe.com', 'alipay.com'],
+    customBlockedDomains: [],
+    bridgeConfig: { port: 28196 }
+  });
+  vm.runInContext(`${extHelperMatch[0]}\n${extRedactorMatch[0]}\n${extCheckTabMatch[0]}`, extVm);
+
+  // 1. Bare Base64/JWT tokens with trailing `=`/`==` or `/` in query/hash, plus Markdown backticks & CJK punctuation in text
+  const bareB64Eq = 'https://app.example.com/cb?K7gNU3sdo+OL0wNhqoVWhr3g6s1xYv72ol_pe_Unols=';
+  const bareB64Eq2 = 'https://app.example.com/cb?K7gNU3sdo+OL0wNhqoVWhr3g6s1xYv72ol_pe_Unols==';
+  const bareJwtHash = 'https://app.example.com/cb#eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0=';
+  const bareSlashHash = 'https://app.example.com/cb#K7gNU3sdo+OL0wNhqoVWhr3g6s1xYv72ol/pe/Unols=';
+  for (const u of [bareB64Eq, bareB64Eq2, bareJwtHash, bareSlashHash]) {
+    assert.equal(redactUrlForAudit(u).includes('K7gNU3sdo'), false, `guardrails must redact ${u}`);
+    assert.equal(redactUrlForAudit(u).includes('eyJhbGci'), false, `guardrails must redact JWT in ${u}`);
+    assert.equal(extVm.redactAuditUrl(u).includes('K7gNU3sdo'), false, `SW must redact ${u}`);
+    assert.equal(extVm.redactAuditUrl(u).includes('eyJhbGci'), false, `SW must redact JWT in ${u}`);
+  }
+
+  const backtickText = 'Reset link: `https://app.example.com/reset/9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c` do not share';
+  const cjkText = '请点击 https://app.example.com/reset/9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c，切勿转发（内部链接：https://app.example.com/cb#eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0=）';
+  for (const txt of [backtickText, cjkText]) {
+    assert.equal(redactUrlsInText(txt).includes('9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c'), false);
+    assert.equal(redactUrlsInText(txt).includes('eyJhbGci'), false);
+    assert.equal(extVm.redactUrlsInTextLocal(txt).includes('9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c'), false);
+    assert.equal(extVm.redactUrlsInTextLocal(txt).includes('eyJhbGci'), false);
+  }
+
+  // Playbook `sanitizeRouteUrl` must catch `+ -> space` decoded Base64 tokens
+  const pbPlusUrl = 'https://seller.example.com/orders?v=K7gNU3sdo+OL0wNhqoVWhr3g6s1xYv72ol_pe_Unols&page=1';
+  const pbBarePlus = 'https://seller.example.com/orders?K7gNU3sdo+OL0wNhqoVWhr3g6s1xYv72ol_pe_Unols=&page=1';
+  assert.equal(sanitizeRouteUrl(pbPlusUrl).includes('K7gNU3sdo'), false);
+  assert.equal(sanitizeRouteUrl(pbBarePlus).includes('K7gNU3sdo'), false);
+  assert.match(sanitizeRouteUrl(pbPlusUrl), /page=1/);
+
+  // 2. Trailing-dot path segments (`/checkout.`, `/pay...`) blocked on both layers
+  assert.equal(evaluateUrlSafety('https://shop.example.com/checkout.').allowed, false);
+  assert.equal(evaluateUrlSafety('https://shop.example.com/pay...').allowed, false);
+  assert.equal(extVm.checkTabUrlAllowed('https://shop.example.com/checkout.').allowed, false);
+  assert.equal(extVm.checkTabUrlAllowed('https://shop.example.com/pay...').allowed, false);
+
+  // 3. Runtime check: `snapshot.excerpt` blocks `opacity: 0` hidden prompt injection & `<slot>` masked secrets,
+  //    and `getOpenShadow` resists `<form><input name="shadowRoot"><input name="shadowRoot"></form>` DOM Clobbering!
+  assert.match(swSource, /checkVisibility\(\{ checkVisibilityCSS: true, checkOpacity: true \}\)/);
+  const openShadowMatch = swSource.match(/function getOpenShadow\(n\) \{[\s\S]*?\n        \}/);
+  assert.ok(openShadowMatch, 'Expected getOpenShadow helper in service-worker.js');
+  const getOpenShadowFn = vm.runInNewContext(`(${openShadowMatch[0]})`, {});
+  const clobberedForm = { shadowRoot: { 0: {}, 1: {}, length: 2 } }; // RadioNodeList has no querySelectorAll
+  assert.equal(getOpenShadowFn(clobberedForm), null, 'RadioNodeList shadowRoot clobbering must return null');
+
+  // 4. Daemon runtime: array-typed `url` blocked at Layer 1, `'screenshot'` banned in `batch`, `resolveFrame` strict `tabId`, & `guardrail_trip` frame wipe
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clive-r9-daemon-'));
+  const tok = crypto.randomBytes(32).toString('hex');
+  fs.writeFileSync(path.join(tempDir, 'auth.token'), `${tok}\n`, 'utf8');
+  const daemon = createDaemonServer({ host: '127.0.0.1', port: 0, stateDir: tempDir, token: () => tok });
+  const port = await daemon.listen();
+  let extWs = null;
+  const getSignedStatus = (reqPath) =>
+    new Promise((resolve, reject) => {
+      const { headers } = buildSignedHttpHeaders(tok, 'GET', reqPath, '');
+      const req = http.request({ host: '127.0.0.1', port, path: reqPath, method: 'GET', headers, agent: false }, (res) => {
+        res.resume();
+        res.on('end', () => resolve(res.statusCode));
+      });
+      req.on('error', reject);
+      req.end();
+    });
+  try {
+    extWs = await connectTestWsClient(port, '/ws/extension', tok);
+    // Register two controlled tabs and push a frame for tab 101
+    extWs.sendMaskedJson({
+      type: 'status_sync',
+      tabs: [
+        { tabId: 101, substate: 'shared', paused: false, title: 'Shop A', url: 'https://a.example.com' },
+        { tabId: 102, substate: 'shared', paused: false, title: 'Shop B', url: 'https://b.example.com' }
+      ]
+    });
+    const tinyJpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString('base64');
+    extWs.sendMaskedJson({
+      type: 'screencast_frame',
+      tabId: 101,
+      mimeType: 'image/jpeg',
+      data: tinyJpeg,
+      title: 'Shop A',
+      url: 'https://a.example.com'
+    });
+    await new Promise((r) => setTimeout(r, 60));
+
+    // Invalid `tabId` (`abc`, `101abc`) or omitted `tabId` with >1 tabs MUST NOT leak tab 101's frame!
+    assert.equal(await getSignedStatus('/api/frame?tabId=abc'), 204);
+    assert.equal(await getSignedStatus('/api/frame?tabId=101abc'), 204);
+    assert.equal(await getSignedStatus('/api/frame'), 204);
+    assert.equal(await getSignedStatus('/api/frame?tabId=101'), 200);
+
+    // `guardrail_trip` immediately purges cached frame for tab 101 even before `status_sync` arrives!
+    extWs.sendMaskedJson({
+      type: 'guardrail_trip',
+      tabId: 101,
+      url: 'https://checkout.stripe.com/pay',
+      reason: 'Protected payment domain'
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(await getSignedStatus('/api/frame?tabId=101'), 204, 'guardrail_trip must immediately delete cached tab frame');
+
+    // Array-typed `url` in `open` & `batch` rejected at Daemon Layer 1 with `INVALID_URL` before reaching extension!
+    const arrOpen = await httpJson(
+      port,
+      'POST',
+      '/api/command',
+      { token: tok },
+      { method: 'open', params: { url: ['https://checkout.stripe.com/c/pay/123'] } }
+    );
+    assert.equal(arrOpen.statusCode >= 400, true);
+    assert.match(String(arrOpen.json?.error || ''), /GUARDRAIL:INVALID_URL/);
+
+    const arrBatch = await httpJson(
+      port,
+      'POST',
+      '/api/command',
+      { token: tok },
+      { method: 'batch', params: { steps: [{ action: 'open', url: ['https://checkout.stripe.com/pay'] }] } }
+    );
+    assert.equal(arrBatch.statusCode >= 400, true);
+    assert.match(String(arrBatch.json?.error || ''), /GUARDRAIL:INVALID_URL/);
+
+    // `'screenshot'` inside `batch` rejected by Daemon!
+    const batchShot = await httpJson(
+      port,
+      'POST',
+      '/api/command',
+      { token: tok },
+      { method: 'batch', params: { tabId: 102, steps: [{ action: 'screenshot' }] } }
+    );
+    assert.equal(batchShot.statusCode >= 400, true);
+    assert.match(String(batchShot.json?.error || ''), /FORBIDDEN_BATCH_ACTION/);
+  } finally {
+    try {
+      extWs?.socket?.destroy();
+    } catch {}
+    await daemon.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+
+  // 5. Verify `autoMergeClosedRelayTab` returns explicit booleans & `mergeRelayTabBack` keeps `relayPopoutWinId` until move succeeds
+  assert.match(swSource, /const merged = await autoMergeClosedRelayTab\(entry\)\.catch\(\(\) => false\);/);
+  assert.match(swSource, /typeof target !== 'number' && typeof target !== 'string'/);
+  assert.match(swSource, /replacedTabId: typeof item\.replacedTabId === 'number' \? item\.replacedTabId : null/);
 });

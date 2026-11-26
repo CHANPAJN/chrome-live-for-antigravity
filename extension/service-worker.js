@@ -81,11 +81,7 @@ const BUILTIN_PROTECTED_DOMAINS = [
   'boc.cn',
   'cmbchina.com',
   'psbc.com',
-  'bankcomm.com',
-  'console.aws.amazon.com',
-  'console.cloud.google.com',
-  'portal.azure.com',
-  'dash.cloudflare.com'
+  'bankcomm.com'
 ];
 
 const CHECKOUT_SEGMENT_RX =
@@ -173,12 +169,15 @@ function canonicalizeRouteForGuardrail(rawSegment, splitRawQuery = false) {
   for (const seg of normalized.split('/')) {
     const cleanSeg = seg.split(';')[0];
     if (!cleanSeg || cleanSeg === '.') continue;
-    rawPieces.push(cleanSeg);
     if (cleanSeg === '..') {
+      rawPieces.push('..');
       stack.pop();
       continue;
     }
-    stack.push(cleanSeg);
+    const strippedSeg = cleanSeg.replace(/\.+$/, '');
+    if (!strippedSeg) continue;
+    rawPieces.push(strippedSeg);
+    stack.push(strippedSeg);
   }
   return {
     ok: true,
@@ -526,6 +525,11 @@ function scrubLocalQueryString(rawQuery, depth = 0) {
     }
     const rawK = pair.slice(0, eq);
     const rawV = pair.slice(eq + 1);
+    if ((rawV === '' || /^=+$/.test(rawV)) && isHighEntropyPathSegment(rawK, { splitMatrix: false })) {
+      tokens[i] = 'REDACTED';
+      changed = true;
+      continue;
+    }
     let decK = rawK;
     try {
       decK = decodeURIComponent(rawK.replace(/\+/g, ' '));
@@ -588,16 +592,29 @@ function redactAuditUrl(rawUrl, depth = 0) {
       const rawHashBody = parsed.hash.slice(hashPrefix.length);
       let cleanedHash = parsed.hash;
 
-      if (
-        rawHashBody &&
+      const hashNoPad = rawHashBody.replace(/=+$/, '');
+      const isBareSingleToken =
+        Boolean(rawHashBody) &&
         !rawHashBody.includes('/') &&
         !rawHashBody.includes('?') &&
         !rawHashBody.includes('&') &&
-        !rawHashBody.includes('=') &&
         !rawHashBody.includes('#') &&
-        (isHighEntropyPathSegment(rawHashBody, { splitMatrix: false }) ||
-          /^(?:eyJ[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{32,})$/.test(rawHashBody))
-      ) {
+        !hashNoPad.includes('=') &&
+        (isHighEntropyPathSegment(hashNoPad, { splitMatrix: false }) ||
+          /^(?:eyJ[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{32,})$/.test(rawHashBody));
+      const isBareSlashBase64Token =
+        Boolean(rawHashBody) &&
+        !rawHashBody.startsWith('/') &&
+        rawHashBody.includes('/') &&
+        !rawHashBody.includes('?') &&
+        !rawHashBody.includes('&') &&
+        !rawHashBody.includes('#') &&
+        !hashNoPad.includes('=') &&
+        rawHashBody.length >= 32 &&
+        /^[A-Za-z0-9+/]+=*$/.test(rawHashBody) &&
+        (/[+=]/.test(rawHashBody) || (/\d/.test(rawHashBody) && /[A-Z]/.test(rawHashBody) && /[a-z]/.test(rawHashBody)));
+
+      if (isBareSingleToken || isBareSlashBase64Token) {
         cleanedHash = `${hashPrefix}REDACTED`;
       } else if (
         !rawHashBody.startsWith('/') &&
@@ -680,6 +697,15 @@ function splitLocalBalancedUrlSuffix(rawMatch) {
         continue;
       }
     }
+    if (ch === '}') {
+      const sub = rawMatch.slice(0, end);
+      const opens = (sub.match(/\{/g) || []).length;
+      const closes = (sub.match(/\}/g) || []).length;
+      if (closes > opens) {
+        end--;
+        continue;
+      }
+    }
     break;
   }
   return { coreUrl: rawMatch.slice(0, end), suffix: rawMatch.slice(end) };
@@ -687,7 +713,7 @@ function splitLocalBalancedUrlSuffix(rawMatch) {
 
 function redactUrlsInTextLocal(rawText) {
   if (typeof rawText !== 'string' || !/https?:\/\//i.test(rawText)) return rawText;
-  return rawText.replace(/https?:\/\/[^\s"'<>]+/gi, (match) => {
+  return rawText.replace(/https?:\/\/[^\s"'<>`\u3000-\u303f\uff00-\uffef\u4e00-\u9fff]+/gi, (match) => {
     const { coreUrl, suffix } = splitLocalBalancedUrlSuffix(match);
     return redactAuditUrl(coreUrl) + suffix;
   });
@@ -810,6 +836,7 @@ async function restoreSessionState() {
         }
         managedTabs.set(item.tabId, {
           tabId: item.tabId,
+          replacedTabId: typeof item.replacedTabId === 'number' ? item.replacedTabId : null,
           substate: item.substate === 'shared' ? 'shared' : 'worker',
           uiMode: item.uiMode || 'working',
           attachedCdp: false,
@@ -817,6 +844,7 @@ async function restoreSessionState() {
           paused: Boolean(item.paused),
           originWindowId: typeof item.originWindowId === 'number' ? item.originWindowId : null,
           originIndex: typeof item.originIndex === 'number' ? item.originIndex : null,
+          originGroupId: typeof item.originGroupId === 'number' ? item.originGroupId : -1,
           relayPopoutWinId: typeof item.relayPopoutWinId === 'number' ? item.relayPopoutWinId : null,
           title: liveTab.title || item.title || '',
           url: liveTab.url || item.url || '',
@@ -885,12 +913,13 @@ function serializeTabs() {
       inRelayPopout: Boolean(entry.relayPopoutWinId),
       originWindowId: entry.originWindowId ?? null,
       originIndex: entry.originIndex ?? null,
+      originGroupId: typeof entry.originGroupId === 'number' ? entry.originGroupId : -1,
       relayPopoutWinId: entry.relayPopoutWinId ?? null,
       replacedTabId: typeof entry.replacedTabId === 'number' ? entry.replacedTabId : null,
       attachedCdp: entry.attachedCdp,
-      title: entry.title,
+      title: redactUrlsInTextLocal(entry.title || ''),
       url: redactAuditUrl(entry.url),
-      activity: entry.activity
+      activity: redactUrlsInTextLocal(entry.activity || '')
     });
   }
   return list;
@@ -1685,12 +1714,9 @@ async function mergeRelayTabBack(entry, { resumedByUserInBrowser = false } = {})
   const prevOriginWinId = entry.originWindowId;
   const prevOriginIndex = entry.originIndex;
   const prevOriginGroupId = typeof entry.originGroupId === 'number' ? entry.originGroupId : -1;
-  entry.relayPopoutWinId = null;
-  entry.originWindowId = null;
-  entry.originIndex = null;
-  entry.originGroupId = -1;
 
   let targetWindowId = null;
+  let placeholderBlankTabId = null;
   if (typeof prevOriginWinId === 'number') {
     const origExists = await chrome.windows.get(prevOriginWinId).catch(() => null);
     if (origExists && origExists.type === 'normal') {
@@ -1700,33 +1726,57 @@ async function mergeRelayTabBack(entry, { resumedByUserInBrowser = false } = {})
   if (targetWindowId === null) {
     const curTab = await chrome.tabs.get(entry.tabId).catch(() => null);
     const allNormal = await chrome.windows.getAll({ windowTypes: ['normal'] }).catch(() => []);
-    const otherWin = allNormal.find((w) => w.id !== curTab?.windowId);
+    const otherWin = allNormal.find((w) => w.id !== curTab?.windowId && w.id !== entry.relayPopoutWinId);
     if (otherWin) targetWindowId = otherWin.id;
+  }
+  if (targetWindowId === null) {
+    const createdWin = await chrome.windows.create({
+      type: 'normal',
+      focused: Boolean(resumedByUserInBrowser)
+    });
+    if (!createdWin || typeof createdWin.id !== 'number') {
+      throw new Error('Unable to locate or create a main Chrome window to merge the relay tab');
+    }
+    targetWindowId = createdWin.id;
+    const initTab = Array.isArray(createdWin.tabs) ? createdWin.tabs[0] : null;
+    if (initTab && typeof initTab.id === 'number' && initTab.id !== entry.tabId) {
+      placeholderBlankTabId = initTab.id;
+    }
   }
 
   const groupColor = resumedByUserInBrowser ? 'cyan' : 'yellow';
   const groupLabel = resumedByUserInBrowser ? tr().groupTitle : tr().groupPaused;
 
-  if (targetWindowId !== null) {
+  const movedTab = await chrome.tabs.move(entry.tabId, {
+    windowId: targetWindowId,
+    index: typeof prevOriginIndex === 'number' ? prevOriginIndex : -1
+  });
+  const actualMoved = Array.isArray(movedTab) ? movedTab[0] : movedTab;
+  if (actualMoved && typeof actualMoved.windowId === 'number' && actualMoved.windowId !== targetWindowId) {
+    throw new Error('Failed to move relay popout tab back into main window');
+  }
+  if (placeholderBlankTabId !== null) {
+    await chrome.tabs.remove(placeholderBlankTabId).catch(() => {});
+  }
+
+  // Only clear popout tracking AFTER chrome.tabs.move is confirmed to have succeeded!
+  entry.relayPopoutWinId = null;
+  entry.originWindowId = null;
+  entry.originIndex = null;
+  entry.originGroupId = -1;
+
+  if (entry.substate === 'worker') {
+    await placeInBackgroundTabGroup(
+      entry.tabId,
+      targetWindowId,
+      resumedByUserInBrowser,
+      groupColor,
+      groupLabel
+    );
+  } else if (prevOriginGroupId >= 0) {
     await chrome.tabs
-      .move(entry.tabId, {
-        windowId: targetWindowId,
-        index: typeof prevOriginIndex === 'number' ? prevOriginIndex : -1
-      })
+      .group({ tabIds: [entry.tabId], groupId: prevOriginGroupId })
       .catch(() => {});
-    if (entry.substate === 'worker') {
-      await placeInBackgroundTabGroup(
-        entry.tabId,
-        targetWindowId,
-        resumedByUserInBrowser,
-        groupColor,
-        groupLabel
-      );
-    } else if (prevOriginGroupId >= 0) {
-      await chrome.tabs
-        .group({ tabIds: [entry.tabId], groupId: prevOriginGroupId })
-        .catch(() => {});
-    }
   }
 
   // Only browser-originated user gestures can lift `paused`; external RPCs merge the window while keeping it paused
@@ -1965,7 +2015,10 @@ async function inspectEmbeddedFramesSafety(tabId) {
             }
           }
           for (const el of root.querySelectorAll('*')) {
-            if (el.shadowRoot) collectFrames(el.shadowRoot, depth + 1);
+            const sr =
+              (typeof Element !== 'undefined' && Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(el)) ||
+              (el.shadowRoot && typeof el.shadowRoot.querySelectorAll === 'function' ? el.shadowRoot : null);
+            if (sr) collectFrames(sr, depth + 1);
           }
         };
         const seenNavDocs = new Set();
@@ -2014,7 +2067,10 @@ async function inspectEmbeddedFramesSafety(tabId) {
             } catch {}
           }
           for (const el of root.querySelectorAll('*')) {
-            if (el.shadowRoot) collectTargetedNavigations(el.shadowRoot, depth + 1);
+            const sr =
+              (typeof Element !== 'undefined' && Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(el)) ||
+              (el.shadowRoot && typeof el.shadowRoot.querySelectorAll === 'function' ? el.shadowRoot : null);
+            if (sr) collectTargetedNavigations(sr, depth + 1);
           }
         };
         try {
@@ -2329,8 +2385,18 @@ async function executeBridgeRpc(method, params) {
               error: '[GUARDRAIL] Cross-origin iframe input cannot be typed remotely; use Popout / Pause in Chrome'
             };
           }
-          while (el && el.shadowRoot && el.shadowRoot.activeElement) {
-            el = el.shadowRoot.activeElement;
+          const getOpenShadow = (n) => {
+            if (!n) return null;
+            try {
+              if (typeof Element !== 'undefined') {
+                const sr = Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(n);
+                if (sr) return sr;
+              }
+            } catch {}
+            return n.shadowRoot && typeof n.shadowRoot.querySelectorAll === 'function' ? n.shadowRoot : null;
+          };
+          while (el && getOpenShadow(el) && getOpenShadow(el).activeElement) {
+            el = getOpenShadow(el).activeElement;
           }
           const getTag = (n) => String(n?.tagName || '').toLowerCase();
           if (
@@ -2347,153 +2413,6 @@ async function executeBridgeRpc(method, params) {
           }
           if (!el) return { ok: false, error: 'No active input field' };
           const ownerWin = el.ownerDocument?.defaultView || window;
-          const st = ownerWin.getComputedStyle(el);
-          const tSec = String(st.webkitTextSecurity || st.getPropertyValue('-webkit-text-security') || '').toLowerCase();
-          // Detect 4..8 single-character split OTP/PIN box groups (up to 6 hops & across sibling open ShadowRoots)
-          const countSingleCharBoxes = (root, d = 0) => {
-            if (!root || d > 3 || typeof root.querySelectorAll !== 'function') return 0;
-            let count = root.querySelectorAll('input[maxlength="1"]').length;
-            if (count >= 4) return count;
-            for (const sub of root.querySelectorAll('*')) {
-              if (sub.shadowRoot) {
-                count += countSingleCharBoxes(sub.shadowRoot, d + 1);
-                if (count >= 4) return count;
-              }
-            }
-            return count;
-          };
-          let isSplitOtpBox = false;
-          if (getTag(el) === 'input' && (el.maxLength === 1 || Number(el.getAttribute?.('maxlength')) === 1)) {
-            let grp = el.parentElement || (el.getRootNode?.()?.host ? el.getRootNode() : null);
-            for (let gHop = 0; gHop < 6 && grp; gHop++) {
-              if (countSingleCharBoxes(grp) >= 4) {
-                isSplitOtpBox = true;
-                break;
-              }
-              grp = grp.parentElement || (grp.getRootNode?.()?.host ?? null);
-            }
-          }
-          const metaTokens = [];
-          const autoTokens = [];
-          const visitedNodes = new Set();
-          const readTextWithSlots = (n) => {
-            if (!n) return '';
-            const out = [n.textContent || ''];
-            if (typeof n.querySelectorAll === 'function') {
-              for (const sl of n.querySelectorAll('slot')) {
-                if (typeof sl.assignedNodes === 'function') {
-                  for (const an of sl.assignedNodes({ flatten: true })) {
-                    if (an && an.textContent) out.push(an.textContent);
-                  }
-                }
-              }
-            }
-            return out.join(' ');
-          };
-          const harvestNodeHints = (node, hop = 0) => {
-            if (!node || typeof node.getAttribute !== 'function' || visitedNodes.has(node)) return;
-            visitedNodes.add(node);
-            if (node.tagName && String(node.tagName).includes('-')) {
-              metaTokens.push(String(node.tagName));
-            }
-            autoTokens.push(node.getAttribute('autocomplete') || '');
-            metaTokens.push(
-              node.getAttribute('name'),
-              node.id,
-              node.getAttribute('placeholder'),
-              node.getAttribute('aria-label'),
-              node.getAttribute('title')
-            );
-            if (node.labels) {
-              for (const lb of Array.from(node.labels)) metaTokens.push(readTextWithSlots(lb));
-            }
-            const wrapLb = node.closest?.('label');
-            if (wrapLb) metaTokens.push(readTextWithSlots(wrapLb));
-            const labelledBy = node.getAttribute('aria-labelledby') || '';
-            const rootNode = node.getRootNode?.();
-            const docObj = node.ownerDocument || document;
-            for (const lid of labelledBy.split(/\s+/).filter(Boolean)) {
-              const lNode =
-                (rootNode && typeof rootNode.getElementById === 'function' ? rootNode.getElementById(lid) : null) ||
-                docObj.getElementById(lid);
-              if (lNode) metaTokens.push(readTextWithSlots(lNode));
-            }
-            // Capture named & unnamed light-DOM slotted labels on Web Component hosts (`<otp-input><span>短信验证码</span></otp-input>`)
-            if (node.shadowRoot) {
-              if (typeof node.shadowRoot.querySelectorAll === 'function') {
-                for (const sl of node.shadowRoot.querySelectorAll('slot')) {
-                  if (typeof sl.assignedNodes === 'function') {
-                    for (const an of sl.assignedNodes({ flatten: true })) {
-                      const hasCtrl =
-                        typeof an?.querySelector === 'function' &&
-                        Boolean(an.querySelector('input, textarea, select, [contenteditable="true"]'));
-                      if (!hasCtrl) {
-                        const sTxt = String(an?.textContent || '').trim();
-                        if (sTxt.length > 0 && sTxt.length <= 64) metaTokens.push(sTxt);
-                      }
-                    }
-                  }
-                }
-              }
-              const hostKids = node.childNodes || node.children;
-              if (hostKids && typeof hostKids[Symbol.iterator] === 'function') {
-                for (const child of hostKids) {
-                  const hasCtrl =
-                    typeof child?.querySelector === 'function' &&
-                    Boolean(child.querySelector('input, textarea, select, [contenteditable="true"]'));
-                  if (!hasCtrl) {
-                    const cTxt = String(child?.textContent || '').trim();
-                    if (cTxt.length > 0 && cTxt.length <= 64) metaTokens.push(cTxt);
-                  }
-                }
-              }
-            }
-            // Harvest adjacent preceding label siblings inside UI form rows (AntD / ElementPlus / Tailwind) without bleeding from prior input rows
-            if (hop <= 4) {
-              let sib = node.previousElementSibling;
-              for (let sHop = 0; sHop < 4 && sib; sHop++, sib = sib.previousElementSibling) {
-                const hasOtherInput =
-                  typeof sib.querySelector === 'function' &&
-                  Boolean(sib.querySelector('input, textarea, select, [contenteditable="true"]'));
-                if (!hasOtherInput) {
-                  const sibTxt = String(readTextWithSlots(sib) || '').trim();
-                  if (sibTxt.length > 0 && sibTxt.length <= 64) {
-                    metaTokens.push(sibTxt);
-                  }
-                }
-              }
-            }
-          };
-          let cursorNode = el;
-          for (let hop = 0; hop < 8 && cursorNode; hop++) {
-            harvestNodeHints(cursorNode, hop);
-            const rn = cursorNode.getRootNode?.();
-            cursorNode =
-              cursorNode.parentElement ||
-              (rn && rn.host ? rn.host : null) ||
-              cursorNode.ownerDocument?.defaultView?.frameElement ||
-              null;
-          }
-          if (initialActiveHost) harvestNodeHints(initialActiveHost, 0);
-          const autoAttr = autoTokens.join(' ').toLowerCase();
-          const rawMeta = metaTokens.filter(Boolean).join(' ');
-          const decamelMeta = rawMeta
-            .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-            .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2');
-          if (
-            isSplitOtpBox ||
-            (getTag(el) === 'input' && String(el.type).toLowerCase() === 'password') ||
-            (tSec && tSec !== 'none') ||
-            /(?:password|one-time-code|cc-number|cc-csc|cc-exp)/i.test(autoAttr) ||
-            /(?:passw(?:or)?d|passcode|one[-_\s]?time|verif(?:y|ication)[-_\s]*(?:code|input|token|num)?|security[-_\s]*(?:code|key|token)|auth(?:entication)?[-_\s]*(?:code|token|key)|sms[-_\s]*(?:code|input|otp|token)|login[-_\s]*code|dynamic[-_\s]*code|card[-_\s]*(?:number|num|no)|api[-_\s]*key|access[-_\s]*(?:key|token)|private[-_\s]*key|client[-_\s]*secret|secret[-_\s]*(?:key|token|code)?|captcha|(?:^|[^a-zA-Z])(?:otp|totp|2fa|mfa|cvv|cvc|csc|pwd|pin|apikey|secret|token)(?:$|[^a-zA-Z])|密码|口令|验证码|动态码|安全码|校验码|密钥|私钥|令牌)/i.test(
-              decamelMeta
-            )
-          ) {
-            return {
-              ok: false,
-              error: '[GUARDRAIL] Remote typing into password or OTP fields is disabled; use Popout / Pause in Chrome'
-            };
-          }
           el.focus?.();
           if (el.isContentEditable) {
             const sel = ownerWin.getSelection?.();
@@ -2559,6 +2478,17 @@ async function executeBridgeRpc(method, params) {
         const yMin = Math.min(ny1, ny2) * vh;
         const yMax = Math.max(ny1, ny2) * vh;
 
+        function getOpenShadow(n) {
+          if (!n) return null;
+          try {
+            if (typeof Element !== 'undefined') {
+              const sr = Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(n);
+              if (sr) return sr;
+            }
+          } catch {}
+          return n.shadowRoot && typeof n.shadowRoot.querySelectorAll === 'function' ? n.shadowRoot : null;
+        }
+
         function collectDeep(root, sel, depth = 0, acc = []) {
           if (!root || depth > 6) return acc;
           try {
@@ -2566,7 +2496,8 @@ async function executeBridgeRpc(method, params) {
           } catch {}
           for (const h of root.querySelectorAll('*')) {
             if (h === window.__chromeLiveHudController__?.hostEl) continue;
-            if (h.shadowRoot) collectDeep(h.shadowRoot, sel, depth + 1, acc);
+            const sr = getOpenShadow(h);
+            if (sr) collectDeep(sr, sel, depth + 1, acc);
           }
           return acc;
         }
@@ -2604,10 +2535,19 @@ async function executeBridgeRpc(method, params) {
           const REGION_SKIP_SEL =
             'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
           const isInsideSkipped = (node, stopRoot) => {
-            let cur = node instanceof Element ? node : node?.parentElement;
-            while (cur) {
-              if (cur.isContentEditable || cur.matches?.(REGION_SKIP_SEL) || cur.closest?.(REGION_SKIP_SEL)) return true;
-              if (typeof cur.checkVisibility === 'function' && !cur.checkVisibility({ checkVisibilityCSS: true })) {
+            const seen = new Set();
+            let cur = node instanceof Element ? node : node?.assignedSlot || node?.parentElement;
+            let passedStop = false;
+            while (cur && !seen.has(cur)) {
+              seen.add(cur);
+              if (!passedStop && (cur.isContentEditable || cur.matches?.(REGION_SKIP_SEL) || cur.closest?.(REGION_SKIP_SEL))) {
+                return true;
+              }
+              if (cur.isContentEditable) return true;
+              if (
+                typeof cur.checkVisibility === 'function' &&
+                !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
+              ) {
                 return true;
               }
               const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
@@ -2621,7 +2561,14 @@ async function executeBridgeRpc(method, params) {
               ) {
                 return true;
               }
-              if (cur === stopRoot) break;
+              if (cur.assignedSlot) {
+                cur = cur.assignedSlot;
+                continue;
+              }
+              if (cur === stopRoot) {
+                passedStop = true;
+                break;
+              }
               const rn = cur.getRootNode?.();
               cur = cur.parentElement || (rn && rn.host ? rn.host : null);
             }
@@ -2633,8 +2580,8 @@ async function executeBridgeRpc(method, params) {
             const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
             let tn;
             while ((tn = tw.nextNode())) {
-              const p = tn.parentElement;
-              if (p && !isInsideSkipped(p, rootNode)) {
+              const startEl = tn.assignedSlot || tn.parentElement;
+              if (startEl && !isInsideSkipped(startEl, rootNode)) {
                 outParts.push(tn.nodeValue || '');
               }
             }
@@ -2710,7 +2657,13 @@ async function executeBridgeRpc(method, params) {
     const steps = Array.isArray(params.steps) ? params.steps.slice(0, 12) : [];
     if (steps.length === 0) throw new Error('batch requires a non-empty steps array');
 
-    let currentTabId = typeof params.tabId === 'number' ? params.tabId : undefined;
+    let currentTabId = undefined;
+    if (params.tabId !== undefined && params.tabId !== null && params.tabId !== '') {
+      if (typeof params.tabId !== 'number' || !Number.isSafeInteger(params.tabId) || params.tabId <= 0) {
+        throw new Error(`Invalid tabId parameter: ${params.tabId}`);
+      }
+      currentTabId = params.tabId;
+    }
     const stepResults = [];
     let finalSnapshot = null;
 
@@ -2723,12 +2676,13 @@ async function executeBridgeRpc(method, params) {
       'scroll',
       'wait',
       'snapshot',
-      'screenshot',
       'done'
     ]);
     for (let i = 0; i < steps.length; i++) {
       const rawStep = steps[i];
-      if (!rawStep || typeof rawStep !== 'object') continue;
+      if (!rawStep || typeof rawStep !== 'object' || Array.isArray(rawStep)) {
+        throw new Error(`Batch step ${i} must be an object`);
+      }
       const action = String(rawStep.action || rawStep.method || rawStep.cmd || '').trim();
       if (!ALLOWED_BATCH_ACTIONS.has(action)) {
         throw new Error(`[GUARDRAIL] Action "${action}" at batch step ${i} is not permitted inside batch pipelines`);
@@ -2738,8 +2692,14 @@ async function executeBridgeRpc(method, params) {
       delete stepParams.action;
       delete stepParams.method;
       delete stepParams.cmd;
-      if (stepParams.tabId === undefined && currentTabId !== undefined) {
-        stepParams.tabId = currentTabId;
+      if (stepParams.tabId === undefined || stepParams.tabId === null || stepParams.tabId === '') {
+        if (currentTabId !== undefined) {
+          stepParams.tabId = currentTabId;
+        } else {
+          delete stepParams.tabId;
+        }
+      } else if (typeof stepParams.tabId !== 'number' || !Number.isSafeInteger(stepParams.tabId) || stepParams.tabId <= 0) {
+        throw new Error(`Invalid tabId parameter at batch step ${i}: ${stepParams.tabId}`);
       }
 
       if (
@@ -2777,7 +2737,10 @@ async function executeBridgeRpc(method, params) {
   }
 
   if (method === 'open') {
-    const url = String(params.url || '').trim();
+    if (typeof params.url !== 'string' || !params.url.trim()) {
+      throw new Error('[GUARDRAIL] URL parameter must be a non-empty string');
+    }
+    const url = params.url.trim();
     const safety = checkTabUrlAllowed(url);
     if (!safety.allowed) throw new Error(`[GUARDRAIL] ${safety.reason}`);
 
@@ -2826,6 +2789,9 @@ async function executeBridgeRpc(method, params) {
     const scrollSteps = Math.min(5, Math.max(0, Number(params.scrollSteps ?? 1)));
     if (urls.length === 0) throw new Error('extract requires at least one URL');
     for (const u of urls) {
+      if (typeof u !== 'string' || !u.trim()) {
+        throw new Error('[GUARDRAIL] Every extract URL must be a non-empty string');
+      }
       const check = checkTabUrlAllowed(u);
       if (!check.allowed) throw new Error(`[GUARDRAIL] ${check.reason} (${u})`);
     }
@@ -2915,29 +2881,46 @@ async function executeBridgeRpc(method, params) {
                 const SKIP_CLOSEST =
                   'style, script, noscript, template, textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], [data-chrome-live-hud]';
                 const isInsideSkipped = (node) => {
-                  let cur = node instanceof Element ? node : node?.parentElement;
-                  while (cur) {
+                  const seen = new Set();
+                  let cur = node instanceof Element ? node : node?.assignedSlot || node?.parentElement;
+                  while (cur && !seen.has(cur)) {
+                    seen.add(cur);
                     if (cur.isContentEditable || cur.matches?.(SKIP_CLOSEST) || cur.closest?.(SKIP_CLOSEST)) return true;
+                    if (cur.assignedSlot) {
+                      cur = cur.assignedSlot;
+                      continue;
+                    }
                     const rn = cur.getRootNode?.();
-                    cur = rn && rn instanceof ShadowRoot ? rn.host : null;
+                    cur = cur.parentElement || (rn && rn.host ? rn.host : null);
                   }
                   return false;
                 };
                 const visCache = new WeakMap();
-                const isElemVisible = (el) => {
+                const isSingleElemVisible = (el) => {
                   if (visCache.has(el)) return visCache.get(el);
                   const cs = window.getComputedStyle(el);
                   const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue('-webkit-text-security') || '').toLowerCase();
-                  let v = (!tSec || tSec === 'none');
-                  if (v) {
-                    if (typeof el.checkVisibility === 'function') {
-                      v = el.checkVisibility({ checkVisibilityCSS: true });
-                    } else {
-                      v = cs.display !== 'none' && cs.visibility !== 'hidden';
-                    }
+                  let v = (!tSec || tSec === 'none') && cs.opacity !== '0' && cs.display !== 'none' && cs.visibility !== 'hidden' && cs.visibility !== 'collapse';
+                  if (v && typeof el.checkVisibility === 'function') {
+                    v = el.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true });
                   }
                   visCache.set(el, v);
                   return v;
+                };
+                const isFlatVisible = (startEl) => {
+                  const seen = new Set();
+                  let cur = startEl;
+                  while (cur && !seen.has(cur)) {
+                    seen.add(cur);
+                    if (!isSingleElemVisible(cur)) return false;
+                    if (cur.assignedSlot) {
+                      cur = cur.assignedSlot;
+                      continue;
+                    }
+                    const rn = cur.getRootNode?.();
+                    cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+                  }
+                  return true;
                 };
                 let text = '';
                 if (root) {
@@ -2947,8 +2930,9 @@ async function executeBridgeRpc(method, params) {
                   let node;
                   while ((node = walker.nextNode())) {
                     const p = node.parentElement;
-                    if (!p) continue;
-                    if (SKIP_TAGS.has(p.tagName) || isInsideSkipped(p) || !isElemVisible(p)) {
+                    const startEl = node.assignedSlot || p;
+                    if (!startEl) continue;
+                    if ((p && SKIP_TAGS.has(p.tagName)) || isInsideSkipped(startEl) || !isFlatVisible(startEl)) {
                       continue;
                     }
                     const chunk = node.nodeValue || '';
@@ -3118,8 +3102,11 @@ async function executeBridgeRpc(method, params) {
           }
           for (const host of allNodes) {
             if (host.hasAttribute && host.hasAttribute('data-chrome-live-hud')) continue;
-            if (host.shadowRoot) {
-              collectDeep(host.shadowRoot, sel, depth + 1, acc);
+            const sr =
+              (typeof Element !== 'undefined' && Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(host)) ||
+              (host.shadowRoot && typeof host.shadowRoot.querySelectorAll === 'function' ? host.shadowRoot : null);
+            if (sr) {
+              collectDeep(sr, sel, depth + 1, acc);
             }
           }
           return acc;
@@ -3177,10 +3164,19 @@ async function executeBridgeRpc(method, params) {
           const SNAP_SKIP_SEL =
             'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
           const isSnapSkipped = (n, stopRoot) => {
-            let cur = n instanceof Element ? n : n?.parentElement;
-            while (cur) {
-              if (cur.isContentEditable || cur.matches?.(SNAP_SKIP_SEL) || cur.closest?.(SNAP_SKIP_SEL)) return true;
-              if (typeof cur.checkVisibility === 'function' && !cur.checkVisibility({ checkVisibilityCSS: true })) {
+            const seen = new Set();
+            let cur = n instanceof Element ? n : n?.assignedSlot || n?.parentElement;
+            let passedStop = false;
+            while (cur && !seen.has(cur)) {
+              seen.add(cur);
+              if (!passedStop && (cur.isContentEditable || cur.matches?.(SNAP_SKIP_SEL) || cur.closest?.(SNAP_SKIP_SEL))) {
+                return true;
+              }
+              if (cur.isContentEditable) return true;
+              if (
+                typeof cur.checkVisibility === 'function' &&
+                !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
+              ) {
                 return true;
               }
               const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
@@ -3194,7 +3190,14 @@ async function executeBridgeRpc(method, params) {
               ) {
                 return true;
               }
-              if (cur === stopRoot) break;
+              if (cur.assignedSlot) {
+                cur = cur.assignedSlot;
+                continue;
+              }
+              if (cur === stopRoot) {
+                passedStop = true;
+                break;
+              }
               const rn = cur.getRootNode?.();
               cur = cur.parentElement || (rn && rn.host ? rn.host : null);
             }
@@ -3206,8 +3209,8 @@ async function executeBridgeRpc(method, params) {
             const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
             let tn;
             while ((tn = tw.nextNode())) {
-              const p = tn.parentElement;
-              if (p && !isSnapSkipped(p, rootNode)) {
+              const startEl = tn.assignedSlot || tn.parentElement;
+              if (startEl && !isSnapSkipped(startEl, rootNode)) {
                 outParts.push(tn.nodeValue || '');
               }
             }
@@ -3301,10 +3304,19 @@ async function executeBridgeRpc(method, params) {
           const ALERT_SKIP_SEL =
             'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
           const isAlertSkipped = (n, stopRoot) => {
-            let cur = n instanceof Element ? n : n?.parentElement;
-            while (cur) {
-              if (cur.isContentEditable || cur.matches?.(ALERT_SKIP_SEL) || cur.closest?.(ALERT_SKIP_SEL)) return true;
-              if (typeof cur.checkVisibility === 'function' && !cur.checkVisibility({ checkVisibilityCSS: true })) {
+            const seen = new Set();
+            let cur = n instanceof Element ? n : n?.assignedSlot || n?.parentElement;
+            let passedStop = false;
+            while (cur && !seen.has(cur)) {
+              seen.add(cur);
+              if (!passedStop && (cur.isContentEditable || cur.matches?.(ALERT_SKIP_SEL) || cur.closest?.(ALERT_SKIP_SEL))) {
+                return true;
+              }
+              if (cur.isContentEditable) return true;
+              if (
+                typeof cur.checkVisibility === 'function' &&
+                !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
+              ) {
                 return true;
               }
               const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
@@ -3318,7 +3330,14 @@ async function executeBridgeRpc(method, params) {
               ) {
                 return true;
               }
-              if (cur === stopRoot) break;
+              if (cur.assignedSlot) {
+                cur = cur.assignedSlot;
+                continue;
+              }
+              if (cur === stopRoot) {
+                passedStop = true;
+                break;
+              }
               const rn = cur.getRootNode?.();
               cur = cur.parentElement || (rn && rn.host ? rn.host : null);
             }
@@ -3328,7 +3347,7 @@ async function executeBridgeRpc(method, params) {
           const aWalker = document.createTreeWalker(aNode, NodeFilter.SHOW_TEXT);
           let aTn;
           while ((aTn = aWalker.nextNode())) {
-            const ap = aTn.parentElement;
+            const ap = aTn.assignedSlot || aTn.parentElement;
             if (ap && !isAlertSkipped(ap, aNode)) {
               cleanAlertParts.push(aTn.nodeValue || '');
             }
@@ -3352,29 +3371,46 @@ async function executeBridgeRpc(method, params) {
         const SKIP_CLOSEST =
           'style, script, noscript, template, textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], [data-chrome-live-hud]';
         const isInsideSkipped = (n) => {
-          let cur = n instanceof Element ? n : n?.parentElement;
-          while (cur) {
+          const seen = new Set();
+          let cur = n instanceof Element ? n : n?.assignedSlot || n?.parentElement;
+          while (cur && !seen.has(cur)) {
+            seen.add(cur);
             if (cur.isContentEditable || cur.matches?.(SKIP_CLOSEST) || cur.closest?.(SKIP_CLOSEST)) return true;
+            if (cur.assignedSlot) {
+              cur = cur.assignedSlot;
+              continue;
+            }
             const rn = cur.getRootNode?.();
-            cur = rn && rn instanceof ShadowRoot ? rn.host : null;
+            cur = cur.parentElement || (rn && rn.host ? rn.host : null);
           }
           return false;
         };
         const visCache = new WeakMap();
-        const isElemVisible = (el) => {
+        const isSingleElemVisible = (el) => {
           if (visCache.has(el)) return visCache.get(el);
           const cs = window.getComputedStyle(el);
           const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue('-webkit-text-security') || '').toLowerCase();
-          let v = (!tSec || tSec === 'none');
-          if (v) {
-            if (typeof el.checkVisibility === 'function') {
-              v = el.checkVisibility({ checkVisibilityCSS: true });
-            } else {
-              v = cs.display !== 'none' && cs.visibility !== 'hidden';
-            }
+          let v = (!tSec || tSec === 'none') && cs.opacity !== '0' && cs.display !== 'none' && cs.visibility !== 'hidden' && cs.visibility !== 'collapse';
+          if (v && typeof el.checkVisibility === 'function') {
+            v = el.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true });
           }
           visCache.set(el, v);
           return v;
+        };
+        const isFlatVisible = (startEl) => {
+          const seen = new Set();
+          let cur = startEl;
+          while (cur && !seen.has(cur)) {
+            seen.add(cur);
+            if (!isSingleElemVisible(cur)) return false;
+            if (cur.assignedSlot) {
+              cur = cur.assignedSlot;
+              continue;
+            }
+            const rn = cur.getRootNode?.();
+            cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+          }
+          return true;
         };
         let excerpt = '';
         if (mainRoot) {
@@ -3384,8 +3420,9 @@ async function executeBridgeRpc(method, params) {
           let tNode;
           while ((tNode = walker.nextNode())) {
             const p = tNode.parentElement;
-            if (!p) continue;
-            if (SKIP_TAGS.has(p.tagName) || isInsideSkipped(p) || !isElemVisible(p)) {
+            const startEl = tNode.assignedSlot || p;
+            if (!startEl) continue;
+            if ((p && SKIP_TAGS.has(p.tagName)) || isInsideSkipped(startEl) || !isFlatVisible(startEl)) {
               continue;
             }
             const v = tNode.nodeValue || '';
@@ -3416,6 +3453,9 @@ async function executeBridgeRpc(method, params) {
 
   if (method === 'click') {
     const target = params.target;
+    if (typeof target !== 'number' && typeof target !== 'string') {
+      throw new Error('[GUARDRAIL] click target must be an element index (number) or selector/label (string)');
+    }
     if (typeof target === 'string') {
       assertSafeModelSelector(target);
     }
@@ -3425,6 +3465,17 @@ async function executeBridgeRpc(method, params) {
 
     const execRes = await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
       func: async (tgt) => {
+        function getOpenShadow(n) {
+          if (!n) return null;
+          try {
+            if (typeof Element !== 'undefined') {
+              const sr = Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(n);
+              if (sr) return sr;
+            }
+          } catch {}
+          return n.shadowRoot && typeof n.shadowRoot.querySelectorAll === 'function' ? n.shadowRoot : null;
+        }
+
         function queryDeep(root, sel, depth = 0) {
           if (!root || depth > 6) return null;
           try {
@@ -3436,8 +3487,9 @@ async function executeBridgeRpc(method, params) {
           const hosts = root.querySelectorAll('*');
           for (const h of hosts) {
             if (h.hasAttribute && h.hasAttribute('data-chrome-live-hud')) continue;
-            if (h.shadowRoot) {
-              const hit = queryDeep(h.shadowRoot, sel, depth + 1);
+            const sr = getOpenShadow(h);
+            if (sr) {
+              const hit = queryDeep(sr, sel, depth + 1);
               if (hit) return hit;
             }
           }
@@ -3451,7 +3503,8 @@ async function executeBridgeRpc(method, params) {
           } catch {}
           for (const h of root.querySelectorAll('*')) {
             if (h.hasAttribute && h.hasAttribute('data-chrome-live-hud')) continue;
-            if (h.shadowRoot) collectDeep(h.shadowRoot, sel, depth + 1, acc);
+            const sr = getOpenShadow(h);
+            if (sr) collectDeep(sr, sel, depth + 1, acc);
           }
           return acc;
         }
@@ -3459,10 +3512,19 @@ async function executeBridgeRpc(method, params) {
         const CLICK_SKIP_SEL =
           'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="searchbox"], [role="combobox"], [role="spinbutton"], .CodeMirror, .cm-editor, .monaco-editor, .ace_editor, .ql-editor, .ProseMirror, [hidden], [aria-hidden="true"], style, script, noscript, template, [data-chrome-live-hud]';
         const isClickSkipped = (n, stopRoot) => {
-          let cur = n instanceof Element ? n : n?.parentElement;
-          while (cur) {
-            if (cur.isContentEditable || cur.matches?.(CLICK_SKIP_SEL) || cur.closest?.(CLICK_SKIP_SEL)) return true;
-            if (typeof cur.checkVisibility === 'function' && !cur.checkVisibility({ checkVisibilityCSS: true })) {
+          const seen = new Set();
+          let cur = n instanceof Element ? n : n?.assignedSlot || n?.parentElement;
+          let passedStop = false;
+          while (cur && !seen.has(cur)) {
+            seen.add(cur);
+            if (!passedStop && (cur.isContentEditable || cur.matches?.(CLICK_SKIP_SEL) || cur.closest?.(CLICK_SKIP_SEL))) {
+              return true;
+            }
+            if (cur.isContentEditable) return true;
+            if (
+              typeof cur.checkVisibility === 'function' &&
+              !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
+            ) {
               return true;
             }
             const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
@@ -3476,7 +3538,14 @@ async function executeBridgeRpc(method, params) {
             ) {
               return true;
             }
-            if (cur === stopRoot) break;
+            if (cur.assignedSlot) {
+              cur = cur.assignedSlot;
+              continue;
+            }
+            if (cur === stopRoot) {
+              passedStop = true;
+              break;
+            }
             const rn = cur.getRootNode?.();
             cur = cur.parentElement || (rn && rn.host ? rn.host : null);
           }
@@ -3489,7 +3558,7 @@ async function executeBridgeRpc(method, params) {
           const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
           let tn;
           while ((tn = tw.nextNode())) {
-            const p = tn.parentElement;
+            const p = tn.assignedSlot || tn.parentElement;
             if (p && !isClickSkipped(p, rootNode)) {
               outParts.push(tn.nodeValue || '');
             }
@@ -3515,8 +3584,8 @@ async function executeBridgeRpc(method, params) {
         if (typeof tgt === 'number') {
           const hit = queryDeep(document, `[data-clive-idx="${tgt}"]`);
           if (isInteractableElement(hit)) el = hit;
-        } else {
-          const raw = String(tgt || '').trim();
+        } else if (typeof tgt === 'string') {
+          const raw = tgt.trim();
           if (raw && /[#.\[\]>:+~=]/.test(raw)) {
             const hit = queryDeep(document, raw);
             if (isInteractableElement(hit)) el = hit;
@@ -3822,6 +3891,12 @@ async function executeBridgeRpc(method, params) {
 
   if (method === 'type') {
     const { target, text, submit } = params;
+    if (typeof target !== 'number' && typeof target !== 'string') {
+      throw new Error('[GUARDRAIL] type target must be an element index (number) or selector/label (string)');
+    }
+    if (typeof text !== 'string') {
+      throw new Error('type text must be a string');
+    }
     if (typeof target === 'string') {
       assertSafeModelSelector(target);
     }
@@ -3831,6 +3906,17 @@ async function executeBridgeRpc(method, params) {
 
     const execRes = await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
       func: async (tgt, val, shouldSubmit) => {
+        function getOpenShadow(n) {
+          if (!n) return null;
+          try {
+            if (typeof Element !== 'undefined') {
+              const sr = Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(n);
+              if (sr) return sr;
+            }
+          } catch {}
+          return n.shadowRoot && typeof n.shadowRoot.querySelectorAll === 'function' ? n.shadowRoot : null;
+        }
+
         function queryDeep(root, sel, depth = 0) {
           if (!root || depth > 6) return null;
           try {
@@ -3841,8 +3927,9 @@ async function executeBridgeRpc(method, params) {
           }
           for (const h of root.querySelectorAll('*')) {
             if (h.hasAttribute && h.hasAttribute('data-chrome-live-hud')) continue;
-            if (h.shadowRoot) {
-              const hit = queryDeep(h.shadowRoot, sel, depth + 1);
+            const sr = getOpenShadow(h);
+            if (sr) {
+              const hit = queryDeep(sr, sel, depth + 1);
               if (hit) return hit;
             }
           }
@@ -3856,7 +3943,8 @@ async function executeBridgeRpc(method, params) {
           } catch {}
           for (const h of root.querySelectorAll('*')) {
             if (h.hasAttribute && h.hasAttribute('data-chrome-live-hud')) continue;
-            if (h.shadowRoot) collectDeep(h.shadowRoot, sel, depth + 1, acc);
+            const sr = getOpenShadow(h);
+            if (sr) collectDeep(sr, sel, depth + 1, acc);
           }
           return acc;
         }
@@ -3902,14 +3990,19 @@ async function executeBridgeRpc(method, params) {
               const tw = document.createTreeWalker(lbl, NodeFilter.SHOW_TEXT);
               let tn;
               while ((tn = tw.nextNode())) {
-                let cur = tn.parentElement;
+                let cur = tn.assignedSlot || tn.parentElement;
                 let blocked = false;
-                while (cur) {
+                const seen = new Set();
+                while (cur && !seen.has(cur)) {
+                  seen.add(cur);
                   if (cur.isContentEditable || cur.matches?.(skipSel) || cur.closest?.(skipSel)) {
                     blocked = true;
                     break;
                   }
-                  if (typeof cur.checkVisibility === 'function' && !cur.checkVisibility({ checkVisibilityCSS: true })) {
+                  if (
+                    typeof cur.checkVisibility === 'function' &&
+                    !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
+                  ) {
                     blocked = true;
                     break;
                   }
@@ -3918,6 +4011,10 @@ async function executeBridgeRpc(method, params) {
                   if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0' || (tSec && tSec !== 'none')) {
                     blocked = true;
                     break;
+                  }
+                  if (cur.assignedSlot) {
+                    cur = cur.assignedSlot;
+                    continue;
                   }
                   if (cur === lbl) break;
                   const rn = cur.getRootNode?.();
@@ -3955,172 +4052,22 @@ async function executeBridgeRpc(method, params) {
           }
         }
 
-        // Drill into inner native input/textarea if target matched a wrapper custom element (while preserving outer host metadata!)
-        const outerMatchedEl = el;
+        // Drill into inner native input/textarea if target matched a wrapper custom element
         if (
           el &&
           !(el instanceof HTMLInputElement) &&
           !(el instanceof HTMLTextAreaElement) &&
           !el.isContentEditable
         ) {
+          const openSr = getOpenShadow(el);
           const inner =
-            (el.shadowRoot &&
-              el.shadowRoot.querySelector('input, textarea, [contenteditable]:not([contenteditable="false"])')) ||
+            (openSr &&
+              openSr.querySelector('input, textarea, [contenteditable]:not([contenteditable="false"])')) ||
             el.querySelector?.('input, textarea, [contenteditable]:not([contenteditable="false"])');
           if (inner) el = inner;
         }
 
         if (!el) return { ok: false, error: `Input element not found: ${tgt}` };
-        const elStyle = window.getComputedStyle(el);
-        const elTextSec = String(elStyle.webkitTextSecurity || elStyle.getPropertyValue('-webkit-text-security') || '').toLowerCase();
-        // Detect 4..8 single-character split OTP/PIN input boxes (up to 6 hops & across sibling open ShadowRoots)
-        const countSplitOtpDigits = (root, d = 0) => {
-          if (!root || d > 3 || typeof root.querySelectorAll !== 'function') return 0;
-          let count = root.querySelectorAll('input[maxlength="1"]').length;
-          if (count >= 4) return count;
-          for (const sub of root.querySelectorAll('*')) {
-            if (sub.shadowRoot) {
-              count += countSplitOtpDigits(sub.shadowRoot, d + 1);
-              if (count >= 4) return count;
-            }
-          }
-          return count;
-        };
-        let isSplitOtpInput = false;
-        const isInputNode =
-          el instanceof HTMLInputElement || String(el.tagName || '').toLowerCase() === 'input';
-        if (isInputNode && (el.maxLength === 1 || Number(el.getAttribute?.('maxlength')) === 1)) {
-          let grp = el.parentElement || (el.getRootNode?.()?.host ? el.getRootNode() : null);
-          for (let gHop = 0; gHop < 6 && grp; gHop++) {
-            if (countSplitOtpDigits(grp) >= 4) {
-              isSplitOtpInput = true;
-              break;
-            }
-            grp = grp.parentElement || (grp.getRootNode?.()?.host ?? null);
-          }
-        }
-        const elMetaBucket = [];
-        const elAutoBucket = [];
-        const seenAncestors = new Set();
-        const readNodeTextAndSlots = (n) => {
-          if (!n) return '';
-          const parts = [n.textContent || ''];
-          if (typeof n.querySelectorAll === 'function') {
-            for (const sl of n.querySelectorAll('slot')) {
-              if (typeof sl.assignedNodes === 'function') {
-                for (const an of sl.assignedNodes({ flatten: true })) {
-                  if (an && an.textContent) parts.push(an.textContent);
-                }
-              }
-            }
-          }
-          return parts.join(' ');
-        };
-        const collectFromNode = (node, hop = 0) => {
-          if (!node || typeof node.getAttribute !== 'function' || seenAncestors.has(node)) return;
-          seenAncestors.add(node);
-          if (node.tagName && String(node.tagName).includes('-')) {
-            elLabelPush(String(node.tagName));
-          }
-          elAutoBucket.push(node.getAttribute('autocomplete') || '');
-          elMetaBucket.push(
-            node.getAttribute('name'),
-            node.id,
-            node.getAttribute('placeholder'),
-            node.getAttribute('aria-label'),
-            node.getAttribute('title')
-          );
-          if (node.labels) {
-            for (const lb of Array.from(node.labels)) elLabelPush(readNodeTextAndSlots(lb));
-          }
-          const wLb = node.closest?.('label');
-          if (wLb) elLabelPush(readNodeTextAndSlots(wLb));
-          const labelledBy = node.getAttribute('aria-labelledby') || '';
-          const rootObj = node.getRootNode?.();
-          for (const lid of labelledBy.split(/\s+/).filter(Boolean)) {
-            const lNode =
-              (rootObj && typeof rootObj.getElementById === 'function' ? rootObj.getElementById(lid) : null) ||
-              document.getElementById(lid);
-            if (lNode) elLabelPush(readNodeTextAndSlots(lNode));
-          }
-          // Capture named & unnamed light-DOM slotted labels on Web Component hosts (`<otp-input><span>短信验证码</span></otp-input>`)
-          if (node.shadowRoot) {
-            if (typeof node.shadowRoot.querySelectorAll === 'function') {
-              for (const sl of node.shadowRoot.querySelectorAll('slot')) {
-                if (typeof sl.assignedNodes === 'function') {
-                  for (const an of sl.assignedNodes({ flatten: true })) {
-                    const hasCtrl =
-                      typeof an?.querySelector === 'function' &&
-                      Boolean(an.querySelector('input, textarea, select, [contenteditable="true"]'));
-                    if (!hasCtrl) {
-                      const sTxt = String(an?.textContent || '').trim();
-                      if (sTxt.length > 0 && sTxt.length <= 64) elLabelPush(sTxt);
-                    }
-                  }
-                }
-              }
-            }
-            const hostKids = node.childNodes || node.children;
-            if (hostKids && typeof hostKids[Symbol.iterator] === 'function') {
-              for (const child of hostKids) {
-                const hasCtrl =
-                  typeof child?.querySelector === 'function' &&
-                  Boolean(child.querySelector('input, textarea, select, [contenteditable="true"]'));
-                if (!hasCtrl) {
-                  const cTxt = String(child?.textContent || '').trim();
-                  if (cTxt.length > 0 && cTxt.length <= 64) elLabelPush(cTxt);
-                }
-              }
-            }
-          }
-          // Harvest adjacent preceding label siblings inside UI form rows (AntD / ElementPlus / Tailwind) without bleeding from prior input rows
-          if (hop <= 4) {
-            let sib = node.previousElementSibling;
-            for (let sHop = 0; sHop < 4 && sib; sHop++, sib = sib.previousElementSibling) {
-              const hasOtherInput =
-                typeof sib.querySelector === 'function' &&
-                Boolean(sib.querySelector('input, textarea, select, [contenteditable="true"]'));
-              if (!hasOtherInput) {
-                const sibTxt = String(readNodeTextAndSlots(sib) || '').trim();
-                if (sibTxt.length > 0 && sibTxt.length <= 64) {
-                  elLabelPush(sibTxt);
-                }
-              }
-            }
-          }
-        };
-        function elLabelPush(txt) {
-          if (txt) elMetaBucket.push(txt);
-        }
-        let walkNode = el;
-        for (let hop = 0; hop < 8 && walkNode; hop++) {
-          collectFromNode(walkNode, hop);
-          const rn = walkNode.getRootNode?.();
-          walkNode = walkNode.parentElement || (rn && rn.host ? rn.host : null);
-        }
-        if (typeof outerMatchedEl !== 'undefined' && outerMatchedEl) {
-          collectFromNode(outerMatchedEl, 0);
-        }
-        const elAuto = elAutoBucket.join(' ').toLowerCase();
-        const rawMetaHints = elMetaBucket.filter(Boolean).join(' ');
-        const decamelMetaHints = rawMetaHints
-          .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
-          .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2');
-        if (
-          isSplitOtpInput ||
-          (isInputNode && String(el.type || '').toLowerCase() === 'password') ||
-          (elTextSec && elTextSec !== 'none') ||
-          /(?:password|one-time-code|cc-number|cc-csc|cc-exp)/i.test(elAuto) ||
-          /(?:passw(?:or)?d|passcode|one[-_\s]?time|verif(?:y|ication)[-_\s]*(?:code|input|token|num)?|security[-_\s]*(?:code|key|token)|auth(?:entication)?[-_\s]*(?:code|token|key)|sms[-_\s]*(?:code|input|otp|token)|login[-_\s]*code|dynamic[-_\s]*code|card[-_\s]*(?:number|num|no)|api[-_\s]*key|access[-_\s]*(?:key|token)|private[-_\s]*key|client[-_\s]*secret|secret[-_\s]*(?:key|token|code)?|captcha|(?:^|[^a-zA-Z])(?:otp|totp|2fa|mfa|cvv|cvc|csc|pwd|pin|apikey|secret|token)(?:$|[^a-zA-Z])|密码|口令|验证码|动态码|安全码|校验码|密钥|私钥|令牌)/i.test(
-            decamelMetaHints
-          )
-        ) {
-          return {
-            ok: false,
-            error:
-              '[GUARDRAIL] Automated typing into password, OTP, or payment security fields is blocked; use Pause / Popout to enter credentials manually in Chrome'
-          };
-        }
         el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
         const rect = el.getBoundingClientRect();
         const jx = ((Math.random() + Math.random()) / 2 - 0.5) * Math.min(rect.width * 0.3, 24);
@@ -4269,18 +4216,43 @@ async function executeBridgeRpc(method, params) {
           tInputType === 'search';
         const extractSafeLabelNode = (lblNode) => {
           if (!lblNode) return '';
+          const skipSel =
+            'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [hidden], [aria-hidden="true"], style, script, noscript, template';
           const parts = [];
           const tw = document.createTreeWalker(lblNode, NodeFilter.SHOW_TEXT);
           let tn;
           while ((tn = tw.nextNode())) {
-            const p = tn.parentElement;
-            if (
-              p &&
-              !p.isContentEditable &&
-              !p.closest(
-                'textarea, select, input, [contenteditable]:not([contenteditable="false"]), [hidden], [aria-hidden="true"], style, script'
-              )
-            ) {
+            let cur = tn.assignedSlot || tn.parentElement;
+            let blocked = false;
+            const seen = new Set();
+            while (cur && !seen.has(cur)) {
+              seen.add(cur);
+              if (cur.isContentEditable || cur.matches?.(skipSel) || cur.closest?.(skipSel)) {
+                blocked = true;
+                break;
+              }
+              if (
+                typeof cur.checkVisibility === 'function' &&
+                !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
+              ) {
+                blocked = true;
+                break;
+              }
+              const cs = (cur.ownerDocument?.defaultView || window).getComputedStyle(cur);
+              const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue?.('-webkit-text-security') || '').toLowerCase();
+              if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0' || (tSec && tSec !== 'none')) {
+                blocked = true;
+                break;
+              }
+              if (cur.assignedSlot) {
+                cur = cur.assignedSlot;
+                continue;
+              }
+              if (cur === lblNode) break;
+              const rn = cur.getRootNode?.();
+              cur = cur.parentElement || (rn && rn.host ? rn.host : null);
+            }
+            if (!blocked) {
               parts.push(tn.nodeValue || '');
             }
           }
@@ -4363,6 +4335,14 @@ async function executeBridgeRpc(method, params) {
   if (method === 'upload') {
     const files = Array.isArray(params.files) ? params.files : [];
     if (files.length === 0) throw new Error('upload requires at least one file path');
+    if (
+      params.target !== undefined &&
+      params.target !== null &&
+      typeof params.target !== 'number' &&
+      typeof params.target !== 'string'
+    ) {
+      throw new Error('[GUARDRAIL] upload target must be a number or string');
+    }
     if (typeof params.target === 'string') {
       assertSafeModelSelector(params.target);
     }
@@ -4407,6 +4387,17 @@ async function executeBridgeRpc(method, params) {
     } catch {}
 
     const locateExpr = `((tgt, fileExts) => {
+      function getOpenShadow(n) {
+        if (!n) return null;
+        try {
+          if (typeof Element !== 'undefined') {
+            const sr = Object.getOwnPropertyDescriptor(Element.prototype, 'shadowRoot')?.get?.call(n);
+            if (sr) return sr;
+          }
+        } catch {}
+        return n.shadowRoot && typeof n.shadowRoot.querySelectorAll === 'function' ? n.shadowRoot : null;
+      }
+
       function queryDeep(root, sel, depth = 0) {
         if (!root || depth > 6) return null;
         try {
@@ -4417,8 +4408,9 @@ async function executeBridgeRpc(method, params) {
         }
         for (const h of root.querySelectorAll('*')) {
           if (h.hasAttribute && h.hasAttribute('data-chrome-live-hud')) continue;
-          if (h.shadowRoot) {
-            const sub = queryDeep(h.shadowRoot, sel, depth + 1);
+          const sr = getOpenShadow(h);
+          if (sr) {
+            const sub = queryDeep(sr, sel, depth + 1);
             if (sub) return sub;
           }
         }
@@ -4432,7 +4424,8 @@ async function executeBridgeRpc(method, params) {
         } catch {}
         for (const h of root.querySelectorAll('*')) {
           if (h.hasAttribute && h.hasAttribute('data-chrome-live-hud')) continue;
-          if (h.shadowRoot) collectDeep(h.shadowRoot, sel, depth + 1, acc);
+          const sr = getOpenShadow(h);
+          if (sr) collectDeep(sr, sel, depth + 1, acc);
         }
         return acc;
       }
@@ -4444,8 +4437,9 @@ async function executeBridgeRpc(method, params) {
           const byFor = queryDeep(document, '#' + CSS.escape(node.htmlFor));
           if (byFor && byFor.tagName === 'INPUT' && String(byFor.type).toLowerCase() === 'file') return byFor;
         }
+        const openSr = getOpenShadow(node);
         const inner =
-          (node.shadowRoot && node.shadowRoot.querySelector('input[type="file"]:not(:disabled)')) ||
+          (openSr && openSr.querySelector('input[type="file"]:not(:disabled)')) ||
           (node.querySelector && node.querySelector('input[type="file"]:not(:disabled)'));
         if (inner) return inner;
         let cur = node.parentElement;
@@ -4476,14 +4470,19 @@ async function executeBridgeRpc(method, params) {
             const tw = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
             let tn;
             while ((tn = tw.nextNode())) {
-              let cur = tn.parentElement;
+              let cur = tn.assignedSlot || tn.parentElement;
               let blocked = false;
-              while (cur) {
+              const seen = new Set();
+              while (cur && !seen.has(cur)) {
+                seen.add(cur);
                 if (cur.isContentEditable || cur.matches?.(skipSel) || cur.closest?.(skipSel)) {
                   blocked = true;
                   break;
                 }
-                if (typeof cur.checkVisibility === 'function' && !cur.checkVisibility({ checkVisibilityCSS: true })) {
+                if (
+                  typeof cur.checkVisibility === 'function' &&
+                  !cur.checkVisibility({ checkVisibilityCSS: true, checkOpacity: true })
+                ) {
                   blocked = true;
                   break;
                 }
@@ -4492,6 +4491,10 @@ async function executeBridgeRpc(method, params) {
                 if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0' || (tSec && tSec !== 'none')) {
                   blocked = true;
                   break;
+                }
+                if (cur.assignedSlot) {
+                  cur = cur.assignedSlot;
+                  continue;
                 }
                 if (cur === node) break;
                 const rn = cur.getRootNode?.();
@@ -4770,10 +4773,15 @@ async function executeBridgeRpc(method, params) {
   }
 
   if (method === 'navigate') {
-    const url = String(params.url || '').trim();
+    if (typeof params.url !== 'string' || !params.url.trim()) {
+      throw new Error('[GUARDRAIL] URL parameter must be a non-empty string');
+    }
+    const url = params.url.trim();
     const safety = checkTabUrlAllowed(url);
     if (!safety.allowed) throw new Error(`[GUARDRAIL] ${safety.reason}`);
     await verifyEntryStillControllable(entry);
+    // Pre-stop any active screencast BEFORE navigating so transitional frames on pages embedding protected frames are never streamed
+    await stopCdpForTab(entry.tabId, entry);
     entry.activity = tr().navigating;
     await chrome.tabs.update(entry.tabId, { url });
     await waitForTabComplete(entry.tabId, 15000);
@@ -5027,9 +5035,9 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 
 async function autoMergeClosedRelayTab(closedEntry) {
   const restoreUrl = typeof closedEntry?.url === 'string' ? closedEntry.url.trim() : '';
-  if (!/^https?:\/\//i.test(restoreUrl)) return;
+  if (!/^https?:\/\//i.test(restoreUrl)) return false;
   const safety = checkTabUrlAllowed(restoreUrl);
-  if (!safety.allowed) return;
+  if (!safety.allowed) return false;
 
   const prevOriginWinId = closedEntry.originWindowId;
   const prevOriginIndex = closedEntry.originIndex;
@@ -5048,7 +5056,7 @@ async function autoMergeClosedRelayTab(closedEntry) {
     const fallbackWin = allNormal.find((w) => w.id !== prevRelayWinId);
     if (fallbackWin) targetWindowId = fallbackWin.id;
   }
-  if (targetWindowId === null) return;
+  if (targetWindowId === null) return false;
 
   let targetIndex;
   if (typeof prevOriginIndex === 'number' && prevOriginIndex >= 0) {
@@ -5064,7 +5072,7 @@ async function autoMergeClosedRelayTab(closedEntry) {
   if (typeof targetIndex === 'number') createProps.index = targetIndex;
 
   const created = await chrome.tabs.create(createProps).catch(() => null);
-  if (!created || typeof created.id !== 'number') return;
+  if (!created || typeof created.id !== 'number') return false;
 
   const isWorker = closedEntry.substate === 'worker';
   if (isWorker) {
@@ -5102,17 +5110,17 @@ async function autoMergeClosedRelayTab(closedEntry) {
 
   await waitForTabComplete(created.id, 12000).catch(() => {});
   const updatedTab = await chrome.tabs.get(created.id).catch(() => null);
-  if (!updatedTab || !managedTabs.has(created.id)) return;
+  if (!updatedTab || !managedTabs.has(created.id)) return true;
 
   const postSafety = checkTabUrlAllowed(updatedTab.url || '');
   if (!postSafety.allowed) {
     await detachManagedTab(created.id, postSafety.reason, true);
-    return;
+    return true;
   }
   const postFrameSafety = await inspectEmbeddedFramesSafety(created.id);
   if (!postFrameSafety.allowed) {
     await detachManagedTab(created.id, postFrameSafety.reason, true);
-    return;
+    return true;
   }
 
   restoredEntry.title = updatedTab.title || restoredEntry.title;
@@ -5130,6 +5138,7 @@ async function autoMergeClosedRelayTab(closedEntry) {
     paused: true
   });
   notifyPanelAndDaemon();
+  return true;
 }
 
 chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
@@ -5142,15 +5151,11 @@ chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
       (removeInfo?.isWindowClosing || removeInfo?.windowId === entry.relayPopoutWinId);
     managedTabs.delete(tabId);
     if (shouldAutoMergeRelay) {
-      autoMergeClosedRelayTab(entry).catch(() => {
-        rememberDetachedTab(tabId, 'Tab closed', false);
-        syncLiveTabGroups();
-        notifyPanelAndDaemon();
-      });
-      return;
+      const merged = await autoMergeClosedRelayTab(entry).catch(() => false);
+      if (merged) return;
     }
     rememberDetachedTab(tabId, 'Tab closed', false);
-    syncLiveTabGroups();
+    await syncLiveTabGroups();
     notifyPanelAndDaemon();
   }
 });
@@ -5397,6 +5402,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const entry = managedTabs.get(msg.tabId);
         await pollHudUserEvents(entry.tabId, entry);
         if (!managedTabs.has(msg.tabId)) {
+          sendResponse({ ok: true });
+          return;
+        }
+        if (entry.paused && entry.relayPopoutWinId) {
+          await mergeRelayTabBack(entry, { resumedByUserInBrowser: true });
+          await persistSessionState();
           sendResponse({ ok: true });
           return;
         }

@@ -58,12 +58,7 @@ export const DEFAULT_BLOCKED_DOMAINS = Object.freeze([
   'boc.cn',
   'cmbchina.com',
   'psbc.com',
-  'bankcomm.com',
-  // Cloud billing & root credential consoles
-  'console.aws.amazon.com',
-  'console.cloud.google.com',
-  'portal.azure.com',
-  'dash.cloudflare.com'
+  'bankcomm.com'
 ]);
 
 const CHECKOUT_SEGMENT_RX =
@@ -215,6 +210,11 @@ function scrubQueryStringTokens(rawQueryWithQuestionMark, depth = 0) {
     }
     const rawK = pair.slice(0, eq);
     const rawV = pair.slice(eq + 1);
+    if ((rawV === '' || /^=+$/.test(rawV)) && isHighEntropyPathToken(rawK, { splitMatrix: false })) {
+      tokens[i] = 'REDACTED';
+      changed = true;
+      continue;
+    }
     let decK = rawK;
     try {
       decK = decodeURIComponent(rawK.replace(/\+/g, ' '));
@@ -287,12 +287,15 @@ function canonicalizePathForGuardrail(rawSegment, splitRawQuery = false) {
   for (const rawPiece of normalizedSlashes.split('/')) {
     const cleanPiece = rawPiece.split(';')[0];
     if (!cleanPiece || cleanPiece === '.') continue;
-    rawPieces.push(cleanPiece);
     if (cleanPiece === '..') {
+      rawPieces.push('..');
       stack.pop();
       continue;
     }
-    stack.push(cleanPiece);
+    const strippedPiece = cleanPiece.replace(/\.+$/, '');
+    if (!strippedPiece) continue;
+    rawPieces.push(strippedPiece);
+    stack.push(strippedPiece);
   }
   return {
     ok: true,
@@ -345,16 +348,29 @@ export function redactUrlForAudit(rawUrl, depth = 0) {
       const rawHashBody = parsed.hash.slice(hashPrefix.length);
       let cleanedHash = parsed.hash;
 
-      if (
-        rawHashBody &&
+      const hashNoPad = rawHashBody.replace(/=+$/, '');
+      const isBareSingleToken =
+        Boolean(rawHashBody) &&
         !rawHashBody.includes('/') &&
         !rawHashBody.includes('?') &&
         !rawHashBody.includes('&') &&
-        !rawHashBody.includes('=') &&
         !rawHashBody.includes('#') &&
-        (isHighEntropyPathToken(rawHashBody, { splitMatrix: false }) ||
-          /^(?:eyJ[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{32,})$/.test(rawHashBody))
-      ) {
+        !hashNoPad.includes('=') &&
+        (isHighEntropyPathToken(hashNoPad, { splitMatrix: false }) ||
+          /^(?:eyJ[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{32,})$/.test(rawHashBody));
+      const isBareSlashBase64Token =
+        Boolean(rawHashBody) &&
+        !rawHashBody.startsWith('/') &&
+        rawHashBody.includes('/') &&
+        !rawHashBody.includes('?') &&
+        !rawHashBody.includes('&') &&
+        !rawHashBody.includes('#') &&
+        !hashNoPad.includes('=') &&
+        rawHashBody.length >= 32 &&
+        /^[A-Za-z0-9+/]+=*$/.test(rawHashBody) &&
+        (/[+=]/.test(rawHashBody) || (/\d/.test(rawHashBody) && /[A-Z]/.test(rawHashBody) && /[a-z]/.test(rawHashBody)));
+
+      if (isBareSingleToken || isBareSlashBase64Token) {
         cleanedHash = `${hashPrefix}REDACTED`;
       } else if (
         !rawHashBody.startsWith('/') &&
@@ -438,6 +454,15 @@ function splitBalancedUrlSuffix(rawMatch) {
         continue;
       }
     }
+    if (ch === '}') {
+      const sub = rawMatch.slice(0, end);
+      const opens = (sub.match(/\{/g) || []).length;
+      const closes = (sub.match(/\}/g) || []).length;
+      if (closes > opens) {
+        end--;
+        continue;
+      }
+    }
     break;
   }
   return { coreUrl: rawMatch.slice(0, end), suffix: rawMatch.slice(end) };
@@ -445,7 +470,7 @@ function splitBalancedUrlSuffix(rawMatch) {
 
 export function redactUrlsInText(rawText) {
   if (typeof rawText !== 'string' || !/https?:\/\//i.test(rawText)) return rawText;
-  return rawText.replace(/https?:\/\/[^\s"'<>]+/gi, (match) => {
+  return rawText.replace(/https?:\/\/[^\s"'<>`\u3000-\u303f\uff00-\uffef\u4e00-\u9fff]+/gi, (match) => {
     const { coreUrl, suffix } = splitBalancedUrlSuffix(match);
     return redactUrlForAudit(coreUrl) + suffix;
   });
@@ -585,7 +610,7 @@ export function getDefaultUploadStagingDir(stateDirOverride = '') {
   return path.join(base, 'uploads');
 }
 
-function parseAllowedUploadDirs(explicitDirs, stateDirOverride = '') {
+function parseAllowedUploadDirEntries(explicitDirs, stateDirOverride = '') {
   let rawList;
   if (Array.isArray(explicitDirs)) {
     rawList = explicitDirs;
@@ -594,23 +619,23 @@ function parseAllowedUploadDirs(explicitDirs, stateDirOverride = '') {
   } else {
     rawList = [];
   }
-  const dirs = [];
+  const entries = [];
   for (const raw of rawList) {
     const trimmed = expandLeadingTilde(String(raw || ''));
     if (!trimmed) continue;
     const abs = path.resolve(trimmed);
-    dirs.push(resolveCanonicalPath(abs));
+    entries.push({ rawDir: abs, canonDir: resolveCanonicalPath(abs) });
   }
   // Strict Fail-Closed: if explicitDirs or CHROME_LIVE_UPLOAD_DIR resolves to zero valid directories
   // (e.g. ";" or empty array), always fall back to the isolated default staging directory.
-  if (dirs.length === 0) {
-    const defaultDir = getDefaultUploadStagingDir(stateDirOverride);
+  if (entries.length === 0) {
+    const defaultDir = path.resolve(getDefaultUploadStagingDir(stateDirOverride));
     try {
       fs.mkdirSync(defaultDir, { recursive: true, mode: 0o700 });
     } catch {}
-    dirs.push(resolveCanonicalPath(path.resolve(defaultDir)));
+    entries.push({ rawDir: defaultDir, canonDir: resolveCanonicalPath(defaultDir) });
   }
-  return dirs;
+  return entries;
 }
 
 export function isNetworkUncPath(rawPath) {
@@ -662,7 +687,7 @@ export function evaluateUploadFileSafety(rawFilePath, options = {}) {
   const realPath = resolveCanonicalPath(resolvedPath);
 
   const effectiveStateDir = options.stateDir ? path.resolve(String(options.stateDir)) : getStateDir();
-  const allowedDirs = parseAllowedUploadDirs(options.allowedDirs, effectiveStateDir);
+  const allowedEntries = parseAllowedUploadDirEntries(options.allowedDirs, effectiveStateDir);
   // Check sensitive filename/directory patterns UNCONDITIONALLY (including `.aws/config`, `.ssh/config`, `.docker/config.json` inside `uploads/`!),
   // while blocking files inside `effectiveStateDir` outside its `uploads/` subdirectory.
   const defaultUploadsDir = resolveCanonicalPath(path.resolve(getDefaultUploadStagingDir(effectiveStateDir)));
@@ -696,8 +721,8 @@ export function evaluateUploadFileSafety(rawFilePath, options = {}) {
     }
   }
 
-  const insideAllowed = allowedDirs.some((dir) => isPathInsideDir(realPath, dir));
-  if (!insideAllowed) {
+  const matchedEntry = allowedEntries.find((e) => isPathInsideDir(realPath, e.canonDir));
+  if (!matchedEntry) {
     return {
       allowed: false,
       code: 'UPLOAD_DIR_RESTRICTED',
@@ -705,9 +730,73 @@ export function evaluateUploadFileSafety(rawFilePath, options = {}) {
     };
   }
 
+  // Reject symbolic links and Windows directory junctions anywhere along the upload path (even when pointing inside the same allowed directory!)
+  let relSub = '';
+  if (isPathInsideDir(resolvedPath, matchedEntry.rawDir)) {
+    relSub = path.relative(matchedEntry.rawDir, resolvedPath);
+  } else if (isPathInsideDir(resolvedPath, matchedEntry.canonDir)) {
+    relSub = path.relative(matchedEntry.canonDir, resolvedPath);
+  } else {
+    return {
+      allowed: false,
+      code: 'SYMLINK_BLOCKED',
+      reason: 'Uploading symbolic links or junctions is blocked by local guardrails'
+    };
+  }
+
+  const nativeRealpath = fs.realpathSync.native || fs.realpathSync;
+  const subSegments = relSub.split(path.sep).filter(Boolean);
+  let walkCur = matchedEntry.canonDir;
+  for (const seg of subSegments) {
+    walkCur = path.join(walkCur, seg);
+    let segStat = null;
+    try {
+      segStat = fs.lstatSync(walkCur);
+    } catch {
+      // Non-existent final target is caught by fs.openSync in daemon prepareUploadParams
+      break;
+    }
+    if (segStat.isSymbolicLink()) {
+      return {
+        allowed: false,
+        code: 'SYMLINK_BLOCKED',
+        reason: 'Uploading symbolic links is blocked by local guardrails'
+      };
+    }
+    try {
+      const segReal = nativeRealpath(walkCur);
+      const sameTarget =
+        process.platform === 'win32'
+          ? segReal.toLowerCase() === walkCur.toLowerCase()
+          : segReal === walkCur;
+      if (!sameTarget) {
+        return {
+          allowed: false,
+          code: 'SYMLINK_BLOCKED',
+          reason: 'Uploading symbolic links or junctions is blocked by local guardrails'
+        };
+      }
+    } catch {
+      return {
+        allowed: false,
+        code: 'SYMLINK_BLOCKED',
+        reason: 'Uploading broken symbolic links is blocked by local guardrails'
+      };
+    }
+  }
+
+  const verifiedNonSymlinkPath = path.join(matchedEntry.canonDir, relSub);
+
   // Block multi-hardlink files (e.g. `mklink /H` or `fs.linkSync` pointing an innocent staging filename at a secret file)
   try {
-    const st = fs.statSync(realPath);
+    const st = fs.lstatSync(verifiedNonSymlinkPath);
+    if (st.isSymbolicLink()) {
+      return {
+        allowed: false,
+        code: 'SYMLINK_BLOCKED',
+        reason: 'Uploading symbolic links is blocked by local guardrails'
+      };
+    }
     if (st.isFile() && typeof st.nlink === 'number' && st.nlink > 1) {
       return {
         allowed: false,
@@ -719,5 +808,5 @@ export function evaluateUploadFileSafety(rawFilePath, options = {}) {
     // Non-existent file paths are caught by stat/open in daemon prepareUploadParams
   }
 
-  return { allowed: true, code: 'OK', reason: '', resolvedPath: realPath };
+  return { allowed: true, code: 'OK', reason: '', resolvedPath: verifiedNonSymlinkPath };
 }

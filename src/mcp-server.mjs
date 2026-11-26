@@ -799,24 +799,37 @@ async function invokeTool(toolName, args, callDaemon) {
     }
     case 'chrome_live_status':
       return await callDaemon('GET', '/api/health');
-    case 'chrome_live_open':
+    case 'chrome_live_open': {
+      if (typeof args?.url !== 'string' || !args.url.trim()) {
+        throw new Error('chrome_live_open requires a non-empty url string');
+      }
       return await callDaemon('POST', '/api/command', {
         method: 'open',
         params: {
           url: args.url,
-          label: args.label || '',
+          label: typeof args.label === 'string' ? args.label : '',
           background: args.background !== false
         }
       });
+    }
     case 'chrome_live_snapshot':
+      if (args?.tabId !== undefined && args?.tabId !== null && (!Number.isSafeInteger(args.tabId) || args.tabId <= 0)) {
+        throw new Error('tabId must be a positive integer');
+      }
       return await callDaemon('POST', '/api/command', {
         method: 'snapshot',
         params: {
-          tabId: args.tabId,
-          maxItems: args.maxItems || 90
+          tabId: args?.tabId,
+          maxItems: args?.maxItems || 90
         }
       });
     case 'chrome_live_click':
+      if (typeof args?.target !== 'number' && typeof args?.target !== 'string') {
+        throw new Error('chrome_live_click target must be an element index (number) or selector/label (string)');
+      }
+      if (args?.tabId !== undefined && args?.tabId !== null && (!Number.isSafeInteger(args.tabId) || args.tabId <= 0)) {
+        throw new Error('tabId must be a positive integer');
+      }
       return await callDaemon('POST', '/api/command', {
         method: 'click',
         params: {
@@ -825,6 +838,15 @@ async function invokeTool(toolName, args, callDaemon) {
         }
       });
     case 'chrome_live_type':
+      if (typeof args?.target !== 'number' && typeof args?.target !== 'string') {
+        throw new Error('chrome_live_type target must be an element index (number) or selector/label (string)');
+      }
+      if (typeof args?.text !== 'string') {
+        throw new Error('chrome_live_type text must be a string');
+      }
+      if (args?.tabId !== undefined && args?.tabId !== null && (!Number.isSafeInteger(args.tabId) || args.tabId <= 0)) {
+        throw new Error('tabId must be a positive integer');
+      }
       return await callDaemon('POST', '/api/command', {
         method: 'type',
         params: {
@@ -834,25 +856,45 @@ async function invokeTool(toolName, args, callDaemon) {
           tabId: args.tabId
         }
       });
-    case 'chrome_live_upload':
+    case 'chrome_live_upload': {
+      const upTarget = args?.target ?? 'auto';
+      if (typeof upTarget !== 'number' && typeof upTarget !== 'string') {
+        throw new Error('chrome_live_upload target must be a number or string');
+      }
+      if (!Array.isArray(args?.files) || args.files.length === 0 || args.files.some((f) => typeof f !== 'string')) {
+        throw new Error('chrome_live_upload files must be a non-empty array of file path strings');
+      }
+      if (args?.tabId !== undefined && args?.tabId !== null && (!Number.isSafeInteger(args.tabId) || args.tabId <= 0)) {
+        throw new Error('tabId must be a positive integer');
+      }
       return await callDaemon('POST', '/api/command', {
         method: 'upload',
         params: {
-          target: args.target ?? 'auto',
+          target: upTarget,
           files: args.files,
           tabId: args.tabId
         }
       });
+    }
     case 'chrome_live_scroll':
+      if (args?.tabId !== undefined && args?.tabId !== null && (!Number.isSafeInteger(args.tabId) || args.tabId <= 0)) {
+        throw new Error('tabId must be a positive integer');
+      }
       return await callDaemon('POST', '/api/command', {
         method: 'scroll',
         params: {
-          direction: args.direction || 'down',
-          amount: args.amount || 600,
-          tabId: args.tabId
+          direction: args?.direction || 'down',
+          amount: args?.amount || 600,
+          tabId: args?.tabId
         }
       });
     case 'chrome_live_navigate':
+      if (typeof args?.url !== 'string' || !args.url.trim()) {
+        throw new Error('chrome_live_navigate requires a non-empty url string');
+      }
+      if (args?.tabId !== undefined && args?.tabId !== null && (!Number.isSafeInteger(args.tabId) || args.tabId <= 0)) {
+        throw new Error('tabId must be a positive integer');
+      }
       return await callDaemon('POST', '/api/command', {
         method: 'navigate',
         params: {
@@ -861,6 +903,9 @@ async function invokeTool(toolName, args, callDaemon) {
         }
       });
     case 'chrome_live_extract':
+      if (!Array.isArray(args?.urls) || args.urls.length === 0 || args.urls.some((u) => typeof u !== 'string')) {
+        throw new Error('chrome_live_extract requires a non-empty array of url strings');
+      }
       return await callDaemon('POST', '/api/command', {
         method: 'extract',
         params: {
@@ -881,14 +926,29 @@ async function invokeTool(toolName, args, callDaemon) {
         'snapshot',
         'done'
       ]);
+      if (args?.tabId !== undefined && args?.tabId !== null && (!Number.isSafeInteger(args.tabId) || args.tabId <= 0)) {
+        throw new Error('tabId must be a positive integer');
+      }
       if (!Array.isArray(args?.steps) || args.steps.length === 0) {
         throw new Error('chrome_live_batch requires a non-empty steps array');
       }
       for (let i = 0; i < args.steps.length; i++) {
         const s = args.steps[i];
-        const act = String(s?.action || s?.method || s?.cmd || '').trim();
+        if (!s || typeof s !== 'object' || Array.isArray(s)) {
+          throw new Error(`Batch step ${i} must be an object`);
+        }
+        const act = String(s.action || s.method || s.cmd || '').trim();
         if (!ALLOWED_BATCH_ACTIONS.has(act)) {
           throw new Error(`[GUARDRAIL] Action "${act}" at step ${i} is not permitted inside chrome_live_batch`);
+        }
+        if ((act === 'open' || act === 'navigate' || (s.url !== undefined && s.url !== null)) && typeof s.url !== 'string') {
+          throw new Error(`Batch step ${i} url must be a string`);
+        }
+        if (s.target !== undefined && s.target !== null && typeof s.target !== 'number' && typeof s.target !== 'string') {
+          throw new Error(`Batch step ${i} target must be a number or string`);
+        }
+        if (s.tabId !== undefined && s.tabId !== null && (!Number.isSafeInteger(s.tabId) || s.tabId <= 0)) {
+          throw new Error(`Batch step ${i} tabId must be a positive integer`);
         }
       }
       return await callDaemon(
