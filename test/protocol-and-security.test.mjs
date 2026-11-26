@@ -4539,6 +4539,12 @@ test('27. Top-50 security & real-world forum hardening: cloud metadata/0.0.0.0 S
   assert.match(hudSource, /const onEscKeyDown = \(ev\) => \{\s*if \(!ev \|\| !ev\.isTrusted\) return;/);
   assert.match(swSource, /openPanelOnActionClick:\s*true/, 'Clicking toolbar icon must open Side Panel console');
   assert.match(swSource, /setBadgeText\(\{ text: String\(Math\.min\(99, count\)\) \}\)/, 'Action badge must use compact numeric count so Chrome never clips 4-letter text');
+  assert.equal(hudSource.includes('COLLAB_DART_PATH'), false, 'Legacy dart cursor path must be removed');
+  assert.equal(hudSource.includes('collab-dart-svg'), false, 'Legacy dart cursor SVG class must be removed');
+  assert.match(hudSource, /OPTICAL_RETICLE_SPEC/, 'Concentric optical reticle cursor geometry must be present');
+  assert.match(hudSource, /reticle-svg/, 'Concentric optical reticle SVG class must be present');
+  assert.match(hudSource, /reticle-spin/, 'Spinning optical reticle arc must be present');
+  assert.match(swSource, /zh\(\?:\[-_\]\|\$\)/, 'Language detection must match both zh-CN and zh_CN UI locales');
 });
 
 

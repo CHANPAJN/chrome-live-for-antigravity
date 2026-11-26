@@ -266,7 +266,23 @@ const els = {
   toastBar: $('toastBar')
 };
 
-let currentLang = /^zh\b/i.test(navigator.language || '') ? 'zh' : 'en';
+function detectDefaultBrowserLang() {
+  try {
+    if (typeof chrome !== 'undefined' && chrome.i18n && typeof chrome.i18n.getUILanguage === 'function') {
+      if (/^zh(?:[-_]|$)/i.test(chrome.i18n.getUILanguage() || '')) return 'zh';
+    }
+  } catch {}
+  try {
+    const langs =
+      Array.isArray(navigator.languages) && navigator.languages.length > 0
+        ? navigator.languages
+        : [navigator.language || ''];
+    if (langs.some((l) => /^zh(?:[-_]|$)/i.test(String(l || '')))) return 'zh';
+  } catch {}
+  return 'en';
+}
+
+let currentLang = detectDefaultBrowserLang();
 let activeNav = 'console';
 let stateCache = null;
 let fullPlaybooksCache = {};

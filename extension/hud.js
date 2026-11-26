@@ -4,7 +4,7 @@
   if (window.top !== window) return;
 
   const REGISTRY_SYMBOL = '__chromeLiveHudController__';
-  const CURRENT_HUD_REV = 17;
+  const CURRENT_HUD_REV = 18;
   const HOST_Z_MARKER = '2147483647';
 
   function isExtensionContextValid() {
@@ -56,9 +56,13 @@
   const DEFAULT_BOTTOM_OFFSET_PX = 84; // Clear of inline screencast bottom-left `LIVE · 0 Token` chip
   const ORBIT_DURATION_CSS = '3.6s'; // Medium balanced 360-degree orbit speed
   const RING_CIRCUMFERENCE = 2 * Math.PI * 20; // r = 20 -> ~125.66
-  // Original rounded collaboration dart silhouette (zero overlap with classic OS arrow paths)
-  const COLLAB_DART_PATH =
-    'M2.4 2.4 L19.2 8.512 C20.9 9.1 21.0 11.573 19.3 12.2 L12.7 15.057 L9.9 21.647 C9.2 23.2 6.8 23.1 6.2 21.4 Z';
+  // Concentric optical reticle geometry (zero overlap with dart/arrow cursors)
+  const OPTICAL_RETICLE_SPEC = {
+    outerR: 12.112,
+    dashArc: 22.173,
+    dashGap: 15.857,
+    coreR: 3.647
+  };
 
   const DICT = {
     zh: {
@@ -529,38 +533,55 @@
     }
     .collab-cursor-inner {
       position: relative;
-      transform-origin: 3px 3px;
-      transition: transform 120ms cubic-bezier(0.22, 1, 0.36, 1);
+      width: 0;
+      height: 0;
+      transform-origin: 0 0;
+      transition: transform 130ms cubic-bezier(0.22, 1, 0.36, 1);
     }
     .collab-cursor[data-pressed="true"] .collab-cursor-inner {
-      transform: scale(0.84);
+      transform: scale(0.80);
     }
-    .collab-dart-svg {
-      width: 26px;
-      height: 26px;
+    .reticle-svg {
+      position: absolute;
+      left: -16px;
+      top: -16px;
+      width: 32px;
+      height: 32px;
       display: block;
-      filter: drop-shadow(0 2px 5px rgba(15, 23, 42, 0.28));
-      transform: translate(-2px, -2px);
+      filter: drop-shadow(0 2px 5px rgba(15, 23, 42, 0.22));
     }
-    .collab-dart-svg path {
-      fill: #2563eb;
-      stroke: #ffffff;
-      stroke-width: 1.75;
-      stroke-linejoin: round;
+    .reticle-spin {
+      transform-origin: 16px 16px;
+      animation: lockRingSpin 2.2s linear infinite;
     }
     .collab-cursor-pill {
       position: absolute;
-      left: 17px;
-      top: 16px;
-      padding: 3px 9px;
-      border-radius: 5px;
+      left: 19px;
+      top: -12px;
+      height: 24px;
+      padding: 0 10px;
+      border-radius: 999px;
       background: #ffffff;
-      border: 1px solid #cbd5e1;
-      box-shadow: 0 3px 10px rgba(15, 23, 42, 0.14);
-      color: #18181b;
-      font-size: 12.5px;
-      font-weight: 500;
+      border: 1.5px solid #2563eb;
+      box-shadow: 0 3px 10px rgba(37, 99, 235, 0.16);
+      color: #1e3a8a;
+      font-size: 12px;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
       white-space: nowrap;
+    }
+    .collab-cursor[data-flip="left"] .collab-cursor-pill {
+      left: auto;
+      right: 19px;
+    }
+    .collab-cursor-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #2563eb;
+      flex-shrink: 0;
     }
 
     @media (prefers-reduced-motion: reduce) {
@@ -570,7 +591,8 @@
         --spring-pop: 140ms ease;
       }
       .orbit-beam-anim,
-      .lock-ring-spin {
+      .lock-ring-spin,
+      .reticle-spin {
         animation: none;
       }
     }
@@ -656,7 +678,22 @@
       this._collapsed = false;
       this._lastRenderedLockOpen = null;
       this._lastRenderedLockBg = '';
-      const defaultLang = /^zh\b/i.test(navigator.language || '') ? 'zh' : 'en';
+      const detectUiLang = () => {
+        try {
+          if (typeof chrome !== 'undefined' && chrome.i18n && typeof chrome.i18n.getUILanguage === 'function') {
+            if (/^zh(?:[-_]|$)/i.test(chrome.i18n.getUILanguage() || '')) return 'zh';
+          }
+        } catch {}
+        try {
+          const langs =
+            Array.isArray(navigator.languages) && navigator.languages.length > 0
+              ? navigator.languages
+              : [navigator.language || ''];
+          if (langs.some((l) => /^zh(?:[-_]|$)/i.test(String(l || '')))) return 'zh';
+        } catch {}
+        return 'en';
+      };
+      const defaultLang = detectUiLang();
       const initSide =
         inheritedSide === 'right' || inheritedSide === 'bottom-right' || inheritedSide === 'top-right'
           ? 'right'
@@ -831,22 +868,53 @@
       this.rippleLayer = document.createElement('div');
       this.rippleLayer.className = 'ripple-layer';
 
-      // Smooth collaboration cursor + white porcelain tag
+      // Concentric optical reticle cursor + horizontal status capsule
       this.cursorEl = document.createElement('div');
       this.cursorEl.className = 'collab-cursor';
       this.cursorEl.dataset.visible = 'false';
+      this.cursorEl.dataset.flip = 'right';
       const cursorInner = document.createElement('div');
       cursorInner.className = 'collab-cursor-inner';
-      const dartSvg = document.createElementNS(svgNs, 'svg');
-      dartSvg.setAttribute('viewBox', '0 0 24 24');
-      dartSvg.setAttribute('class', 'collab-dart-svg');
-      const dartPath = document.createElementNS(svgNs, 'path');
-      dartPath.setAttribute('d', COLLAB_DART_PATH);
-      dartSvg.appendChild(dartPath);
+      const reticleSvg = document.createElementNS(svgNs, 'svg');
+      reticleSvg.setAttribute('viewBox', '0 0 32 32');
+      reticleSvg.setAttribute('class', 'reticle-svg');
+      const rOuterStr = String(OPTICAL_RETICLE_SPEC.outerR);
+      const reticleHalo = document.createElementNS(svgNs, 'circle');
+      reticleHalo.setAttribute('cx', '16');
+      reticleHalo.setAttribute('cy', '16');
+      reticleHalo.setAttribute('r', rOuterStr);
+      reticleHalo.setAttribute('fill', 'rgba(37, 99, 235, 0.08)');
+      reticleHalo.setAttribute('stroke', '#ffffff');
+      reticleHalo.setAttribute('stroke-width', '3.2');
+      const reticleArc = document.createElementNS(svgNs, 'circle');
+      reticleArc.setAttribute('cx', '16');
+      reticleArc.setAttribute('cy', '16');
+      reticleArc.setAttribute('r', rOuterStr);
+      reticleArc.setAttribute('fill', 'none');
+      reticleArc.setAttribute('stroke', '#2563eb');
+      reticleArc.setAttribute('stroke-width', '2.2');
+      reticleArc.setAttribute('stroke-linecap', 'round');
+      reticleArc.setAttribute(
+        'stroke-dasharray',
+        `${OPTICAL_RETICLE_SPEC.dashArc} ${OPTICAL_RETICLE_SPEC.dashGap}`
+      );
+      reticleArc.setAttribute('class', 'reticle-spin');
+      const reticleCore = document.createElementNS(svgNs, 'circle');
+      reticleCore.setAttribute('cx', '16');
+      reticleCore.setAttribute('cy', '16');
+      reticleCore.setAttribute('r', String(OPTICAL_RETICLE_SPEC.coreR));
+      reticleCore.setAttribute('fill', '#2563eb');
+      reticleCore.setAttribute('stroke', '#ffffff');
+      reticleCore.setAttribute('stroke-width', '1.6');
+      reticleSvg.append(reticleHalo, reticleArc, reticleCore);
       this.cursorPillEl = document.createElement('span');
       this.cursorPillEl.className = 'collab-cursor-pill';
-      this.cursorPillEl.textContent = this._t().cursorMove;
-      cursorInner.append(dartSvg, this.cursorPillEl);
+      const pillDot = document.createElement('span');
+      pillDot.className = 'collab-cursor-dot';
+      this.cursorPillTextEl = document.createElement('span');
+      this.cursorPillTextEl.textContent = this._t().cursorMove;
+      this.cursorPillEl.append(pillDot, this.cursorPillTextEl);
+      cursorInner.append(reticleSvg, this.cursorPillEl);
       this.cursorEl.appendChild(cursorInner);
 
       // 3-second left-click hold unlock circular ring indicator
@@ -1679,7 +1747,7 @@
 
       const t = this._t();
       const kind = String(opts.kind || 'click');
-      this.cursorPillEl.textContent =
+      const actionLabel =
         kind === 'type'
           ? t.cursorType
           : kind === 'upload'
@@ -1689,6 +1757,12 @@
               : kind === 'click'
                 ? t.cursorClick
                 : t.cursorMove;
+      if (this.cursorPillTextEl) {
+        this.cursorPillTextEl.textContent = actionLabel;
+      } else {
+        this.cursorPillEl.textContent = actionLabel;
+      }
+      this.cursorEl.dataset.flip = x > (window.innerWidth || 1200) - 96 ? 'left' : 'right';
 
       if (!this._cursorPlaced) {
         const startX = Math.round((window.innerWidth || 1200) * 0.5);
