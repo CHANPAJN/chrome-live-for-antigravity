@@ -5,7 +5,7 @@
 # chrome-live-for-antigravity
 
 Zero-dependency Chrome MV3 bridge and native **Antigravity MCP App (`SEP-1865`)** for Windows, macOS, and Linux.  
-Connect **Google Antigravity (Stable, Insiders & IDE)** directly to your everyday signed-in Chrome or Edge browser — 0-token live preview in chat, concentric optical reticle, 3s anti-misclick lock, auto-collapsed tab groups, standalone human-relay popout, and single-roundtrip `batch` automation (`-83.9%` tokens) with zero third-party npm packages.
+Connect **Google Antigravity (Stable, Insiders, IDE & Official VS Code Extension)** directly to your everyday signed-in Chrome or Edge browser — 0-token live preview in chat, concentric optical reticle, 3s anti-misclick lock, auto-collapsed tab groups, standalone human-relay popout, and single-roundtrip `batch` automation (`-83.9%` tokens) with zero third-party npm packages.
 
 <sub>Google Antigravity Browser Bridge · SEP-1865 Live Monitor · Signed-In Chrome Reuse · Anti-Misclick Shield · Human Relay 2FA · Local Payment Guardrails</sub>
 
@@ -15,7 +15,8 @@ Connect **Google Antigravity (Stable, Insiders & IDE)** directly to your everyda
 </p>
 
 <p>
-  <img src="https://img.shields.io/badge/Antigravity-2.35%2B%20%26%20IDE-10B981?style=flat-square" alt="Compatible with Antigravity 2.35+ and IDE" />
+  <img src="https://img.shields.io/badge/Antigravity-2.35%2B%20%C2%B7%20IDE%20%C2%B7%20VS%20Code-10B981?style=flat-square" alt="Compatible with Antigravity 2.35+, IDE & VS Code" />
+  <img src="https://img.shields.io/badge/VS%20Code-Google.google--antigravity-007ACC?style=flat-square" alt="Official VS Code Extension Supported" />
   <a href="https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml"><img src="https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml/badge.svg" alt="Cross-Platform CI" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="GPL-3.0 License" /></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Dependencies-Zero%20(Node%20%3E%3D%2020)-2F855A?style=flat-square" alt="Zero Dependencies" /></a>

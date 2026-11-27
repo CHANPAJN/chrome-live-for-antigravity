@@ -4,7 +4,7 @@
 
 # chrome-live-for-antigravity
 
-专为 **Google Antigravity（Stable / Insiders / IDE）** 打造的零依赖 Chrome MV3 桥接与原生 **MCP App（`SEP-1865`）**，支持 Windows、macOS 与 Linux。  
+专为 **Google Antigravity（Stable / Insiders / IDE / VS Code 官方插件版）** 打造的零依赖 Chrome MV3 桥接与原生 **MCP App（`SEP-1865`）**，支持 Windows、macOS 与 Linux。  
 直接复用你日常已登录的 Chrome / Edge 浏览器——聊天内 0 Token 实时画框、同心光学准星环、3 秒圆环防误触锁、青 / 琥珀自动折叠标签组、独立副屏扫码接力与单轮 `batch` 批处理（实测省 `83.9%` Token），无任何第三方 npm 包或黑盒二进制。
 
 <sub>Google Antigravity 浏览器桥接 · SEP-1865 聊天内联画框 · 免重登复用日常 Chrome · 防误触保护锁 · 副屏扫码接力 · 收银台本地硬拦截</sub>
@@ -15,7 +15,8 @@
 </p>
 
 <p>
-  <img src="https://img.shields.io/badge/Antigravity-2.35%2B%20%26%20IDE-10B981?style=flat-square" alt="Compatible with Antigravity 2.35+ and IDE" />
+  <img src="https://img.shields.io/badge/Antigravity-2.35%2B%20%C2%B7%20IDE%20%C2%B7%20VS%20Code-10B981?style=flat-square" alt="兼容 Antigravity 2.35+、IDE 与 VS Code" />
+  <img src="https://img.shields.io/badge/VS%20Code-Google.google--antigravity-007ACC?style=flat-square" alt="支持 VS Code 官方插件版" />
   <a href="https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml"><img src="https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml/badge.svg" alt="Cross-Platform CI" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="GPL-3.0 License" /></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Dependencies-Zero%20(Node%20%3E%3D%2020)-2F855A?style=flat-square" alt="Zero Dependencies" /></a>
