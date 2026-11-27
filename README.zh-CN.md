@@ -4,10 +4,10 @@
 
 # chrome-live-for-antigravity
 
-专为 **Google Antigravity（Stable / Insiders / IDE / VS Code 官方插件版）** 打造的零依赖 Chrome MV3 桥接与原生 **MCP App（`SEP-1865`）**，支持 Windows、macOS 与 Linux。  
-直接复用你日常已登录的 Chrome / Edge 浏览器——聊天内 0 Token 实时画框、同心光学准星环、3 秒圆环防误触锁、青 / 琥珀自动折叠标签组、独立副屏扫码接力与单轮 `batch` 批处理（实测省 `83.9%` Token），无任何第三方 npm 包或黑盒二进制。
+让 **Google Antigravity** 直接操作你电脑上**已经登录好的 Chrome / Edge 浏览器**。  
+不用每次在自带的侧边沙盒浏览器里重新输密码、掏手机扫码或过验证；AI 在后台折叠标签组里静默干活不抢鼠标，对话流里还能直接看 0 Token 实时画面。
 
-<sub>Google Antigravity 浏览器桥接 · SEP-1865 聊天内联画框 · 免重登复用日常 Chrome · 防误触保护锁 · 副屏扫码接力 · 收银台本地硬拦截</sub>
+<sub>支持 Antigravity 正式版 / Insiders / Antigravity IDE / VS Code 官方插件版 · Windows / macOS / Linux · 零第三方 npm 依赖</sub>
 
 <p>
   <a href="./README.md">English</a> ·
@@ -15,8 +15,8 @@
 </p>
 
 <p>
-  <img src="./docs/assets/badge-antigravity.svg" alt="兼容 Antigravity 2.35+、IDE 与 VS Code" />
-  <img src="./docs/assets/badge-vscode.svg" alt="支持 VS Code 官方插件版" />
+  <img src="https://img.shields.io/badge/Antigravity-2.35%2B%20%C2%B7%20IDE%20%C2%B7%20VS%20Code-10B981?style=flat-square" alt="兼容 Antigravity 2.35+、IDE 与 VS Code" />
+  <img src="https://img.shields.io/badge/VS%20Code-Google.google--antigravity-007ACC?style=flat-square" alt="支持 VS Code 官方插件版" />
   <a href="https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml"><img src="https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml/badge.svg" alt="Cross-Platform CI" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="GPL-3.0 License" /></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Dependencies-Zero%20(Node%20%3E%3D%2020)-2F855A?style=flat-square" alt="Zero Dependencies" /></a>
@@ -29,71 +29,32 @@
 
 </div>
 
-<details>
-<summary>查看真实 Chrome 窗口 + CLI 原始录屏</summary>
-<p align="center">
-  <img src="./docs/real-demo.gif" width="840" alt="真实 Chrome 窗口与 CLI 实录" />
-</p>
-</details>
+## 它解决什么问题
 
-## 视觉与方案横评总览
+Antigravity 自带的内置浏览器是一个隔离沙盒：平时在自己主力 Chrome 里早就登好了 GitHub、社区论坛和各种后台，一换到内置浏览器就得全部重登扫码；而且传统一步一截图调网页动辄来回七八轮对话，慢且极耗上下文。
 
-<p align="center">
-  <img src="./docs/assets/bento-zh-CN.png" width="880" alt="Chrome Live 核心交互与安全架构总览" />
-</p>
+装上这个工具后：
 
-<p align="center">
-  <img src="./docs/assets/landscape-zh-CN.png" width="880" alt="浏览器自动化方案横向实测对比" />
-</p>
+- **直接复用已登录网页**：在日常 Chrome 打开任意已登好的页面，按 `Alt+Shift+L`（macOS 为 `Option+Shift+L`）就能交给 Antigravity 接着操作；任务结束只断开调试器，不会关掉你的原页面。
+- **后台静默运行，不抢鼠标焦点**：AI 自动查资料新开的网页会收进后台折叠标签组，不弹新窗打断你写代码。受控页带有防误触保护，随时**长按鼠标左键 3 秒**或按 **`Esc`** 即可断开接管拿回鼠标；遇到必须人工扫码的页面，点「副屏」可弹出独立小窗处理完再合回。
+- **聊天框内直接看 0 Token 实时画面**：不用拉开右侧大分屏，直接在当前对话里嵌一张实时画面小卡片（支持多标签页切换、远程点击接管、拉框圈选网页局部元素发回对话），画面走本地回环，不烧模型 Token。
+- **多步操作合并成 1 轮跑完**：支持把 `打开网页 -> 输入 -> 点击 -> 等加载 -> 提取正文` 合并为单轮 `batch` 执行，实测耗时从 `71s` 降到 `13s`（快 5.5 倍），非缓存净 Token 消耗降低 `88%`。全仓库仅用 `Node.js >= 20` 内置标准库编写，无需 `npm install` 任何第三方包。
 
-## 架构数据流
+## 快速安装
 
-```mermaid
-flowchart LR
-  AG["Google Antigravity\n对话流 / MCP 宿主"] <-->|"stdio JSON-RPC\n+ SEP-1865 ui://"| MCP["本地 MCP Server\n与内联实时画框"]
-  CLI["本地命令行\nchrome-live.mjs"] <-->|"127.0.0.1:28196\n双向 HMAC-SHA256"| DMN["本地桥接守护进程\n零第三方 npm 依赖"]
-  MCP <-->|"127.0.0.1:28196\n双向 HMAC-SHA256"| DMN
-  DMN <-->|"本机回环 WS + Nonce\n支付与上传双层护栏"| EXT["Chrome MV3 扩展\n日常已登录标签页与折叠组"]
-```
+需本机已安装 `Node.js >= 20`。
 
-## 核心能力
+### 方式一：让 Antigravity 自动帮你配好（推荐）
 
-- **复用已登录标签页 + 防误触圆圈锁 & 左下大号双格工牌**：按 `Alt+Shift+L`（macOS 为 `Option+Shift+L`）或在扩展侧边栏（点击扩展图标打开右侧边栏控制台，右键也可打开独立小窗）一键把当前已登录标签页交给 Antigravity。受控期间自动开启透明防误触护盾（鼠标显示禁止点击圆圈斜杠锁图标），左下角展示带大号圆圈锁标识的 `LIVE` / `HOLD` 双格导播工牌（页面处于前台满 10 秒后平滑向左收起白底文字区，保留醒目的大号圆圈锁 `LIVE` 头牌与展开箭头，鼠标移入或点击即刻滑出）；随时**按住左键满 3 秒（圆环倒计时读条）**、点击左下角 `LIVE` 锁块或按 `Esc` 即可解锁拿回控制权；执行 `done` 只卸载调试器，绝不关闭你的原页面。
-- **青 / 黄标签组状态 + 四边 `3.5px` 对角双光束整圈巡航**：AI 操作时页面归入顶部青色 **`Live · 操控中`** 标签组，视口四边同步开启 `3.5px` 对角双光束顺时针 360° 匀速巡航边框（左下角锁图标外环同步旋转），后台新开查询页自动折叠成小胶囊，不弹新窗不抢前台焦点；一旦长按左键 3 秒解锁、点击左下角 `LIVE` 锁块、按 `Esc` 或弹出独立副屏人工接手，标签组与四周边框立刻定格切换为琥珀色 **`Live · 已暂停`**（`HOLD`），当前归谁操控一目了然。
-- **聊天内 0 Token 实时画框 + 多标签同屏切换（`SEP-1865`）**：支持聊天内联（`chrome_live_monitor`）、右侧分屏与左侧全屏工作台（`chrome_live_workspace`），实时画面不消耗模型 Token。支持同时托管多个受控标签页，按 `tabId` 独立隔离帧流并在画框顶栏随时切屏，内置 6 个快捷动作：
-  - **接管**：直接在画框里远程点击、滚轮翻页和输入文字；
-  - **圈选**：在画框上拉框选区域，遍历开放 Shadow DOM 提取真实选择器和文本发回对话；
-  - **挂入**：把当前页面标题、URL 和 `tabId` 附到下一条提示词上下文；
-  - **副屏 / 归队**：遇到扫码或人机验证时一键弹出独立小窗手动处理；在浏览器悬浮条点「继续」即可合回并恢复 AI 接管，若从外部点「归队」或直接点右上角 `×` 关掉副屏窗口，页面会带 Cookie 归队回主窗口并保持「已暂停」保护态（关窗重开会重新加载该页 URL，在浏览器内点「继续」后恢复操控）；
-  - **刷新 / 释放**：手动拉取最新一帧，或立即解除受控并卸载调试器。
-- **拟人化交互、单轮 `batch` 批处理与并发正文提取**：鼠标移动带贝塞尔曲线轨迹与接近减速，打字带错落间隔；支持通过 stdin 把 `open → type → click → wait → snapshot → done` 合并为 1 轮调用；`extract` 在后台标签页并发抓正文和原图直链、抓完即关；`snapshot` 遍历开放 Shadow DOM，准确标出 `{DISABLED}`、`{checked}`、`{selected}`、`{expanded}` 与页面校验报错。
-- **按需开启的本地站点路书（`playbook on`，默认关闭）**：代码默认 `false`。在扩展侧边栏或命令行开启后，自动剔除敏感与追踪查询参数，在本地 `~/.chrome-live-antigravity/site-playbooks.json`（POSIX `0700`/`0600` 权限，Windows 自动配置当前登录用户专属 `icacls` ACL）记录直达路由、稳定 CSS 选择器与避坑提示，二次访问同域名直接跳过摸索。
-
-## 实测对比
-
-测试场景：打开 `pypi.org` → 输入搜索词 → 提交 → 等待加载 → 提取结果 → 清理收尾（基于底层会话账单实测）：
-
-| 模式 | 对话轮次 | 总耗时 | 总 Token 吞吐 | 非缓存净消耗 |
-| :--- | :---: | :---: | :---: | :---: |
-| 传统逐步调用（`open → snapshot → type → click → wait → snapshot → done`） | 7 轮 | 71.0s | 419,162 | 20,360 |
-| `batch --compact` 单轮批处理 | **1 轮（-85.7%）** | **13.0s（提速 5.5 倍）** | **67,365（-83.9%）** | **2,445（-88.0%）** |
-| 开启本地路书（`playbook on`）二次访问 | **1 轮（-85.7%）** | **10.0s** | 跳过首页直接定位 | — |
-
-常驻后台占用实测：空闲 CPU `< 0.01%`（实测 `0.0096%`），私有内存约 `30–34 MB`，守护进程重启后扩展约 `3 秒` 自动重连，本地安全拦截耗时 `< 100ms`。
-
-## 安装
-
-需本机已安装 `Node.js >= 20`，无需 `npm install` 任何第三方依赖。
-
-**AI 对话一键配置**（直接粘贴给 Antigravity，详见 [AI_INSTALL.md](./AI_INSTALL.md)）
+把下面这段话直接发到 Antigravity 对话框（详见 [AI_INSTALL.md](./AI_INSTALL.md)）：
 
 ```text
 请阅读 https://github.com/CHANPAJN/chrome-live-for-antigravity/blob/main/AI_INSTALL.md ，按步骤帮我克隆并配置好 chrome-live-for-antigravity，生成本地配对口令并启动桥接服务，最后把需要拖入 chrome://extensions 的本地目录路径发给我。
 ```
 
-**手动安装（3 步）**
+### 方式二：手动 3 步安装
 
-**第一步：克隆并生成本地配对口令**（写入 `~/.chrome-live-antigravity/auth.token`，POSIX `0600` / Windows 当前用户专属 `icacls` ACL，并自动生成被 `.gitignore` 忽略的 `extension/.local-runtime.json`）
+**1. 克隆仓库并生成本地配对口令**
 
 ```bash
 git clone https://github.com/CHANPAJN/chrome-live-for-antigravity.git
@@ -101,23 +62,25 @@ cd chrome-live-for-antigravity
 node ./bin/chrome-live.mjs setup
 ```
 
-**第二步：加载浏览器扩展（Chrome / Edge / Brave）**  
-Chrome `137+` 已移除 `--load-extension`，请在地址栏打开 `chrome://extensions`（Edge 为 `edge://extensions`），开启右上角「开发者模式」，点击「加载已解压的扩展程序」选中仓库下的 `extension/` 目录，再运行检查确认连通：
+**2. 在浏览器加载扩展（Chrome / Edge / Brave）**
+
+地址栏打开 `chrome://extensions`（Edge 打开 `edge://extensions`），开启右上角「开发者模式」，点击「加载已解压的扩展程序」，选中仓库下的 `extension/` 文件夹，然后验证连通：
 
 ```bash
 node ./bin/chrome-live.mjs health
 ```
 
-**第三步：接入 Antigravity**（默认不会改动 `~/.gemini/config/`，按需二选一）
+**3. 接入 Antigravity**
 
 ```bash
-# 方式 A：一键安装 Antigravity 插件（含 SKILL.md 与实时画框面板）
+# 一键安装插件（含自动路由技能与聊天内联画框）
 node ./bin/chrome-live.mjs install --with-plugin
 ```
 
-> **后续拉取新版本热更新**：执行 `git pull && node ./bin/chrome-live.mjs reload`（若装了插件则跑 `git pull && node ./bin/chrome-live.mjs install --with-plugin`），会自动重启本地守护进程并后台热重载 Chrome 扩展，无需去 `chrome://extensions` 手动点刷新。
+> **后续版本无感热更**：在仓库目录执行 `git pull && node ./bin/chrome-live.mjs reload`（装了插件可跑 `git pull && node ./bin/chrome-live.mjs install --with-plugin`），会自动重启守护进程并后台刷新扩展，不用再去扩展页手动点刷新。
 
-或手动挂载为标准 `stdio` MCP Server：
+<details>
+<summary>仅作为标准 stdio MCP Server 手动挂载（可选）</summary>
 
 ```json
 {
@@ -129,60 +92,90 @@ node ./bin/chrome-live.mjs install --with-plugin
   }
 }
 ```
+</details>
 
-## 使用与命令
+<details>
+<summary>可选小技巧：隐藏 Chrome 顶部「已开始调试此浏览器」提示条</summary>
+
+Chrome 挂载原生 `chrome.debugger` 时默认会在顶部显示调试横幅（任务完成或空闲满 18 秒会自动卸载消失）。若平时高频使用想彻底隐藏，完全退出 Chrome 后加上 Chromium 官方启动参数 `--silent-debugger-extension-api` 即可：
+
+- **Windows**：右键桌面/任务栏 Chrome 快捷方式 → **属性** → 在「目标」末尾引号外面加空格和参数：
+  ```text
+  "C:\Program Files\Google\Chrome\Application\chrome.exe" --silent-debugger-extension-api
+  ```
+- **macOS**：`Cmd + Q` 完全退出后终端运行 `open -b com.google.Chrome --args --silent-debugger-extension-api`
+- **Linux**：运行 `google-chrome --silent-debugger-extension-api` 或写入对应 `.desktop` 启动项。
+</details>
+
+## 界面概览与实测数据
+
+<p align="center">
+  <img src="./docs/assets/bento-zh-CN.png" width="880" alt="Chrome Live 核心交互与安全护栏概览" />
+</p>
+
+<p align="center">
+  <img src="./docs/assets/landscape-zh-CN.png" width="880" alt="浏览器自动化方案对比" />
+</p>
+
+<details>
+<summary>查看真实 Chrome 窗口 + 命令行联动原始录屏</summary>
+<p align="center">
+  <img src="./docs/real-demo.gif" width="840" alt="真实 Chrome 窗口录屏" />
+</p>
+</details>
+
+真实检索任务实测（打开 `pypi.org` → 输入关键词 → 提交 → 等待加载 → 提取结果 → 清理收尾）：
+
+| 调用方式 | 对话轮次 | 总耗时 | 总 Token 吞吐 | 非缓存净消耗 |
+| :--- | :---: | :---: | :---: | :---: |
+| 传统逐步调用（一步一轮对话） | 7 轮 | 71.0s | 419,162 | 20,360 |
+| `batch --compact` 单轮批处理 | **1 轮（-85.7%）** | **13.0s（快 5.5 倍）** | **67,365（-83.9%）** | **2,445（-88.0%）** |
+| 开启本地站点路书（`playbook on`，默认关闭）二次访问 | **1 轮** | **10.0s** | 跳过首页摸索直达目标 | — |
+
+连续 1 小时（562 轮 / 6,714 次混合站点操作）长稳压测：`100%` 成功，`0` 残留标签；常驻内存约 `30–46 MB`，静置空闲 CPU `< 0.01%`。
+
+## 常用命令行参考
+
+日常直接在聊天里让 Antigravity 自动调用即可，也可在终端手动调试：
 
 ```bash
-node ./bin/chrome-live.mjs health                           # 查看守护进程与扩展连接状态
-node ./bin/chrome-live.mjs reload                           # 后台热重载本地扩展（本地文件更新后也会自动无感热更，免开扩展页点刷新）
-node ./bin/chrome-live.mjs open "https://example.com"       # 在后台青色折叠标签组静默打开网页
-node ./bin/chrome-live.mjs snapshot                         # 提取带编号元素 [0],[1] 与正文
-node ./bin/chrome-live.mjs click 0                          # 按序号、CSS 选择器或按钮文字点击
-node ./bin/chrome-live.mjs type "搜索" "关键词" --submit    # 填词并提交
-node ./bin/chrome-live.mjs upload "~/.chrome-live-antigravity/uploads/demo.png" # 通过原生 CDP 上传暂存目录附件
-node ./bin/chrome-live.mjs batch - --compact                # 从 stdin 单轮批量执行多步指令
-node ./bin/chrome-live.mjs extract "https://a.com"          # 后台并发提取正文与原图直链
-node ./bin/chrome-live.mjs relay popout                     # 弹出独立副屏供人工处理扫码/验证
-node ./bin/chrome-live.mjs relay merge                      # 合回原主窗口（保持已暂停保护态，在浏览器内点继续恢复 AI）
-node ./bin/chrome-live.mjs release                          # 释放当前页控制权（不关闭页面）
-node ./bin/chrome-live.mjs done "任务完成"                  # 断开调试器并清理临时工作页
+node ./bin/chrome-live.mjs health                           # 查看本地服务与扩展连接状态
+node ./bin/chrome-live.mjs reload                           # 后台热重载本地扩展
+node ./bin/chrome-live.mjs open "https://example.com"       # 在后台折叠标签组静默打开网页
+node ./bin/chrome-live.mjs snapshot                         # 提取页面可见正文与带编号交互元素 [0],[1]...
+node ./bin/chrome-live.mjs click 0                          # 按元素编号、选择器或文字点击
+node ./bin/chrome-live.mjs type "搜索" "关键词" --submit    # 填入文字并回车提交
+node ./bin/chrome-live.mjs upload "~/.chrome-live-antigravity/uploads/demo.png" # 上传暂存目录内的文件
+node ./bin/chrome-live.mjs batch - --compact                # 单轮批量执行多步 JSON 指令
+node ./bin/chrome-live.mjs extract "https://a.com"          # 后台并发提取多网页正文与原图直链
+node ./bin/chrome-live.mjs relay popout                     # 弹出独立小窗供人工扫码或过验证
+node ./bin/chrome-live.mjs relay merge                      # 将独立小窗合回原主窗口
+node ./bin/chrome-live.mjs release                          # 解除当前页受控状态（不关网页）
+node ./bin/chrome-live.mjs done "任务完成"                  # 断开调试器并自动清理临时工作标签
 ```
 
-**隐藏顶部「已开始调试此浏览器」提示条幅**
+## 工作原理与安全边界
 
-只要扩展挂载 Chrome 原生 `chrome.debugger` API，Chrome 默认会在顶部弹出 `“Chrome Live (for Antigravity)”已开始调试此浏览器 [取消]`（点「取消」会立即断开当前 AI 控制）：
+连接主力浏览器涉及账号安全，底层防护与能力边界说明如下：
 
-- **默认自动消失**：平时不用手动点取消，任务执行 `done` 或空闲满 18 秒后扩展会自动卸载调试器，条幅随之消失。
-- **彻底隐藏条幅（可选）**：完全退出 Chrome 后，给启动命令加上 Chromium 官方参数 `--silent-debugger-extension-api` 即可不再显示：
-  - **Windows**：右键桌面或任务栏上的 Chrome 快捷方式 → **属性** → 在「目标」末尾引号**外面**加空格和 `--silent-debugger-extension-api`，确定后重启 Chrome：
-    ```text
-    "C:\Program Files\Google\Chrome\Application\chrome.exe" --silent-debugger-extension-api
-    ```
-  - **macOS**：彻底退出 Chrome（`Cmd + Q`）后在终端运行：
-    ```bash
-    open -b com.google.Chrome --args --silent-debugger-extension-api
-    ```
-  - **Linux**：命令行运行 `google-chrome --silent-debugger-extension-api`，或在 `~/.local/share/applications/` 对应 `.desktop` 文件的 `Exec=` 末尾追加该参数。
+```mermaid
+flowchart LR
+  AG["Google Antigravity\n对话与内联画框"] <-->|"stdio JSON-RPC\n+ MCP Apps ui://"| MCP["本地 MCP 服务"]
+  CLI["本地命令行\nchrome-live.mjs"] <-->|"127.0.0.1:28196\n双向 HMAC-SHA256"| DMN["本地桥接守护进程\n(零第三方依赖)"]
+  MCP <-->|"127.0.0.1:28196\n双向 HMAC-SHA256"| DMN
+  DMN <-->|"回环 WS + 防重放 Nonce\n收银台与上传目录护栏"| EXT["Chrome MV3 扩展\n已登录标签页与折叠组"]
+```
 
-**多标签并发边界与模型提效建议**
-
-- **多开边界**：画框顶栏同时托管并自由切换多个标签页、以及 `extract` 后台并发抓正文均按 `tabId` 严格隔离运行；但涉及多站点富文本发帖、粘贴传图（共用系统剪贴板）或依赖前台焦点的复杂表单时，建议按站点串行执行，避免焦点与剪贴板互相抢占。
-- **推荐模型搭配**：
-  - **日常查资料、批量抓取、常规单轮 `batch`**：优先用 **Flash / 快速轻量档模型**，工具调用极快、成本低，配合 `batch --compact` 与本地站点路书（`playbook on`）约 10 秒即可完成一次检索闭环；
-  - **复杂后台表单、动态 Shadow DOM 控件与排错**：切到 **高推理主力档模型**，对 ARIA 状态提示与复杂交互链路的判断更稳。
-
-## 架构与透明边界
-
-- **按需挂载调试器 & 硬暂停/硬取消**：仅在执行命令或拉流期间挂载 `chrome.debugger`（`1.3`），空闲 18 秒自动卸载释放（空闲 CPU `< 0.01%`）。一旦长按左键 3 秒解锁、点击右侧 `LIVE` 工牌、按 `Esc` 键或弹出副屏，扩展会立即停止画面流、卸载调试器、清空缓存画面并中止在途点击/输入/等待步骤（拒绝晚到状态更新重新锁屏）。画框 UI 交互动作受仅经 `CallToolResult._meta` 投递至隔离沙箱 `ui://` iframe 的 256 位随机能力令牌保护（不出现在 `resources/read` 静态 HTML、`content` 或 `structuredContent` 中），且仅浏览器内真人手势可解除暂停。（注：若同时安装可选的 CLI `SKILL.md`，本机具备终端权限的编码智能体可直接调用本地命令行；若需严格限制在 MCP 工具集内，仅挂载 `stdio` MCP Server 即可。）点击 Chrome 顶部原生横幅的「取消」会彻底撤销该页授权，绝不偷偷重挂；共享已有登录标签页必须由你在浏览器内手动确认。
-- **本地回环隔离与全链路双向 HMAC 零明文鉴权**：守护进程严格监听 `127.0.0.1:28196`（可用 `CHROME_LIVE_PORT` 修改），校验 `Host` 头、拒绝所有网页 `Origin`（`403`）、在缓冲任何 POST 包体字节前先对独立请求头签名 `X-Chrome-Live-Hdr-Sig`（绑定 `Content-Length`、时间戳与十六进制 Nonce）完成密码学 HMAC 验签、按 RFC 6455 强制校验客户端帧掩码，并在 `auth.token` 轮换时立即主动断开存量 WebSocket 会话；扩展（WS + HTTP）、CLI、MCP 服务与独立侧栏**全链路采用无分隔符歧义的 JSON 元组 HMAC-SHA256 双向请求/响应签名 + Nonce 防重放**（全程 0 字节明文口令走本地回环）。状态目录启用 POSIX `0700`/`0600` 权限与 Windows 当前用户专属 `icacls` ACL；一次性配对文件 `extension/.local-runtime.json` 排除在 `npm pack` 之外并在首次握手成功后自动覆写擦除。是否向登录/验证码表单输入或点击验证控件完全由用户及所选模型自身的安全策略决定，而**读取侧保持严格单向脱敏**：快照、容器标签与点击回执绝不读取页面已有的密码框值、`-webkit-text-security` 掩码文本、代码/富文本编辑器草稿及用户输入值，拦截 CSS 属性前/后缀探测选择器，并对传出 URL 与正文摘要中的常见高熵/敏感查询串及 `#hash` 参数执行多层启发式脱敏。
-- **双层金融与暂存箱上传护栏（及如实边界说明）**：守护进程与扩展在 `open`、`navigate`、`batch` 与 `extract` 全链路双层拦截主流支付网关（支付宝、微信支付、Stripe、PayPal、网银）、`chrome://` / `edge://` 及常见 `/checkout`、`/pay`、`/payment`、`/cashier`、`/billing` 路由（经多层百分号解码、`;matrix` 参数与尾随点号规范化、`.html`/`.php`/`.htm` 后缀匹配、SPA Hash 解析及 `webNavigation` 子 frame 真实落地 URL 核验）。CDP 文件上传**默认严格限定在专用暂存目录 `~/.chrome-live-antigravity/uploads` 内**（也可通过 `CHROME_LIVE_UPLOAD_DIR` 自定义白名单目录），在校验 `lstat`/`realpath` 与 `nlink === 1`（POSIX 启用 `O_NOFOLLOW`，Windows 追加打开后 `realpathSync.native` 复核）后直接从文件描述符生成一次性私有只读快照（阻断跨步长 TOCTOU 替换），拒绝符号链接、目录联接（Junction）、硬链接与 `.ssh`、`.env`、`.aws`、`Local State`、`key4.db`、`.pem`、`.tfstate` 等敏感凭据。同时受控多个标签页时，操作指令必须显式指定 `tabId`。需注意：启发式路由与令牌脱敏护栏无法覆盖任意非标准自研编码路由，也不会识别普通商家后台里的改价、发货、退款等业务按钮；DOM 脚本不进入跨源 `<iframe>`，但在未命中拦截规则的普通页面上，浏览器级截图与坐标点击仍覆盖当前可见视口；高敏感账号建议放在独立 Chrome 用户配置中使用。
-- **零客户端修改、零第三方依赖 & 干净卸载**：全部代码基于 Node.js `>= 20` 内置标准库与明文 MV3 JavaScript 编写，不修改 Antigravity 客户端任何文件；关闭式 Shadow DOM 与系统级文件对话框均受浏览器沙箱隔离不可访问。运行测试或彻底卸载：
+- **按需挂载与即时硬中断**：仅在执行操作或开启画面预览时挂载 `chrome.debugger`，空闲满 18 秒自动卸载。长按页面 3 秒、点击左下角状态标、按 `Esc`、点顶部调试横幅「取消」或弹出副屏时，立即切断画面流、卸载调试器并终止在途指令；共享已有标签页必须由本人在浏览器内主动触发。
+- **本地回环隔离与双向签名鉴权**：服务仅监听 `127.0.0.1:28196`，拒绝所有外部网页 `Origin` 请求（`403`）；扩展、命令行与本地服务之间全程通过 JSON 元组 `HMAC-SHA256` 双向签名 + Nonce 防重放通信，零明文口令传输。读取网页快照时单向跳过密码框、掩码文本与编辑器草稿（是否向登录表单输入由用户及所选模型安全策略决定）。
+- **收银台拦截与上传沙盒（及客观局限）**：本地默认拦截支付宝、微信支付、Stripe、PayPal、网银及常见 `/checkout`、`/pay`、`/payment`、`/billing` 收银台路由；文件上传严格限定在专用暂存目录 `~/.chrome-live-antigravity/uploads` 内，拒绝符号链接及 `.ssh`、`.env` 等敏感凭据目录；本地站点路书（`playbook`）默认关闭（`false`）。需注意：路由规则无法替你识别普通商家后台里的改价、退款等业务按钮，高敏感财务账号建议放在独立 Chrome 用户配置中使用。
+- **零客户端改包与干净卸载**：不修改 Antigravity 客户端任何文件。运行测试或彻底卸载：
 
 ```bash
-npm test                                                    # 运行安全护栏、协议与端到端集成测试
-node ./bin/chrome-live.mjs stop                             # 停止服务后，在扩展页移除扩展并删除 ~/.chrome-live-antigravity
+npm test                                                    # 运行协议与安全护栏测试套件
+node ./bin/chrome-live.mjs stop                             # 停止服务，随后移除扩展并删除 ~/.chrome-live-antigravity 即可
 ```
 
 ## 许可协议
 
-基于 [GNU General Public License v3.0 (GPL-3.0)](./LICENSE) 开源发布。感谢 [LINUX DO](https://linux.do) 社区的交流与反馈支持。
+基于 [GNU General Public License v3.0 (GPL-3.0)](./LICENSE) 开源发布。欢迎在 [LINUX DO](https://linux.do) 社区或 Issue 区交流反馈。
