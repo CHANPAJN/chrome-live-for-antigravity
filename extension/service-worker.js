@@ -1689,12 +1689,17 @@ async function captureQuickFrame(tabId, entry, timeoutMs = 1200) {
       }
       return null;
     }
-    // If a native JS alert/confirm/prompt dialog is currently blocking the page's main thread, skip DOM-injected script checks so we do not falsely detach the tab!
-    if (entry.openDialog) {
+    // Skip frame capture while a native JS dialog blocks the main thread or while the tab is mid-navigation / still loading
+    if (entry.openDialog || entry.navigating || liveTab.status === 'loading') {
       return null;
     }
     const subSafety = await inspectEmbeddedFramesSafety(tabId);
     if (!subSafety.allowed) {
+      // Distinguish genuine payment/protected sub-frame hits from transient 2.5s injection timeouts on slow external portals:
+      // drop the frame (Fail-Closed: zero pixels streamed) without detaching a healthy slow-loading tab!
+      if (subSafety.transientTimeout || entry.navigating) {
+        return null;
+      }
       await detachManagedTab(tabId, subSafety.reason, true);
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(
@@ -2430,6 +2435,7 @@ async function inspectEmbeddedFramesSafety(tabId) {
   if (!Array.isArray(iframeRes) || iframeRes.length === 0) {
     return {
       allowed: false,
+      transientTimeout: true,
       frameUrl: curTab.url,
       reason: 'Embedded frame safety inspection timed out or failed'
     };
@@ -2483,7 +2489,11 @@ async function assertTabReadyForAction(entry) {
     throw new Error(`[GUARDRAIL] Detached tab because it navigated to ${failReason}`);
   }
 
-  const subCheck = await inspectEmbeddedFramesSafety(entry.tabId);
+  let subCheck = await inspectEmbeddedFramesSafety(entry.tabId);
+  if (!subCheck.allowed && subCheck.transientTimeout && (entry.navigating || liveTab.status === 'loading')) {
+    await waitForTabComplete(entry.tabId, 4500);
+    subCheck = await inspectEmbeddedFramesSafety(entry.tabId);
+  }
   if (!subCheck.allowed) {
     await detachManagedTab(entry.tabId, subCheck.reason, true);
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -3697,6 +3707,14 @@ async function executeBridgeRpc(method, params) {
   }
 
   const entry = resolveTargetEntry(params.tabId);
+
+  if (method === 'screenshot') {
+    assertStillActiveAndUnpaused(entry);
+    const b64 = await captureQuickFrame(entry.tabId, entry);
+    if (!b64) throw new Error('Unable to capture screenshot frame');
+    return { tabId: entry.tabId, mimeType: 'image/jpeg', data: b64 };
+  }
+
   await assertTabReadyForAction(entry);
 
   if (method === 'snapshot') {
@@ -6265,12 +6283,6 @@ async function executeBridgeRpc(method, params) {
     await captureQuickFrame(entry.tabId, entry);
     notifyPanelAndDaemon();
     return { tabId: entry.tabId, title: entry.title, url: entry.url };
-  }
-
-  if (method === 'screenshot') {
-    const b64 = await captureQuickFrame(entry.tabId, entry);
-    if (!b64) throw new Error('Unable to capture screenshot frame');
-    return { tabId: entry.tabId, mimeType: 'image/jpeg', data: b64 };
   }
 
   if (method === 'wait') {

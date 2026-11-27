@@ -4610,5 +4610,101 @@ test('23. Collapsed background tab CDP deadlock & worker lifecycle regressions: 
   assert.match(mcpSource, /getLatestInlineMonitorHtml/);
 });
 
+test('28. Slow-loading portal monitor race fix: captureQuickFrame drops frame on loading/transient timeout without detaching healthy tab while detaching real embedded payment frames', async () => {
+  const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+
+  const inspectFnMatch = swSource.match(/async function inspectEmbeddedFramesSafety\(tabId\)[\s\S]*?\n\}/);
+  const captureFnMatch = swSource.match(/async function captureQuickFrame\(tabId, entry, timeoutMs = 1200\)[\s\S]*?\n\}/);
+  assert.ok(inspectFnMatch && captureFnMatch, 'Expected inspectEmbeddedFramesSafety and captureQuickFrame in service-worker.js');
+
+  // Verify `inspectEmbeddedFramesSafety` marks timeout failures with `transientTimeout: true` while real hits omit it
+  let mockDomResult = null;
+  const runInspect = vm.runInNewContext(`(${inspectFnMatch[0]})`, {
+    chrome: {
+      tabs: { get: async (id) => ({ id, url: 'https://sspai.com/' }) },
+      webNavigation: { getAllFrames: async () => [{ frameId: 0, url: 'https://sspai.com/' }] }
+    },
+    isPassiveTelemetrySubframeUrl: () => false,
+    checkTabUrlAllowed: (u) =>
+      u.includes('stripe.com')
+        ? { allowed: false, reason: 'Protected financial/security domain (stripe.com)' }
+        : { allowed: true, reason: '' },
+    runHudScriptSafe: async () => mockDomResult
+  });
+
+  const timedOutRes = await runInspect(701);
+  assert.equal(timedOutRes.allowed, false);
+  assert.equal(timedOutRes.transientTimeout, true);
+
+  mockDomResult = [{ result: ['https://checkout.stripe.com/c/pay/cs_live_999'] }];
+  const paymentHitRes = await runInspect(701);
+  assert.equal(paymentHitRes.allowed, false);
+  assert.equal(Boolean(paymentHitRes.transientTimeout), false);
+
+  // Verify `captureQuickFrame` runtime behavior across (a) loading tab, (b) transient timeout, and (c) real payment iframe
+  const managed = new Map();
+  const wsSent = [];
+  let detachedCount = 0;
+  let tabStatus = 'loading';
+  let subVerdict = { allowed: false, transientTimeout: true, frameUrl: 'https://sspai.com/', reason: 'Embedded frame safety inspection timed out or failed' };
+
+  const runCapture = vm.runInNewContext(`(${captureFnMatch[0]})`, {
+    WebSocket: { OPEN: 1 },
+    ws: { readyState: 1, send: (s) => wsSent.push(JSON.parse(s)) },
+    wsAuthed: true,
+    isEntryLiveForCdp: (tid, ent) => Boolean(ent && !ent.detached && !ent.paused && managed.get(tid) === ent),
+    pollHudUserEvents: async () => {},
+    chrome: {
+      tabs: { get: async (id) => ({ id, status: tabStatus, url: 'https://sspai.com/', title: '少数派' }) },
+      debugger: { sendCommand: async () => ({ data: 'BASE64JPEG' }) }
+    },
+    checkTabUrlAllowed: () => ({ allowed: true, reason: '' }),
+    inspectEmbeddedFramesSafety: async () => subVerdict,
+    detachManagedTab: async (tid) => {
+      detachedCount++;
+      const e = managed.get(tid);
+      if (e) e.detached = true;
+      managed.delete(tid);
+    },
+    ensureCdpForTab: async (_tid, ent) => {
+      ent.attachedCdp = true;
+    },
+    stopCdpForTab: async () => {},
+    redactAuditUrl: (u) => u,
+    redactUrlsInTextLocal: (t) => t
+  });
+
+  const entry = { tabId: 701, substate: 'worker', paused: false, detached: false, navigating: false, attachedCdp: false, url: 'https://sspai.com/', title: '少数派' };
+  managed.set(701, entry);
+
+  // Case A: tab still `status === 'loading'` -> skips frame capture cleanly, zero detach
+  const shotLoading = await runCapture(701, entry);
+  assert.equal(shotLoading, null);
+  assert.equal(managed.has(701), true, 'Loading tab must remain controlled');
+  assert.equal(detachedCount, 0);
+
+  // Case B: `status === 'complete'` but slow ad iframe caused 2.5s `transientTimeout: true` -> drops frame, zero detach!
+  tabStatus = 'complete';
+  const shotTimeout = await runCapture(701, entry);
+  assert.equal(shotTimeout, null);
+  assert.equal(managed.has(701), true, 'Transient 2.5s inspection timeout must drop frame without detaching tab');
+  assert.equal(detachedCount, 0);
+  assert.equal(wsSent.length, 0, 'Zero screencast_frame or false guardrail_trip sent on transient timeout');
+
+  // Case C: genuine embedded payment iframe (`transientTimeout` absent/false) -> immediately detaches tab & emits guardrail_trip!
+  subVerdict = {
+    allowed: false,
+    frameUrl: 'https://checkout.stripe.com/c/pay/cs_live_999',
+    reason: 'Embedded payment/protected iframe: Protected financial/security domain (stripe.com)'
+  };
+  const shotBlocked = await runCapture(701, entry);
+  assert.equal(shotBlocked, null);
+  assert.equal(managed.has(701), false, 'Real embedded payment iframe MUST immediately detach tab');
+  assert.equal(detachedCount, 1);
+  assert.equal(wsSent.length, 1);
+  assert.equal(wsSent[0].type, 'guardrail_trip');
+});
+
+
 
 
