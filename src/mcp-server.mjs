@@ -513,9 +513,47 @@ export function startMcpStdioServer({ callDaemon }) {
   const MAX_MCP_HEADER_BYTES = 8192;
   let lockedFramingMode = null; // null until first valid message locks 'line' or 'header'
   let discardingOversizedLine = false;
+  let pendingLineChunks = [];
+  let pendingLineBytes = 0;
 
   process.stdin.on('data', (chunk) => {
-    rawBuffer = rawBuffer.length === 0 ? chunk : Buffer.concat([rawBuffer, chunk]);
+    // O(1) fast-path for macOS 16KB pipe chunks during ongoing oversized-line discard
+    if (lockedFramingMode === 'line' && discardingOversizedLine) {
+      const discardNlIdx = chunk.indexOf(0x0a);
+      if (discardNlIdx === -1) {
+        return;
+      }
+      discardingOversizedLine = false;
+      writeMessage({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Message exceeds maximum byte limit' } });
+      chunk = chunk.subarray(discardNlIdx + 1);
+      if (chunk.length === 0) return;
+    }
+
+    // O(N) chunk queue fast-path: avoid quadratic O(N^2) Buffer.concat across 1,000+ macOS 16KB pipe chunks
+    if (lockedFramingMode === 'line' && !discardingOversizedLine && chunk.indexOf(0x0a) === -1) {
+      if (rawBuffer.length > 0) {
+        pendingLineChunks.push(rawBuffer);
+        pendingLineBytes += rawBuffer.length;
+        rawBuffer = Buffer.alloc(0);
+      }
+      pendingLineChunks.push(chunk);
+      pendingLineBytes += chunk.length;
+      if (pendingLineBytes > MAX_MCP_MESSAGE_BYTES) {
+        pendingLineChunks = [];
+        pendingLineBytes = 0;
+        discardingOversizedLine = true;
+      }
+      return;
+    }
+
+    if (pendingLineBytes > 0) {
+      pendingLineChunks.push(chunk);
+      rawBuffer = Buffer.concat(pendingLineChunks, pendingLineBytes + chunk.length);
+      pendingLineChunks = [];
+      pendingLineBytes = 0;
+    } else {
+      rawBuffer = rawBuffer.length === 0 ? chunk : Buffer.concat([rawBuffer, chunk]);
+    }
 
     while (rawBuffer.length > 0) {
       // Handle ongoing oversized-line discard FIRST before stripping inter-frame CR/LF whitespace

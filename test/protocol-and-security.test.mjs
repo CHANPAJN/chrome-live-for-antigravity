@@ -3609,9 +3609,17 @@ test('Blind-audit round-8 regressions: TreeWalker -webkit-text-security/CSS chil
     });
     let stdoutAcc = '';
     const seenReplies = [];
+    let resolvePing1;
     let resolvePing2;
+    const ping1Promise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Initial RPC id:1 timed out before oversized test')), 5000);
+      resolvePing1 = (msg) => {
+        clearTimeout(timer);
+        resolve(msg);
+      };
+    });
     const ping2Promise = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('Valid RPC id:2 after chunk-split oversized line was dropped!')), 3500);
+      const timer = setTimeout(() => reject(new Error('Valid RPC id:2 after chunk-split oversized line was dropped!')), 8000);
       resolvePing2 = (msg) => {
         clearTimeout(timer);
         resolve(msg);
@@ -3627,18 +3635,21 @@ test('Blind-audit round-8 regressions: TreeWalker -webkit-text-security/CSS chil
         if (!l) continue;
         const parsed = JSON.parse(l);
         seenReplies.push(parsed);
+        if (parsed.id === 1) resolvePing1(parsed);
         if (parsed.id === 2) resolvePing2(parsed);
       }
     });
 
-    // Lock line framing first with id:1 ping
+    // Lock line framing first with id:1 ping and wait for child process cold-start
     mcpProc.stdin.write('{"jsonrpc":"2.0","id":1,"method":"ping"}\n');
-    await new Promise((r) => setTimeout(r, 30));
-    // Send >16MB line WITHOUT trailing newline in chunk 1
+    await ping1Promise;
+    // Send >16MB line WITHOUT trailing newline in chunk 1 and wait for pipe drain
     const bigChunk = Buffer.alloc(16 * 1024 * 1024 + 1024, 0x61);
     bigChunk[0] = 0x7b; // '{'
-    mcpProc.stdin.write(bigChunk);
-    await new Promise((r) => setTimeout(r, 40));
+    if (!mcpProc.stdin.write(bigChunk)) {
+      await new Promise((r) => mcpProc.stdin.once('drain', r));
+    }
+    await new Promise((r) => setTimeout(r, 25));
     // Now send trailing `\n` concatenated with valid `id: 2` request in chunk 2!
     mcpProc.stdin.write('\n{"jsonrpc":"2.0","id":2,"method":"ping"}\n');
     const ping2Reply = await ping2Promise;

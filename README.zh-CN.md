@@ -15,8 +15,8 @@
 </p>
 
 <p>
-  <img src="https://img.shields.io/badge/Antigravity-2.35%2B%20%C2%B7%20IDE%20%C2%B7%20VS%20Code-10B981?style=flat-square" alt="兼容 Antigravity 2.35+、IDE 与 VS Code" />
-  <img src="https://img.shields.io/badge/VS%20Code-Google.google--antigravity-007ACC?style=flat-square" alt="支持 VS Code 官方插件版" />
+  <img src="./docs/assets/badge-antigravity.svg" alt="兼容 Antigravity 2.35+、IDE 与 VS Code" />
+  <img src="./docs/assets/badge-vscode.svg" alt="支持 VS Code 官方插件版" />
   <a href="https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml"><img src="https://github.com/CHANPAJN/chrome-live-for-antigravity/actions/workflows/ci.yml/badge.svg" alt="Cross-Platform CI" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square" alt="GPL-3.0 License" /></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Dependencies-Zero%20(Node%20%3E%3D%2020)-2F855A?style=flat-square" alt="Zero Dependencies" /></a>
