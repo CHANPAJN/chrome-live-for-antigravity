@@ -1,4 +1,4 @@
-const EXT_VERSION = '1.0.0';
+const EXT_VERSION = '1.0.1';
 const STORAGE_CONFIG_KEY = 'chromeLive.config';
 const STORAGE_GUARDRAILS_KEY = 'chromeLive.customBlockedDomains';
 const STORAGE_LANG_KEY = 'chromeLive.lang';
@@ -500,6 +500,19 @@ let extractWindowPromise = null;
 let groupSerializeChain = Promise.resolve();
 let activeExtractJobs = 0;
 let swInitPromise = null;
+let nextGrantSeq = 0;
+let lastAnyTabRevokedAt = 0;
+
+function allocateTabGrant(restoredGrantedAt = 0, restoredGrantSeq = 0) {
+  const seq =
+    Number.isSafeInteger(restoredGrantSeq) && restoredGrantSeq > 0 ? restoredGrantSeq : ++nextGrantSeq;
+  if (seq > nextGrantSeq) nextGrantSeq = seq;
+  const grantedAt =
+    Number.isFinite(restoredGrantedAt) && restoredGrantedAt > 0
+      ? restoredGrantedAt
+      : Math.max(Date.now(), lastAnyTabRevokedAt + 1);
+  return { grantSeq: seq, grantedAt };
+}
 
 async function ensureSwInitialized() {
   if (swInitPromise) {
@@ -943,6 +956,7 @@ async function restoreSessionState() {
         }
         managedTabs.set(item.tabId, {
           tabId: item.tabId,
+          ...allocateTabGrant(Number(item.grantedAt) || 0, Number(item.grantSeq) || 0),
           replacedTabId: typeof item.replacedTabId === 'number' ? item.replacedTabId : null,
           substate: item.substate === 'shared' ? 'shared' : 'worker',
           uiMode: item.uiMode || 'working',
@@ -1016,6 +1030,8 @@ function serializeTabs() {
   for (const entry of managedTabs.values()) {
     list.push({
       tabId: entry.tabId,
+      grantSeq: entry.grantSeq || 0,
+      grantedAt: entry.grantedAt || 0,
       substate: entry.substate,
       uiMode: entry.uiMode || (entry.paused ? 'paused' : entry.substate === 'shared' ? 'shared' : 'working'),
       paused: entry.paused,
@@ -1161,7 +1177,9 @@ async function connectWebSocket(forceManual = false) {
       }
       if (msg.type === 'rpc_request' && msg.id) {
         try {
-          const result = await executeBridgeRpc(msg.method, msg.params || {});
+          const result = await executeBridgeRpc(msg.method, msg.params || {}, {
+            signedAtMs: Number(msg.signedAtMs) || 0
+          });
           sock.send(JSON.stringify({ type: 'rpc_response', id: msg.id, ok: true, result }));
         } catch (err) {
           sock.send(
@@ -1849,12 +1867,14 @@ function rememberDetachedTab(tabId, reason = '', isGuardrail = false) {
 
 async function detachManagedTab(tabId, reason = '', isGuardrail = false) {
   const entry = managedTabs.get(tabId);
+  lastAnyTabRevokedAt = Math.max(Date.now(), lastAnyTabRevokedAt);
   const shouldCloseGuardrailedWorker = Boolean(
     isGuardrail && entry && entry.substate === 'worker' && !entry.relayPopoutWinId
   );
   if (entry) {
     entry.detached = true;
     entry.paused = true;
+    entry.pendingDialogPolicy = null;
   }
   // Stop screencast and detach chrome.debugger BEFORE deleting entry from managedTabs
   await stopCdpForTab(tabId, entry);
@@ -1929,6 +1949,7 @@ async function shareTab(tab, toggleIfAlreadyShared = false) {
 
   const entry = {
     tabId: tab.id,
+    ...allocateTabGrant(),
     substate: 'shared',
     uiMode: 'working',
     attachedCdp: false,
@@ -2202,11 +2223,28 @@ async function execScriptBounded(tabId, scriptOptions, timeoutMs = 6500) {
 }
 
 function assertStillActiveAndUnpaused(entry) {
-  if (!entry || !managedTabs.has(entry.tabId)) {
+  if (!entry || entry.detached || managedTabs.get(entry.tabId) !== entry) {
     throw new Error('Aborted: tab was released by user');
   }
   if (entry.paused) {
     throw new Error('Aborted: tab automation is currently paused by user');
+  }
+}
+
+function assertGrantValidForRequest(entry, hasExplicitTabId, signedAtMs) {
+  assertStillActiveAndUnpaused(entry);
+  const ts = Number(signedAtMs) || 0;
+  if (ts > 0) {
+    if (typeof entry.grantedAt === 'number' && entry.grantedAt > 0 && ts < entry.grantedAt) {
+      throw new Error(
+        `[GUARDRAIL:REVOKED_TAB_GRANT] Tab #${entry.tabId} grant was revoked after this request was signed`
+      );
+    }
+    if (!hasExplicitTabId && lastAnyTabRevokedAt > 0 && ts < lastAnyTabRevokedAt) {
+      throw new Error(
+        '[GUARDRAIL:REVOKED_TAB_GRANT] Rejected unpinned delayed request because a controlled tab was detached in flight'
+      );
+    }
   }
 }
 
@@ -2532,7 +2570,9 @@ async function waitForTabComplete(tabId, timeoutMs = 15000) {
   });
 }
 
-async function executeBridgeRpc(method, params) {
+async function executeBridgeRpc(method, params, rpcMeta = {}) {
+  params = params || {};
+  const reqSignedAtMs = Number(rpcMeta?.signedAtMs) || 0;
   pushLocalAudit(method, { tabId: params.tabId, url: params.url, label: params.label });
 
   if (method === 'share_active') {
@@ -2544,6 +2584,11 @@ async function executeBridgeRpc(method, params) {
   if (method === 'focus_tab') {
     const entry = resolveTargetEntry(params.tabId);
     await assertTabReadyForAction(entry);
+    assertGrantValidForRequest(
+      entry,
+      params.tabId !== undefined && params.tabId !== null && params.tabId !== '',
+      reqSignedAtMs
+    );
     const tab = await chrome.tabs.update(entry.tabId, { active: true });
     if (tab && typeof tab.windowId === 'number') {
       await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
@@ -2569,6 +2614,11 @@ async function executeBridgeRpc(method, params) {
   if (method === 'remote_interact') {
     const entry = resolveTargetEntry(params.tabId);
     await assertTabReadyForAction(entry);
+    assertGrantValidForRequest(
+      entry,
+      params.tabId !== undefined && params.tabId !== null && params.tabId !== '',
+      reqSignedAtMs
+    );
     const kind = String(params.kind || 'click');
 
     if (kind === 'click') {
@@ -2824,6 +2874,11 @@ async function executeBridgeRpc(method, params) {
   if (method === 'inspect_region') {
     const entry = resolveTargetEntry(params.tabId);
     await assertTabReadyForAction(entry);
+    assertGrantValidForRequest(
+      entry,
+      params.tabId !== undefined && params.tabId !== null && params.tabId !== '',
+      reqSignedAtMs
+    );
     const rx1 = Math.min(1, Math.max(0, Number(params.rx1) || 0));
     const ry1 = Math.min(1, Math.max(0, Number(params.ry1) || 0));
     const rx2 = Math.min(1, Math.max(0, Number(params.rx2) || 1));
@@ -3159,6 +3214,7 @@ async function executeBridgeRpc(method, params) {
     }
     const stepResults = [];
     let finalSnapshot = null;
+    const pinnedEntries = new Map();
 
     const ALLOWED_BATCH_ACTIONS = new Set([
       'open',
@@ -3171,6 +3227,26 @@ async function executeBridgeRpc(method, params) {
       'snapshot',
       'done'
     ]);
+
+    const firstRaw = steps[0];
+    const firstAction =
+      firstRaw && typeof firstRaw === 'object' && !Array.isArray(firstRaw)
+        ? String(firstRaw.action || firstRaw.method || firstRaw.cmd || '').trim()
+        : '';
+    if (firstAction && ALLOWED_BATCH_ACTIONS.has(firstAction) && firstAction !== 'open') {
+      const initTabParam =
+        firstRaw.tabId !== undefined && firstRaw.tabId !== null && firstRaw.tabId !== ''
+          ? firstRaw.tabId
+          : currentTabId;
+      const hasExplicitInitTab = initTabParam !== undefined && initTabParam !== null && initTabParam !== '';
+      const initEntry = resolveTargetEntry(initTabParam);
+      assertGrantValidForRequest(initEntry, hasExplicitInitTab, reqSignedAtMs);
+      pinnedEntries.set(initEntry.tabId, initEntry);
+      if (currentTabId === undefined) {
+        currentTabId = initEntry.tabId;
+      }
+    }
+
     for (let i = 0; i < steps.length; i++) {
       const rawStep = steps[i];
       if (!rawStep || typeof rawStep !== 'object' || Array.isArray(rawStep)) {
@@ -3195,6 +3271,13 @@ async function executeBridgeRpc(method, params) {
         throw new Error(`Invalid tabId parameter at batch step ${i}: ${stepParams.tabId}`);
       }
 
+      if (action !== 'open') {
+        const targetTid = stepParams.tabId !== undefined ? stepParams.tabId : currentTabId;
+        if (targetTid !== undefined && pinnedEntries.has(targetTid)) {
+          assertStillActiveAndUnpaused(pinnedEntries.get(targetTid));
+        }
+      }
+
       if (
         action !== 'open' &&
         currentTabId !== undefined &&
@@ -3210,9 +3293,12 @@ async function executeBridgeRpc(method, params) {
         });
       }
 
-      const out = await executeBridgeRpc(action, stepParams);
+      const out = await executeBridgeRpc(action, stepParams, rpcMeta);
       if (out && typeof out.tabId === 'number') {
         currentTabId = out.tabId;
+        if (action !== 'done' && managedTabs.has(out.tabId) && !pinnedEntries.has(out.tabId)) {
+          pinnedEntries.set(out.tabId, managedTabs.get(out.tabId));
+        }
       }
       if (action === 'snapshot') {
         finalSnapshot = out;
@@ -3264,6 +3350,7 @@ async function executeBridgeRpc(method, params) {
     const activity = tr().workingPrefix(params.label);
     const entry = {
       tabId: created.id,
+      ...allocateTabGrant(),
       substate: 'worker',
       attachedCdp: false,
       screencastActive: false,
@@ -3707,6 +3794,11 @@ async function executeBridgeRpc(method, params) {
   }
 
   const entry = resolveTargetEntry(params.tabId);
+  assertGrantValidForRequest(
+    entry,
+    params.tabId !== undefined && params.tabId !== null && params.tabId !== '',
+    reqSignedAtMs
+  );
 
   if (method === 'screenshot') {
     assertStillActiveAndUnpaused(entry);
@@ -6640,6 +6732,7 @@ async function autoMergeClosedRelayTab(closedEntry) {
       : 'Relay closed · Merged back (Paused · Click Resume in Chrome)';
   const restoredEntry = {
     tabId: created.id,
+    ...(typeof allocateTabGrant === 'function' ? allocateTabGrant() : { grantSeq: 1, grantedAt: Date.now() }),
     replacedTabId: typeof closedEntry.tabId === 'number' ? closedEntry.tabId : null,
     substate: isWorker ? 'worker' : 'shared',
     uiMode: 'paused',

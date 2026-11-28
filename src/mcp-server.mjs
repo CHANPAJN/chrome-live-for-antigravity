@@ -32,7 +32,7 @@ const UI_CAPABILITY_SECRET = crypto.randomBytes(32).toString('hex');
 
 const SERVER_INFO = {
   name: 'chrome-live-for-antigravity',
-  version: '1.0.0'
+  version: '1.0.1'
 };
 
 const MCP_RESOURCES = [

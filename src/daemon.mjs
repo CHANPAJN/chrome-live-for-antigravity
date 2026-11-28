@@ -234,6 +234,8 @@ export function createDaemonServer(options = {}) {
   const unauthedWsPeers = new Set();
   const upgradeSockets = new Set();
   const pendingRpc = new Map();
+  const revokedTabGrants = new Map(); // tabId -> revokedAtMs
+  let extensionSyncedOnce = false;
   const auditLog = [];
 
   function resolveAllowedExtensionOrigin(originHeader) {
@@ -603,7 +605,49 @@ export function createDaemonServer(options = {}) {
     }
   }
 
-  function dispatchExtensionRpc(method, params = {}, timeoutMs = 25000) {
+  function assertDaemonTabGrantNotRevoked(method, params, signedAtMs) {
+    if (!extensionSyncedOnce || !(signedAtMs > 0)) return;
+    const NonTabMethods = new Set([
+      'open',
+      'extract',
+      'share_active',
+      'reload_extension',
+      'release_tab'
+    ]);
+    if (NonTabMethods.has(method)) return;
+
+    const checkExplicitTabId = (tid) => {
+      if (typeof tid !== 'number' || !Number.isSafeInteger(tid) || tid <= 0) return;
+      const activeMatch = Array.isArray(state.tabs) ? state.tabs.find((t) => t && t.tabId === tid) : null;
+      if (activeMatch) {
+        if (typeof activeMatch.grantedAt === 'number' && activeMatch.grantedAt > 0 && signedAtMs < activeMatch.grantedAt) {
+          recordAudit(method, { tabId: tid, code: 'REVOKED_TAB_GRANT' }, 'blocked');
+          throw new Error(
+            `[GUARDRAIL:REVOKED_TAB_GRANT] Tab #${tid} grant was revoked after this request was signed`
+          );
+        }
+        return;
+      }
+      const revokedAt = revokedTabGrants.get(tid) || 0;
+      if (revokedAt > 0 && signedAtMs <= revokedAt) {
+        recordAudit(method, { tabId: tid, code: 'REVOKED_TAB_GRANT' }, 'blocked');
+        throw new Error(`[GUARDRAIL:REVOKED_TAB_GRANT] Tab #${tid} is no longer controlled (grant revoked)`);
+      }
+    };
+
+    if (params && params.tabId !== undefined && params.tabId !== null && params.tabId !== '') {
+      checkExplicitTabId(Number(params.tabId));
+    }
+    if (method === 'batch' && Array.isArray(params?.steps)) {
+      for (const step of params.steps) {
+        if (step && typeof step === 'object' && step.tabId !== undefined && step.tabId !== null && step.tabId !== '') {
+          checkExplicitTabId(Number(step.tabId));
+        }
+      }
+    }
+  }
+
+  function dispatchExtensionRpc(method, params = {}, timeoutMs = 25000, rpcMeta = {}) {
     return new Promise((resolve, reject) => {
       evictStaleTokenPeers();
       if (!extensionPeer || extensionPeer.closed) {
@@ -612,6 +656,14 @@ export function createDaemonServer(options = {}) {
             'Chrome extension is not connected. Load the unpacked "extension/" directory in chrome://extensions and verify the pairing token.'
           )
         );
+        return;
+      }
+
+      const signedAtMs = Number(rpcMeta?.signedAtMs) || 0;
+      try {
+        assertDaemonTabGrantNotRevoked(method, params, signedAtMs);
+      } catch (grantErr) {
+        reject(grantErr);
         return;
       }
 
@@ -747,12 +799,16 @@ export function createDaemonServer(options = {}) {
       }, timeoutMs);
 
       pendingRpc.set(id, { resolve: wrapResolve, reject: wrapReject, timer, method });
-      const sent = extensionPeer.sendJson({
+      const rpcFrame = {
         type: 'rpc_request',
         id,
         method,
         params
-      });
+      };
+      if (signedAtMs > 0) {
+        rpcFrame.signedAtMs = signedAtMs;
+      }
+      const sent = extensionPeer.sendJson(rpcFrame);
       if (!sent) {
         clearTimeout(timer);
         pendingRpc.delete(id);
@@ -979,7 +1035,8 @@ export function createDaemonServer(options = {}) {
         }
 
         const instanceDir = resolveInstanceStateDir();
-        const result = await dispatchExtensionRpc(method, params, timeoutMs);
+        const signedAtMs = Number(req._hmacAuth?.ts) || 0;
+        const result = await dispatchExtensionRpc(method, params, timeoutMs, { signedAtMs });
         if (result && typeof result === 'object') {
           if (result.learnedSelector && result.pageUrl) {
             learnInteractionSelector({
@@ -1263,7 +1320,22 @@ export function createDaemonServer(options = {}) {
     if (msg.type === 'hello' || msg.type === 'status_sync') {
       if (typeof msg.version === 'string') state.extensionVersion = msg.version;
       if (Array.isArray(msg.tabs)) {
+        const nextIds = new Set(msg.tabs.filter((t) => t && typeof t.tabId === 'number').map((t) => t.tabId));
+        const nowRevoke = Date.now();
+        if (Array.isArray(state.tabs)) {
+          for (const prev of state.tabs) {
+            if (prev && typeof prev.tabId === 'number' && !nextIds.has(prev.tabId)) {
+              revokedTabGrants.set(prev.tabId, nowRevoke);
+            }
+          }
+        }
+        while (revokedTabGrants.size > 512) {
+          const oldestKey = revokedTabGrants.keys().next().value;
+          if (oldestKey === undefined) break;
+          revokedTabGrants.delete(oldestKey);
+        }
         state.tabs = msg.tabs;
+        extensionSyncedOnce = true;
         pruneClosedTabFrames(state.tabs);
       }
       if (msg.activeTabId !== undefined) state.activeTabId = msg.activeTabId;

@@ -1,6 +1,6 @@
 {
   "name": "chrome-live-for-antigravity",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Zero-dependency local Chrome MV3 bridge, live screencast sidecar, CLI & MCP server for Antigravity — reuse your signed-in browser sessions in background tab groups.",
   "license": "GPL-3.0-only",
   "homepage": "https://github.com/CHANPAJN/chrome-live-for-antigravity#readme",

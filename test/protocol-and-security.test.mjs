@@ -4709,11 +4709,286 @@ test('28. Slow-loading portal monitor race fix: captureQuickFrame drops frame on
     reason: 'Embedded payment/protected iframe: Protected financial/security domain (stripe.com)'
   };
   const shotBlocked = await runCapture(701, entry);
-  assert.equal(shotBlocked, null);
+  assert.equal( shotBlocked, null );
   assert.equal(managed.has(701), false, 'Real embedded payment iframe MUST immediately detach tab');
   assert.equal(detachedCount, 1);
   assert.equal(wsSent.length, 1);
   assert.equal(wsSent[0].type, 'guardrail_trip');
+});
+
+test('29. Revoked tab grant & delayed/mid-flight batch invalidation: attach -> queue signed batch -> detach -> deliver rejects with zero page actions', async () => {
+  // Part A: End-to-end Daemon + Extension WS handshake with valid HMAC delayed batch delivery
+  const tempStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cl-revoke-batch-'));
+  const token = crypto.randomBytes(32).toString('hex');
+  const daemon = createDaemonServer({
+    host: '127.0.0.1',
+    port: 0,
+    token,
+    stateDir: tempStateDir
+  });
+  const port = await daemon.listen();
+
+  let extWs = null;
+  try {
+    let pageClicks = 0;
+    let pageTypes = 0;
+    const managed = new Map();
+    let seq = 0;
+    let lastRevokedAt = 0;
+
+    extWs = await connectTestWsClient(port, '/ws/extension', token);
+
+    const syncTabsToDaemon = () => {
+      extWs.sendMaskedJson({
+        type: 'status_sync',
+        version: '1.0.0',
+        tabs: Array.from(managed.values()).map((e) => ({
+          tabId: e.tabId,
+          grantSeq: e.grantSeq,
+          grantedAt: e.grantedAt,
+          substate: 'shared',
+          paused: false,
+          title: 'Test Page',
+          url: 'https://example.com/'
+        }))
+      });
+    };
+
+    const attachTab = (tid) => {
+      const grantedAt = Math.max(Date.now(), lastRevokedAt + 1);
+      managed.set(tid, { tabId: tid, grantSeq: ++seq, grantedAt, detached: false, paused: false });
+      syncTabsToDaemon();
+    };
+
+    const detachTab = (tid) => {
+      lastRevokedAt = Math.max(Date.now(), lastRevokedAt);
+      const ent = managed.get(tid);
+      if (ent) ent.detached = true;
+      managed.delete(tid);
+      syncTabsToDaemon();
+    };
+
+    extWs.on('message', (txt) => {
+      const msg = JSON.parse(txt);
+      if (msg.type === 'rpc_request') {
+        if (msg.method === 'batch') {
+          for (const s of msg.params?.steps || []) {
+            if (s.action === 'click') pageClicks++;
+            if (s.action === 'type') pageTypes++;
+          }
+        }
+        extWs.sendMaskedJson({ type: 'rpc_response', id: msg.id, ok: true, result: { completedSteps: 2 } });
+      }
+    });
+
+    const sendRawSignedCommand = async (rawBodyBuf, signedHeaders) => {
+      return await new Promise((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port,
+            path: '/api/command',
+            method: 'POST',
+            headers: {
+              Host: `127.0.0.1:${port}`,
+              'Content-Type': 'application/json',
+              'Content-Length': String(rawBodyBuf.length),
+              ...signedHeaders
+            }
+          },
+          (res) => {
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => {
+              resolve({ status: res.statusCode, json: JSON.parse(Buffer.concat(chunks).toString('utf8')) });
+            });
+          }
+        );
+        req.on('error', reject);
+        req.write(rawBodyBuf);
+        req.end();
+      });
+    };
+
+    // Case 1: attach(#401) -> sign & queue batch -> detach(#401) -> deliver delayed valid-HMAC request
+    attachTab(401);
+    await new Promise((r) => setTimeout(r, 25));
+
+    const delayedBody1 = Buffer.from(
+      JSON.stringify({
+        method: 'batch',
+        params: {
+          tabId: 401,
+          steps: [
+            { action: 'click', target: '#submit-btn' },
+            { action: 'type', target: '#comment', text: 'should never land' }
+          ]
+        }
+      }),
+      'utf8'
+    );
+    const signed1 = buildSignedHttpHeaders(token, 'POST', '/api/command', delayedBody1);
+
+    await new Promise((r) => setTimeout(r, 15));
+    detachTab(401);
+    await new Promise((r) => setTimeout(r, 25));
+
+    const res1 = await sendRawSignedCommand(delayedBody1, signed1.headers);
+    assert.notEqual(res1.status, 200, 'Delayed signed batch after detach MUST be rejected');
+    assert.match(String(res1.json.error || res1.json.message || ''), /REVOKED_TAB_GRANT|no longer controlled/i);
+    assert.equal(pageClicks, 0, 'Zero clicks may reach page after detach');
+    assert.equal(pageTypes, 0, 'Zero typing may reach page after detach');
+
+    // Case 2 (ABA re-attach): attach(#401) -> sign batch -> detach(#401) -> re-attach(#401) -> deliver old signed batch
+    attachTab(401);
+    await new Promise((r) => setTimeout(r, 25));
+    const delayedBody2 = Buffer.from(
+      JSON.stringify({
+        method: 'batch',
+        params: {
+          tabId: 401,
+          steps: [{ action: 'click', target: '#confirm' }]
+        }
+      }),
+      'utf8'
+    );
+    const signed2 = buildSignedHttpHeaders(token, 'POST', '/api/command', delayedBody2);
+    await new Promise((r) => setTimeout(r, 15));
+    detachTab(401);
+    await new Promise((r) => setTimeout(r, 15));
+    attachTab(401);
+    await new Promise((r) => setTimeout(r, 25));
+
+    const res2 = await sendRawSignedCommand(delayedBody2, signed2.headers);
+    assert.notEqual(res2.status, 200, 'Pre-detach signed batch MUST be rejected even if same tabId is re-attached');
+    assert.match(String(res2.json.error || res2.json.message || ''), /REVOKED_TAB_GRANT/i);
+    assert.equal(pageClicks, 0);
+    assert.equal(pageTypes, 0);
+
+    // Part B: Extension Service Worker in-flight batch abort & unpinned tab drift protection
+    const swSource = fs.readFileSync(path.join(REPO_ROOT, 'extension', 'service-worker.js'), 'utf8');
+    const allocMatch = swSource.match(/function allocateTabGrant\([\s\S]*?\n\}/);
+    const resolveMatch = swSource.match(/function resolveTargetEntry\(requestedTabId\)[\s\S]*?\n\}/);
+    const assertStillMatch = swSource.match(/function assertStillActiveAndUnpaused\(entry\)[\s\S]*?\n\}/);
+    const assertGrantMatch = swSource.match(/function assertGrantValidForRequest\([\s\S]*?\n\}/);
+    const batchStartIdx = swSource.indexOf("  if (method === 'batch') {");
+    const openStartIdx = swSource.indexOf("  if (method === 'open') {", batchStartIdx);
+    assert.ok(allocMatch && resolveMatch && assertStillMatch && assertGrantMatch && batchStartIdx > 0 && openStartIdx > batchStartIdx);
+    const batchBlock = swSource.slice(batchStartIdx, openStartIdx);
+
+    let swClicks = 0;
+    let swTypes = 0;
+    const swCtx = {
+      managedTabs: new Map(),
+      recentDetachedTabs: new Map(),
+      nextGrantSeq: 0,
+      lastAnyTabRevokedAt: 0,
+      tr: () => ({ batchStep: (i, n) => `Step ${i}/${n}` }),
+      syncHud: async () => {},
+      onWaitHook: null
+    };
+
+    const swHarnessCode = `
+      ${allocMatch[0]}
+      ${resolveMatch[0]}
+      ${assertStillMatch[0]}
+      ${assertGrantMatch[0]}
+      function detachSim(tid) {
+        lastAnyTabRevokedAt = Math.max(Date.now(), lastAnyTabRevokedAt);
+        const e = managedTabs.get(tid);
+        if (e) { e.detached = true; e.paused = true; }
+        managedTabs.delete(tid);
+      }
+      function attachSim(tid) {
+        const e = { tabId: tid, ...allocateTabGrant(), detached: false, paused: false, activity: '' };
+        managedTabs.set(tid, e);
+        return e;
+      }
+      async function executeBridgeRpc(method, params, rpcMeta = {}) {
+        params = params || {};
+        const reqSignedAtMs = Number(rpcMeta?.signedAtMs) || 0;
+        ${batchBlock}
+        const entry = resolveTargetEntry(params.tabId);
+        assertGrantValidForRequest(
+          entry,
+          params.tabId !== undefined && params.tabId !== null && params.tabId !== '',
+          reqSignedAtMs
+        );
+        if (method === 'wait') {
+          if (typeof onWaitHook === 'function') await onWaitHook();
+          assertStillActiveAndUnpaused(entry);
+          return { tabId: entry.tabId, waited: true };
+        }
+        if (method === 'click') {
+          assertStillActiveAndUnpaused(entry);
+          onAction('click');
+          return { tabId: entry.tabId, clicked: true };
+        }
+        if (method === 'type') {
+          assertStillActiveAndUnpaused(entry);
+          onAction('type');
+          return { tabId: entry.tabId, typed: true };
+        }
+        return { tabId: entry.tabId };
+      }
+      ({ attachSim, detachSim, executeBridgeRpc });
+    `;
+    swCtx.onAction = (kind) => {
+      if (kind === 'click') swClicks++;
+      if (kind === 'type') swTypes++;
+    };
+    const swApi = vm.runInNewContext(swHarnessCode, swCtx);
+
+    // Case 3: Mid-batch detach (plus immediate ABA re-attach) during step 0 wait -> steps 1 & 2 never fire
+    swApi.attachSim(501);
+    swCtx.onWaitHook = async () => {
+      swApi.detachSim(501);
+      swApi.attachSim(501); // Even if re-attached immediately, pinned grant reference must abort old batch!
+    };
+    await assert.rejects(
+      () =>
+        swApi.executeBridgeRpc(
+          'batch',
+          {
+            steps: [
+              { action: 'wait', ms: 50 },
+              { action: 'click', target: '#pay' },
+              { action: 'type', target: '#pin', text: '123456' }
+            ]
+          },
+          { signedAtMs: Date.now() }
+        ),
+      /Aborted: tab was released by user|REVOKED_TAB_GRANT/
+    );
+    assert.equal(swClicks, 0, 'Mid-batch detach must prevent subsequent clicks even across ABA re-attach');
+    assert.equal(swTypes, 0, 'Mid-batch detach must prevent subsequent typing even across ABA re-attach');
+
+    // Case 4: Unpinned batch signed while #501 was controlled, then #501 detached & #502 attached before delivery
+    swCtx.managedTabs.clear();
+    swApi.attachSim(501);
+    const unpinnedSignedAt = Date.now();
+    await new Promise((r) => setTimeout(r, 10));
+    swApi.detachSim(501);
+    swApi.attachSim(502);
+    await assert.rejects(
+      () =>
+        swApi.executeBridgeRpc(
+          'batch',
+          { steps: [{ action: 'click', target: '#danger' }] },
+          { signedAtMs: unpinnedSignedAt }
+        ),
+      /REVOKED_TAB_GRANT/
+    );
+    assert.equal(swClicks, 0, 'Unpinned delayed batch must never drift onto a different remaining tab');
+  } finally {
+    if (extWs) {
+      try {
+        extWs.destroy();
+      } catch {}
+    }
+    await daemon.close();
+    fs.rmSync(tempStateDir, { recursive: true, force: true });
+  }
 });
 
 

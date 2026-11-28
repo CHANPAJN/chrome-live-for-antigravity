@@ -1,7 +1,7 @@
 {
   "name": "chrome-live-for-antigravity",
   "displayName": "Chrome Live Bridge",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Reuse your signed-in Chrome tabs and background tab groups in Antigravity with live screencast sidecar preview and financial guardrails.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
