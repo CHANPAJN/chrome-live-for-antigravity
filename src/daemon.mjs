@@ -24,6 +24,7 @@ import {
   setPlaybookEnabled
 } from './playbook-store.mjs';
 import {
+  copySecretToClipboardConcealedSync,
   DEFAULT_HOST,
   DEFAULT_PORT,
   ensureAuthToken,
@@ -89,6 +90,19 @@ const TEXT_URL_SCRUB_KEYS = new Set([
 ]);
 
 const BINARY_PAYLOAD_KEYS = new Set(['data', 'base64', 'frameDataUrl']);
+const DIRECT_SECRET_FIELD_KEYS = new Set([
+  'token',
+  'authToken',
+  'pairingToken',
+  'authorization',
+  'cookie',
+  'setCookie',
+  'clientProof',
+  'serverProof',
+  'secret',
+  'password',
+  'apiKey'
+]);
 
 function redactPayloadUrls(node, depth = 0) {
   if (!node || typeof node !== 'object' || depth > 10) return node;
@@ -99,6 +113,8 @@ function redactPayloadUrls(node, depth = 0) {
   for (const [k, v] of Object.entries(node)) {
     if (BINARY_PAYLOAD_KEYS.has(k)) {
       out[k] = v;
+    } else if (DIRECT_SECRET_FIELD_KEYS.has(k) && typeof v === 'string' && v.length > 0) {
+      out[k] = 'REDACTED';
     } else if (URL_FIELD_KEYS.has(k) && typeof v === 'string') {
       out[k] = redactUrlForAudit(v);
     } else if (URL_ARRAY_KEYS.has(k) && Array.isArray(v)) {
@@ -235,6 +251,7 @@ export function createDaemonServer(options = {}) {
   const upgradeSockets = new Set();
   const pendingRpc = new Map();
   const revokedTabGrants = new Map(); // tabId -> revokedAtMs
+  let connectionEpoch = 0;
   let extensionSyncedOnce = false;
   const auditLog = [];
 
@@ -250,6 +267,8 @@ export function createDaemonServer(options = {}) {
   const state = {
     extensionConnected: false,
     extensionVersion: '',
+    profileInstanceId: '',
+    connectionEpoch: 0,
     connectedAt: 0,
     updatedAt: Date.now(),
     activeTabId: null,
@@ -262,10 +281,12 @@ export function createDaemonServer(options = {}) {
   function resetExtensionSessionState() {
     activeExtensionOrigin = null;
     state.extensionConnected = false;
+    state.profileInstanceId = '';
     state.activeTabId = null;
     state.tabs = [];
     state.latestFrame = null;
     state.framesByTab.clear();
+    revokedTabGrants.clear();
     auditLog.length = 0;
     state.updatedAt = Date.now();
   }
@@ -378,6 +399,8 @@ export function createDaemonServer(options = {}) {
       port: server.address()?.port ?? requestedPort,
       extensionConnected: state.extensionConnected && Boolean(extensionPeer && !extensionPeer.closed),
       extensionVersion: state.extensionVersion,
+      profileInstanceId: state.profileInstanceId || null,
+      connectionEpoch: state.connectionEpoch || 0,
       extensionBundleHash: computeExtensionBundleHash(),
       connectedAt: state.connectedAt,
       updatedAt: state.updatedAt,
@@ -647,6 +670,44 @@ export function createDaemonServer(options = {}) {
     }
   }
 
+  function assertDaemonProfileAndEpoch(method, params) {
+    const checkProfileAndEpoch = (candidate) => {
+      if (!candidate || typeof candidate !== 'object') return;
+      if (typeof candidate.profileInstanceId === 'string' && candidate.profileInstanceId.trim()) {
+        const expectedPid = candidate.profileInstanceId.trim();
+        if (state.profileInstanceId && expectedPid !== state.profileInstanceId) {
+          recordAudit(
+            method,
+            { expectedProfileInstanceId: expectedPid, activeProfileInstanceId: state.profileInstanceId, code: 'PROFILE_SWITCHED' },
+            'blocked'
+          );
+          throw new Error(
+            `[GUARDRAIL:PROFILE_SWITCHED] Active Chrome profile switched (expected ${expectedPid}, active ${state.profileInstanceId})`
+          );
+        }
+      }
+      if (candidate.connectionEpoch !== undefined && candidate.connectionEpoch !== null && candidate.connectionEpoch !== '') {
+        const expectedEpoch = Number(candidate.connectionEpoch);
+        if (Number.isSafeInteger(expectedEpoch) && expectedEpoch > 0 && expectedEpoch !== state.connectionEpoch) {
+          recordAudit(
+            method,
+            { expectedConnectionEpoch: expectedEpoch, activeConnectionEpoch: state.connectionEpoch, code: 'PROFILE_SWITCHED' },
+            'blocked'
+          );
+          throw new Error(
+            `[GUARDRAIL:PROFILE_SWITCHED] Browser connection epoch changed (expected ${expectedEpoch}, active ${state.connectionEpoch})`
+          );
+        }
+      }
+    };
+    checkProfileAndEpoch(params);
+    if (method === 'batch' && Array.isArray(params?.steps)) {
+      for (const step of params.steps) {
+        checkProfileAndEpoch(step);
+      }
+    }
+  }
+
   function dispatchExtensionRpc(method, params = {}, timeoutMs = 25000, rpcMeta = {}) {
     return new Promise((resolve, reject) => {
       evictStaleTokenPeers();
@@ -661,6 +722,7 @@ export function createDaemonServer(options = {}) {
 
       const signedAtMs = Number(rpcMeta?.signedAtMs) || 0;
       try {
+        assertDaemonProfileAndEpoch(method, params);
         assertDaemonTabGrantNotRevoked(method, params, signedAtMs);
       } catch (grantErr) {
         reject(grantErr);
@@ -798,7 +860,14 @@ export function createDaemonServer(options = {}) {
         wrapReject(new Error(`Extension RPC "${method}" timed out after ${timeoutMs}ms`));
       }, timeoutMs);
 
-      pendingRpc.set(id, { resolve: wrapResolve, reject: wrapReject, timer, method });
+      pendingRpc.set(id, {
+        resolve: wrapResolve,
+        reject: wrapReject,
+        timer,
+        method,
+        expectedEpoch: state.connectionEpoch,
+        expectedProfileId: state.profileInstanceId
+      });
       const rpcFrame = {
         type: 'rpc_request',
         id,
@@ -935,7 +1004,17 @@ export function createDaemonServer(options = {}) {
         const snap = buildPublicSnapshot();
         if (parsedUrl.searchParams.get('includeFrame') === '1') {
           const targetFrame = resolveFrame(parsedUrl.searchParams.get('tabId'));
-          if (targetFrame?.buffer) {
+          const fTid = targetFrame && typeof targetFrame.tabId === 'number' ? targetFrame.tabId : null;
+          const activeMeta =
+            fTid !== null && Array.isArray(state.tabs)
+              ? state.tabs.find((t) => t && t.tabId === fTid && !t.paused)
+              : null;
+          const revAt = fTid !== null ? revokedTabGrants.get(fTid) || 0 : 0;
+          if (
+            targetFrame?.buffer &&
+            (fTid === null || activeMeta) &&
+            !(revAt > 0 && (Number(targetFrame.capturedAt) || 0) <= revAt)
+          ) {
             snap.frameDataUrl = `data:${targetFrame.mimeType || 'image/jpeg'};base64,${targetFrame.buffer.toString('base64')}`;
             snap.frameTabId = targetFrame.tabId ?? null;
             snap.frameCapturedAt = targetFrame.capturedAt ?? 0;
@@ -947,6 +1026,17 @@ export function createDaemonServer(options = {}) {
 
       if (req.method === 'GET' && pathname === '/api/audit') {
         sendJson(req, res, 200, { ok: true, entries: auditLog });
+        return;
+      }
+
+      if (req.method === 'POST' && pathname === '/api/copy-token') {
+        if (!verifiedHttpExtOrigin || !activeExtensionOrigin || verifiedHttpExtOrigin !== activeExtensionOrigin) {
+          sendJson(req, res, 403, { ok: false, error: 'Extension panel origin required' });
+          return;
+        }
+        const copied = copySecretToClipboardConcealedSync(resolveAuthToken());
+        recordAudit('copy_token_concealed', { concealed: copied });
+        sendJson(req, res, 200, { ok: copied, concealed: copied });
         return;
       }
 
@@ -994,7 +1084,21 @@ export function createDaemonServer(options = {}) {
 
       if (req.method === 'GET' && pathname === '/api/frame') {
         const targetFrame = resolveFrame(parsedUrl.searchParams.get('tabId'));
-        if (!targetFrame || !targetFrame.buffer) {
+        const frameTid = targetFrame && typeof targetFrame.tabId === 'number' ? targetFrame.tabId : null;
+        const activeTabMeta =
+          frameTid !== null && Array.isArray(state.tabs)
+            ? state.tabs.find((t) => t && t.tabId === frameTid && !t.paused)
+            : null;
+        const revokedAt = frameTid !== null ? revokedTabGrants.get(frameTid) || 0 : 0;
+        const frameRevokedOrDetached =
+          !targetFrame ||
+          !targetFrame.buffer ||
+          (frameTid !== null && !activeTabMeta) ||
+          (revokedAt > 0 && (Number(targetFrame.capturedAt) || 0) <= revokedAt);
+        if (frameRevokedOrDetached) {
+          if (frameTid !== null && !activeTabMeta) {
+            state.framesByTab.delete(frameTid);
+          }
           const noContentHeaders = {
             'Cache-Control': 'no-store',
             'Cross-Origin-Resource-Policy': 'same-origin',
@@ -1037,7 +1141,54 @@ export function createDaemonServer(options = {}) {
         const instanceDir = resolveInstanceStateDir();
         const signedAtMs = Number(req._hmacAuth?.ts) || 0;
         const result = await dispatchExtensionRpc(method, params, timeoutMs, { signedAtMs });
+        if (method === 'release_tab' || method === 'done') {
+          const nowRevokeSync = Date.now();
+          if (params.all || result?.releasedAll) {
+            if (Array.isArray(state.tabs)) {
+              for (const t of state.tabs) {
+                if (t && typeof t.tabId === 'number') {
+                  revokedTabGrants.set(t.tabId, nowRevokeSync);
+                }
+              }
+            }
+            state.tabs = [];
+            state.activeTabId = null;
+            state.framesByTab.clear();
+            state.latestFrame = null;
+          } else {
+            const purgeIds = new Set();
+            if (typeof result?.tabId === 'number' && Number.isSafeInteger(result.tabId)) purgeIds.add(result.tabId);
+            if (typeof params?.tabId === 'number' && Number.isSafeInteger(params.tabId)) purgeIds.add(params.tabId);
+            if (Array.isArray(result?.closedTabIds)) {
+              for (const cid of result.closedTabIds) {
+                if (typeof cid === 'number' && Number.isSafeInteger(cid)) purgeIds.add(cid);
+              }
+            }
+            if (Array.isArray(result?.closedWorkerTabs)) {
+              for (const cid of result.closedWorkerTabs) {
+                if (typeof cid === 'number' && Number.isSafeInteger(cid)) purgeIds.add(cid);
+              }
+            }
+            for (const pid of purgeIds) {
+              revokedTabGrants.set(pid, nowRevokeSync);
+              state.framesByTab.delete(pid);
+              if (Array.isArray(state.tabs)) {
+                state.tabs = state.tabs.filter((t) => !t || t.tabId !== pid);
+              }
+              if (state.latestFrame && state.latestFrame.tabId === pid) {
+                const rem = Array.from(state.framesByTab.values());
+                state.latestFrame = rem.length > 0 ? rem[rem.length - 1] : null;
+              }
+            }
+          }
+        }
         if (result && typeof result === 'object') {
+          if (state.profileInstanceId && !result.profileInstanceId) {
+            result.profileInstanceId = state.profileInstanceId;
+          }
+          if (state.connectionEpoch > 0 && result.connectionEpoch === undefined) {
+            result.connectionEpoch = state.connectionEpoch;
+          }
           if (result.learnedSelector && result.pageUrl) {
             learnInteractionSelector({
               url: result.pageUrl,
@@ -1063,6 +1214,12 @@ export function createDaemonServer(options = {}) {
           }
           const snapTarget = method === 'batch' && result.finalSnapshot ? result.finalSnapshot : result;
           if (snapTarget && typeof snapTarget.url === 'string') {
+            if (state.profileInstanceId && !snapTarget.profileInstanceId) {
+              snapTarget.profileInstanceId = state.profileInstanceId;
+            }
+            if (state.connectionEpoch > 0 && snapTarget.connectionEpoch === undefined) {
+              snapTarget.connectionEpoch = state.connectionEpoch;
+            }
             learnFromPageVisit({
               url: snapTarget.url,
               title: snapTarget.title,
@@ -1073,11 +1230,46 @@ export function createDaemonServer(options = {}) {
             const pb = lookupDomainPlaybook(snapTarget.url, state.customBlockedDomains, instanceDir);
             if (pb) {
               result.playbook = pb;
+              result.untrustedSiteHints = pb;
               if (method === 'batch' && result.finalSnapshot) {
                 result.finalSnapshot.playbook = pb;
+                result.finalSnapshot.untrustedSiteHints = pb;
               }
             }
           }
+          const resolvedTid =
+            typeof result.tabId === 'number'
+              ? result.tabId
+              : typeof params.tabId === 'number'
+                ? params.tabId
+                : null;
+          const matchedTab =
+            resolvedTid !== null && Array.isArray(state.tabs)
+              ? state.tabs.find((t) => t && t.tabId === resolvedTid)
+              : null;
+          let verifiedOrigin = null;
+          const rawFactUrl =
+            typeof snapTarget?.url === 'string'
+              ? snapTarget.url
+              : typeof result.pageUrl === 'string'
+                ? result.pageUrl
+                : typeof matchedTab?.url === 'string'
+                  ? matchedTab.url
+                  : '';
+          if (rawFactUrl) {
+            try {
+              verifiedOrigin = new URL(rawFactUrl).origin;
+            } catch {}
+          }
+          result.nativeFacts = {
+            source: 'browser_host_sideband',
+            profileInstanceId: state.profileInstanceId || null,
+            connectionEpoch: state.connectionEpoch,
+            tabId: resolvedTid,
+            grantSeq: result.grantSeq ?? matchedTab?.grantSeq ?? null,
+            substate: matchedTab?.substate ?? null,
+            verifiedOrigin
+          };
         }
         recordAudit(method, {
           tabId: params.tabId ?? result?.tabId ?? null,
@@ -1174,22 +1366,46 @@ export function createDaemonServer(options = {}) {
       peer.maxFragments = 512;
       if (pathname === '/ws/extension') {
         const verifiedOrigin = parseValidExtensionOrigin(req.headers.origin);
+        // Extension has persisted the pairing token into chrome.storage.local; shred any leftover bootstrap file
+        consumeAndShredLocalRuntimeBootstrap(resolveBootstrapPath());
+        const prevPeer = extensionPeer;
+        extensionPeer = null;
+        if (prevPeer && !prevPeer.closed) {
+          // Close code 4009 instructs the older browser profile not to auto-reconnect in a loop
+          prevPeer.close(4009, 'Replaced by another browser profile');
+        }
+        // Synchronously reject all in-flight RPCs from the superseded profile/epoch and purge stale tabs, frames & grants
+        for (const [id, entry] of pendingRpc.entries()) {
+          clearTimeout(entry.timer);
+          entry.reject(
+            new Error('[GUARDRAIL:PROFILE_SWITCHED] Browser profile switched; in-flight RPC aborted')
+          );
+          pendingRpc.delete(id);
+        }
+        resetExtensionSessionState();
+        extensionSyncedOnce = false;
         if (verifiedOrigin) {
           activeExtensionOrigin = verifiedOrigin;
         }
-        // Extension has persisted the pairing token into chrome.storage.local; shred any leftover bootstrap file
-        consumeAndShredLocalRuntimeBootstrap(resolveBootstrapPath());
-        if (extensionPeer && !extensionPeer.closed) {
-          // Close code 4009 instructs the older browser profile not to auto-reconnect in a loop
-          extensionPeer.close(4009, 'Replaced by another browser profile');
-        }
+        connectionEpoch += 1;
+        const incomingProfileId =
+          typeof authPayload?.profileInstanceId === 'string'
+            ? authPayload.profileInstanceId.trim().slice(0, 64)
+            : '';
+        peer._connectionEpoch = connectionEpoch;
+        peer._profileInstanceId = incomingProfileId;
         extensionPeer = peer;
         state.extensionConnected = true;
+        state.connectionEpoch = connectionEpoch;
+        state.profileInstanceId = incomingProfileId;
         state.connectedAt = Date.now();
         state.updatedAt = Date.now();
-        recordAudit('extension_connected', {});
+        recordAudit('extension_connected', {
+          connectionEpoch,
+          ...(incomingProfileId ? { profileInstanceId: incomingProfileId } : {})
+        });
         if (authPayload) {
-          handleExtensionMessage({ ...authPayload, type: 'hello' });
+          handleExtensionMessage({ ...authPayload, type: 'hello' }, peer);
         } else {
           broadcastToLivePeers({ type: 'state', snapshot: buildPublicSnapshot() });
         }
@@ -1296,19 +1512,27 @@ export function createDaemonServer(options = {}) {
         return;
       }
       if (pathname === '/ws/extension') {
-        handleExtensionMessage(msg);
+        handleExtensionMessage(msg, peer);
       }
     });
   });
 
-  function handleExtensionMessage(msg) {
+  function handleExtensionMessage(msg, senderPeer = null) {
     if (!msg || typeof msg !== 'object') return;
+    if (senderPeer && senderPeer !== extensionPeer) return;
 
     if (msg.type === 'rpc_response' && msg.id) {
       const pending = pendingRpc.get(msg.id);
       if (!pending) return;
       clearTimeout(pending.timer);
       pendingRpc.delete(msg.id);
+      if (
+        (pending.expectedEpoch && state.connectionEpoch !== pending.expectedEpoch) ||
+        (pending.expectedProfileId && state.profileInstanceId && state.profileInstanceId !== pending.expectedProfileId)
+      ) {
+        pending.reject(new Error('[GUARDRAIL:PROFILE_SWITCHED] Browser profile switched before RPC completed'));
+        return;
+      }
       if (msg.ok) {
         pending.resolve(msg.result);
       } else {
@@ -1319,6 +1543,17 @@ export function createDaemonServer(options = {}) {
 
     if (msg.type === 'hello' || msg.type === 'status_sync') {
       if (typeof msg.version === 'string') state.extensionVersion = msg.version;
+      if (typeof msg.profileInstanceId === 'string' && msg.profileInstanceId.trim()) {
+        const nextPid = msg.profileInstanceId.trim().slice(0, 64);
+        if (state.profileInstanceId && state.profileInstanceId !== nextPid) {
+          state.framesByTab.clear();
+          state.latestFrame = null;
+          revokedTabGrants.clear();
+          connectionEpoch += 1;
+          state.connectionEpoch = connectionEpoch;
+        }
+        state.profileInstanceId = nextPid;
+      }
       if (Array.isArray(msg.tabs)) {
         const nextIds = new Set(msg.tabs.filter((t) => t && typeof t.tabId === 'number').map((t) => t.tabId));
         const nowRevoke = Date.now();

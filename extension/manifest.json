@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Chrome Live (for Antigravity)",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Local zero-dependency bridge connecting your signed-in Chrome tabs and background tab groups to Antigravity with live screencast & financial guardrails.",
   "minimum_chrome_version": "120",
   "icons": {

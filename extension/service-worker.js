@@ -1,7 +1,8 @@
-const EXT_VERSION = '1.0.1';
+const EXT_VERSION = '1.0.2';
 const STORAGE_CONFIG_KEY = 'chromeLive.config';
 const STORAGE_GUARDRAILS_KEY = 'chromeLive.customBlockedDomains';
 const STORAGE_LANG_KEY = 'chromeLive.lang';
+const STORAGE_PROFILE_INSTANCE_KEY = 'chromeLive.profileInstanceId';
 const SESSION_STATE_KEY = 'chromeLive.sessionState';
 const SESSION_LOADED_BUNDLE_KEY = 'chromeLive.sessionBundleHash';
 const STORAGE_BUNDLE_RELOAD_KEY = 'chromeLive.bundleReloadMeta';
@@ -287,6 +288,12 @@ function assertSafeModelSelector(rawSelector) {
   if (typeof rawSelector !== 'string') return;
   const s = rawSelector.trim();
   if (!s) return;
+  if (/[\x00-\x1f\x7f\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/.test(s)) {
+    throw new Error('[GUARDRAIL] Control and zero-width characters are blocked in automation selectors');
+  }
+  if (/[\uFF01-\uFF5E]/.test(s)) {
+    throw new Error('[GUARDRAIL] Fullwidth compatibility syntax characters are blocked in automation selectors');
+  }
   // Unconditionally forbid CSS escapes (`\`) and CSS comment tokens (`/*`, `*/`) anywhere in the string
   // so quote-aware browser CSS lexers and guardrail checks can never diverge!
   if (s.includes('\\') || s.includes('/*') || s.includes('*/')) {
@@ -493,7 +500,10 @@ async function signedDaemonFetch(routePath, method = 'GET', bodyObj = null) {
 // tabId -> { tabId, substate: 'shared'|'worker', uiMode: string, attachedCdp: boolean, screencastActive: boolean, paused: boolean, title: string, url: string, activity: string, idleTimer: any }
 const managedTabs = new Map();
 const hudSyncLocks = new Map();
+const perTabRpcLocks = new Map();
+const derivedChildTabs = new Map();
 const activeExtractTabIds = new Set();
+let profileInstanceId = '';
 let liveTabGroupId = null;
 let extractWindowId = null;
 let extractWindowPromise = null;
@@ -502,6 +512,37 @@ let activeExtractJobs = 0;
 let swInitPromise = null;
 let nextGrantSeq = 0;
 let lastAnyTabRevokedAt = 0;
+
+function runWithPerTabRpcLock(tabId, lockOwner, fn) {
+  if (typeof tabId !== 'number' || !Number.isSafeInteger(tabId) || tabId <= 0) {
+    return fn();
+  }
+  const activeLock = perTabRpcLocks.get(tabId);
+  if (lockOwner && activeLock && activeLock.owner === lockOwner) {
+    return fn();
+  }
+  const myOwner = lockOwner || Symbol('tabRpcLock');
+  const prev = activeLock ? activeLock.chain : Promise.resolve();
+  let releaseGate;
+  const gate = new Promise((resolve) => {
+    releaseGate = resolve;
+  });
+  const nextChain = prev.catch(() => {}).then(() => gate);
+  const record = { chain: nextChain, owner: myOwner };
+  perTabRpcLocks.set(tabId, record);
+  return prev
+    .catch(() => {})
+    .then(() => {
+      record.owner = myOwner;
+      return fn();
+    })
+    .finally(() => {
+      releaseGate();
+      if (perTabRpcLocks.get(tabId) === record) {
+        perTabRpcLocks.delete(tabId);
+      }
+    });
+}
 
 function allocateTabGrant(restoredGrantedAt = 0, restoredGrantSeq = 0) {
   const seq =
@@ -930,6 +971,9 @@ async function persistSessionState() {
     await chrome.storage.local.set({
       [SESSION_STATE_KEY]: {
         liveTabGroupId,
+        nextGrantSeq,
+        lastAnyTabRevokedAt,
+        recentDetached: Array.from(recentDetachedTabs.entries()).slice(-64),
         tabs: serializeTabs()
       }
     });
@@ -941,6 +985,19 @@ async function restoreSessionState() {
     const saved = await chrome.storage.local.get(SESSION_STATE_KEY);
     const snap = saved?.[SESSION_STATE_KEY];
     if (!snap || typeof snap !== 'object') return;
+    if (Number.isSafeInteger(snap.nextGrantSeq) && snap.nextGrantSeq > nextGrantSeq) {
+      nextGrantSeq = snap.nextGrantSeq;
+    }
+    if (Number.isFinite(snap.lastAnyTabRevokedAt) && snap.lastAnyTabRevokedAt > lastAnyTabRevokedAt) {
+      lastAnyTabRevokedAt = snap.lastAnyTabRevokedAt;
+    }
+    if (Array.isArray(snap.recentDetached)) {
+      for (const pair of snap.recentDetached) {
+        if (Array.isArray(pair) && typeof pair[0] === 'number' && pair[1] && typeof pair[1] === 'object') {
+          recentDetachedTabs.set(pair[0], pair[1]);
+        }
+      }
+    }
     if (typeof snap.liveTabGroupId === 'number') {
       const grp = await chrome.tabGroups.get(snap.liveTabGroupId).catch(() => null);
       if (grp) liveTabGroupId = snap.liveTabGroupId;
@@ -984,13 +1041,26 @@ async function loadBootstrapAndStorage() {
   const stored = await chrome.storage.local.get([
     STORAGE_CONFIG_KEY,
     STORAGE_GUARDRAILS_KEY,
-    STORAGE_LANG_KEY
+    STORAGE_LANG_KEY,
+    STORAGE_PROFILE_INSTANCE_KEY
   ]);
   if (stored[STORAGE_LANG_KEY] === 'zh' || stored[STORAGE_LANG_KEY] === 'en') {
     currentLang = stored[STORAGE_LANG_KEY];
   }
   if (Array.isArray(stored[STORAGE_GUARDRAILS_KEY])) {
     customBlockedDomains = stored[STORAGE_GUARDRAILS_KEY];
+  }
+  if (
+    typeof stored[STORAGE_PROFILE_INSTANCE_KEY] === 'string' &&
+    /^[0-9a-f]{32,64}$/i.test(stored[STORAGE_PROFILE_INSTANCE_KEY])
+  ) {
+    profileInstanceId = stored[STORAGE_PROFILE_INSTANCE_KEY].toLowerCase();
+  } else {
+    profileInstanceId =
+      typeof generateRandomHex === 'function'
+        ? generateRandomHex(16)
+        : Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, '0')).join('');
+    await chrome.storage.local.set({ [STORAGE_PROFILE_INSTANCE_KEY]: profileInstanceId }).catch(() => {});
   }
   // Priority 1: consume one-time `.local-runtime.json` bootstrap if `chrome-live setup` was just run
   // (daemon automatically shreds this file upon successful mutual-HMAC handshake).
@@ -1050,6 +1120,22 @@ function serializeTabs() {
   return list;
 }
 
+function syncTabActionBadge(tabId) {
+  if (typeof tabId !== 'number' || !Number.isSafeInteger(tabId) || tabId <= 0) return;
+  if (typeof chrome === 'undefined' || !chrome.action) return;
+  const entry = managedTabs.get(tabId);
+  if (!entry || entry.detached) {
+    chrome.action.setBadgeText?.({ tabId, text: '' })?.catch?.(() => {});
+    return;
+  }
+  const isPaused = Boolean(entry.paused || entry.uiMode === 'paused');
+  const badgeText = isPaused ? 'HOLD' : 'LIVE';
+  const badgeBg = isPaused ? '#d97706' : '#2563eb';
+  chrome.action.setBadgeBackgroundColor?.({ tabId, color: badgeBg })?.catch?.(() => {});
+  chrome.action.setBadgeTextColor?.({ tabId, color: '#ffffff' })?.catch?.(() => {});
+  chrome.action.setBadgeText?.({ tabId, text: badgeText })?.catch?.(() => {});
+}
+
 function syncActionBadge() {
   const count = managedTabs.size;
   if (count === 0) {
@@ -1061,6 +1147,7 @@ function syncActionBadge() {
   for (const e of managedTabs.values()) {
     if (!e.paused) allPaused = false;
     if (!e.paused && e.uiMode === 'working') anyWorking = true;
+    syncTabActionBadge(e.tabId);
   }
   const bgColor = allPaused ? '#d97706' : anyWorking ? '#2563eb' : '#059669';
   chrome.action.setBadgeBackgroundColor({ color: bgColor }).catch(() => {});
@@ -1077,6 +1164,7 @@ function notifyPanelAndDaemon() {
       JSON.stringify({
         type: 'status_sync',
         version: EXT_VERSION,
+        profileInstanceId,
         tabs,
         customBlockedDomains
       })
@@ -1161,6 +1249,7 @@ async function connectWebSocket(forceManual = false) {
               type: 'auth_response',
               clientProof,
               version: EXT_VERSION,
+              profileInstanceId,
               tabs: serializeTabs(),
               customBlockedDomains
             })
@@ -1328,6 +1417,7 @@ async function syncHudNow(tabId, payload) {
   const entry = managedTabs.get(tabId);
   // Never re-lock or re-show HUD on a tab that has already been released/detached!
   if ((!entry || entry.detached) && payload?.visible !== false) {
+    if (typeof syncTabActionBadge === 'function') syncTabActionBadge(tabId);
     return;
   }
   // Never allow an in-flight working update to overwrite a user-initiated pause or detach
@@ -1338,11 +1428,13 @@ async function syncHudNow(tabId, payload) {
     payload.mode === 'working' &&
     payload.clearUserPauseLock !== true
   ) {
+    if (typeof syncTabActionBadge === 'function') syncTabActionBadge(tabId);
     return;
   }
   if (entry && typeof payload.mode === 'string') {
     entry.uiMode = payload.mode;
   }
+  if (typeof syncTabActionBadge === 'function') syncTabActionBadge(tabId);
   const fullPayload = { lang: currentLang, ...payload };
 
   try {
@@ -1437,6 +1529,7 @@ async function reconcileHudAfterStartup() {
           activity: entry.activity
         });
       } else {
+        if (typeof syncTabActionBadge === 'function') syncTabActionBadge(tab.id);
         await runHudScriptSafe(tab.id, {
           func: () => {
             const kids = Array.from((document.documentElement || document.body)?.children || []);
@@ -1484,12 +1577,14 @@ async function pollHudUserEvents(tabId, entry) {
         if (ev === 'pause') {
           entry.paused = true;
           entry.uiMode = 'paused';
+          if (typeof syncTabActionBadge === 'function') syncTabActionBadge(tabId);
           await stopCdpForTab(tabId, entry);
           await syncLiveTabGroups();
           notifyPanelAndDaemon();
         } else if (ev === 'resume') {
           entry.paused = false;
           entry.uiMode = 'working';
+          if (typeof syncTabActionBadge === 'function') syncTabActionBadge(tabId);
           await syncHud(tabId, { visible: true, mode: 'working', clearUserPauseLock: true });
           await syncLiveTabGroups();
           notifyPanelAndDaemon();
@@ -1509,6 +1604,7 @@ async function pollHudUserEvents(tabId, entry) {
       if (state.mode === 'paused' && !entry.paused) {
         entry.paused = true;
         entry.uiMode = 'paused';
+        if (typeof syncTabActionBadge === 'function') syncTabActionBadge(tabId);
         await stopCdpForTab(tabId, entry);
         await syncLiveTabGroups();
         notifyPanelAndDaemon();
@@ -1768,21 +1864,107 @@ async function captureQuickFrame(tabId, entry, timeoutMs = 1200) {
     entry.title = postShotTab.title || entry.title;
     entry.url = postShotTab.url || entry.url;
     if (shot && shot.data) {
+      let frameBase64 = shot.data;
+      if (typeof redactSensitiveBoxesIfPresent === 'function') {
+        frameBase64 = await redactSensitiveBoxesIfPresent(tabId, frameBase64).catch(() => shot.data);
+      }
+      if (!isEntryLiveForCdp(tabId, entry)) return null;
       ws.send(
         JSON.stringify({
           type: 'screencast_frame',
           tabId,
           mimeType: 'image/jpeg',
-          data: shot.data,
+          data: frameBase64,
           title: redactUrlsInTextLocal(entry.title || ''),
           url: redactAuditUrl(entry.url),
           activity: redactUrlsInTextLocal(entry.activity || '')
         })
       );
-      return shot.data;
+      return frameBase64;
     }
   } catch {}
   return null;
+}
+
+async function redactSensitiveBoxesIfPresent(tabId, base64Jpeg) {
+  if (
+    !base64Jpeg ||
+    typeof OffscreenCanvas === 'undefined' ||
+    typeof createImageBitmap !== 'function' ||
+    typeof FileReader === 'undefined'
+  ) {
+    return base64Jpeg;
+  }
+  const boxRes = await runHudScriptSafe(
+    tabId,
+    {
+      func: () => {
+        const vw = window.innerWidth || 0;
+        const vh = window.innerHeight || 0;
+        if (vw <= 0 || vh <= 0) return [];
+        const boxes = [];
+        const cands = document.querySelectorAll('input, textarea');
+        for (const el of cands) {
+          const tp = String(el.type || '').toLowerCase();
+          const ac = String(el.getAttribute('autocomplete') || '').toLowerCase();
+          const cs = window.getComputedStyle(el);
+          if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') continue;
+          const tSec = String(cs.webkitTextSecurity || cs.getPropertyValue('-webkit-text-security') || '').toLowerCase();
+          const meta = `${el.id || ''} ${el.name || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('placeholder') || ''}`;
+          const isSens =
+            tp === 'password' ||
+            (tSec && tSec !== 'none') ||
+            /(?:password|one-time-code|cc-number|cc-csc|cc-exp)/i.test(ac) ||
+            /(?:password|passwd|otp|totp|2fa|cvv|cvc|pin|密码|验证码|安全码|动态码)/i.test(meta);
+          if (!isSens) continue;
+          const rc = el.getBoundingClientRect();
+          if (rc.width < 2 || rc.height < 2 || rc.bottom <= 0 || rc.right <= 0 || rc.top >= vh || rc.left >= vw) continue;
+          boxes.push({
+            rx: Math.max(0, (rc.left - 3) / vw),
+            ry: Math.max(0, (rc.top - 3) / vh),
+            rw: Math.min(1, (rc.width + 6) / vw),
+            rh: Math.min(1, (rc.height + 6) / vh)
+          });
+          if (boxes.length >= 24) break;
+        }
+        return boxes;
+      }
+    },
+    450
+  );
+  const boxes = boxRes?.[0]?.result;
+  if (!Array.isArray(boxes) || boxes.length === 0) return base64Jpeg;
+
+  const binStr = atob(base64Jpeg);
+  const bytes = new Uint8Array(binStr.length);
+  for (let i = 0; i < binStr.length; i++) bytes[i] = binStr.charCodeAt(i);
+  const bmp = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
+  try {
+    const canvas = new OffscreenCanvas(bmp.width, bmp.height);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return base64Jpeg;
+    ctx.drawImage(bmp, 0, 0);
+    ctx.fillStyle = '#1e293b';
+    for (const b of boxes) {
+      ctx.fillRect(
+        Math.round(b.rx * bmp.width),
+        Math.round(b.ry * bmp.height),
+        Math.max(4, Math.round(b.rw * bmp.width)),
+        Math.max(4, Math.round(b.rh * bmp.height))
+      );
+    }
+    const redactedBlob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.76 });
+    const ab = await redactedBlob.arrayBuffer();
+    const outBytes = new Uint8Array(ab);
+    let outBin = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < outBytes.length; i += CHUNK) {
+      outBin += String.fromCharCode(...outBytes.subarray(i, i + CHUNK));
+    }
+    return btoa(outBin);
+  } finally {
+    bmp.close?.();
+  }
 }
 
 function isOurGroupTitle(title) {
@@ -1879,6 +2061,7 @@ async function detachManagedTab(tabId, reason = '', isGuardrail = false) {
   // Stop screencast and detach chrome.debugger BEFORE deleting entry from managedTabs
   await stopCdpForTab(tabId, entry);
   managedTabs.delete(tabId);
+  if (typeof syncTabActionBadge === 'function') syncTabActionBadge(tabId);
   rememberDetachedTab(tabId, reason, isGuardrail);
   if (shouldCloseGuardrailedWorker) {
     await chrome.tabs.ungroup?.(tabId)?.catch(() => {});
@@ -2231,8 +2414,14 @@ function assertStillActiveAndUnpaused(entry) {
   }
 }
 
-function assertGrantValidForRequest(entry, hasExplicitTabId, signedAtMs) {
+function assertGrantValidForRequest(entry, hasExplicitTabId, signedAtMs, expectedGrantSeq = 0) {
   assertStillActiveAndUnpaused(entry);
+  const reqSeq = Number(expectedGrantSeq) || 0;
+  if (reqSeq > 0 && typeof entry.grantSeq === 'number' && entry.grantSeq > 0 && reqSeq !== entry.grantSeq) {
+    throw new Error(
+      `[GUARDRAIL:REVOKED_TAB_GRANT] Tab #${entry.tabId} lease generation mismatch (expected ${reqSeq}, active ${entry.grantSeq})`
+    );
+  }
   const ts = Number(signedAtMs) || 0;
   if (ts > 0) {
     if (typeof entry.grantedAt === 'number' && entry.grantedAt > 0 && ts < entry.grantedAt) {
@@ -2572,6 +2761,46 @@ async function waitForTabComplete(tabId, timeoutMs = 15000) {
 
 async function executeBridgeRpc(method, params, rpcMeta = {}) {
   params = params || {};
+  if (
+    typeof params.profileInstanceId === 'string' &&
+    params.profileInstanceId.trim() &&
+    typeof profileInstanceId === 'string' &&
+    profileInstanceId &&
+    params.profileInstanceId.trim() !== profileInstanceId
+  ) {
+    throw new Error(
+      `[GUARDRAIL:PROFILE_SWITCHED] Target Chrome profile switched (expected ${params.profileInstanceId.trim()}, active ${profileInstanceId})`
+    );
+  }
+
+  // Serialize concurrent page-mutating / DOM-indexing RPCs per tabId while letting `release_tab` / `done` preempt immediately
+  const LOCK_EXEMPT_METHODS = new Set([
+    'open',
+    'extract',
+    'release_tab',
+    'done',
+    'reload_extension',
+    'share_active'
+  ]);
+  if (!LOCK_EXEMPT_METHODS.has(method) && !rpcMeta._lockAcquired) {
+    let candidateLockTabId = null;
+    if (params.tabId !== undefined && params.tabId !== null && params.tabId !== '') {
+      const parsedId = Number(params.tabId);
+      if (Number.isSafeInteger(parsedId) && parsedId > 0) candidateLockTabId = parsedId;
+    } else if (method === 'batch' && Array.isArray(params.steps) && params.steps[0]?.tabId) {
+      const stepTid = Number(params.steps[0].tabId);
+      if (Number.isSafeInteger(stepTid) && stepTid > 0) candidateLockTabId = stepTid;
+    } else if (managedTabs.size === 1) {
+      candidateLockTabId = managedTabs.keys().next().value;
+    }
+    if (candidateLockTabId !== null) {
+      const ownerTok = rpcMeta._lockOwner || Symbol(`rpc:${method}`);
+      return await runWithPerTabRpcLock(candidateLockTabId, ownerTok, () =>
+        executeBridgeRpc(method, params, { ...rpcMeta, _lockOwner: ownerTok, _lockAcquired: true })
+      );
+    }
+  }
+
   const reqSignedAtMs = Number(rpcMeta?.signedAtMs) || 0;
   pushLocalAudit(method, { tabId: params.tabId, url: params.url, label: params.label });
 
@@ -3215,6 +3444,8 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
     const stepResults = [];
     let finalSnapshot = null;
     const pinnedEntries = new Map();
+    const batchLockOwner = rpcMeta._lockOwner || Symbol('batchRpcLock');
+    const activeBatchProfileId = typeof profileInstanceId === 'string' ? profileInstanceId : '';
 
     const ALLOWED_BATCH_ACTIONS = new Set([
       'open',
@@ -3240,7 +3471,12 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
           : currentTabId;
       const hasExplicitInitTab = initTabParam !== undefined && initTabParam !== null && initTabParam !== '';
       const initEntry = resolveTargetEntry(initTabParam);
-      assertGrantValidForRequest(initEntry, hasExplicitInitTab, reqSignedAtMs);
+      assertGrantValidForRequest(
+        initEntry,
+        hasExplicitInitTab,
+        reqSignedAtMs,
+        Number(firstRaw.grantSeq ?? params.grantSeq) || 0
+      );
       pinnedEntries.set(initEntry.tabId, initEntry);
       if (currentTabId === undefined) {
         currentTabId = initEntry.tabId;
@@ -3251,6 +3487,16 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
       const rawStep = steps[i];
       if (!rawStep || typeof rawStep !== 'object' || Array.isArray(rawStep)) {
         throw new Error(`Batch step ${i} must be an object`);
+      }
+      if (
+        typeof rawStep.profileInstanceId === 'string' &&
+        rawStep.profileInstanceId.trim() &&
+        activeBatchProfileId &&
+        rawStep.profileInstanceId.trim() !== activeBatchProfileId
+      ) {
+        throw new Error(
+          `[GUARDRAIL:PROFILE_SWITCHED] Target Chrome profile switched at batch step ${i}`
+        );
       }
       const action = String(rawStep.action || rawStep.method || rawStep.cmd || '').trim();
       if (!ALLOWED_BATCH_ACTIONS.has(action)) {
@@ -3293,7 +3539,11 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
         });
       }
 
-      const out = await executeBridgeRpc(action, stepParams, rpcMeta);
+      const out = await executeBridgeRpc(action, stepParams, {
+        ...rpcMeta,
+        _lockOwner: batchLockOwner,
+        _lockAcquired: false
+      });
       if (out && typeof out.tabId === 'number') {
         currentTabId = out.tabId;
         if (action !== 'done' && managedTabs.has(out.tabId) && !pinnedEntries.has(out.tabId)) {
@@ -3797,7 +4047,8 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
   assertGrantValidForRequest(
     entry,
     params.tabId !== undefined && params.tabId !== null && params.tabId !== '',
-    reqSignedAtMs
+    reqSignedAtMs,
+    Number(params.grantSeq) || 0
   );
 
   if (method === 'screenshot') {
@@ -3821,8 +4072,12 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
     await verifyEntryStillControllable(entry);
 
     if (entry.openDialog) {
+      entry.lastSnapshotMap = new Map();
+      entry.lastSnapshotToken = '';
       return {
         tabId: entry.tabId,
+        ...(profileInstanceId ? { profileInstanceId } : {}),
+        ...(entry.grantSeq ? { grantSeq: entry.grantSeq } : {}),
         title: entry.title || '',
         url: entry.url || '',
         elements: [],
@@ -3834,8 +4089,13 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
       };
     }
 
+    const snapToken =
+      typeof generateRandomHex === 'function'
+        ? generateRandomHex(8)
+        : Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, '0')).join('');
+
     const execRes = await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
-      func: (limit, customScopeSel) => {
+      func: (limit, customScopeSel, snapTok) => {
         const SELECTORS =
           'a[href], button, input, textarea, select, summary, [role="button"], [role="link"], [role="tab"], [role="textbox"], [role="searchbox"], [role="combobox"], [role="switch"], [role="radio"], [role="checkbox"], [role="option"], [role="menuitem"], [contenteditable]:not([contenteditable="false"]), label:has(input[type="radio"]), label:has(input[type="checkbox"])';
 
@@ -4130,6 +4390,16 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
           chosenNodes = visibleCandidates.slice(0, limit);
         }
 
+        const _remAttrFn = typeof Element !== 'undefined' ? Element.prototype.removeAttribute : null;
+        for (const staleNode of collectDeep(document, '[data-clive-idx], [data-clive-snap]')) {
+          try {
+            if (_remAttrFn && staleNode instanceof Element) {
+              _remAttrFn.call(staleNode, 'data-clive-idx');
+              _remAttrFn.call(staleNode, 'data-clive-snap');
+            }
+          } catch {}
+        }
+
         const elements = [];
         let idx = 0;
 
@@ -4140,6 +4410,9 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
             tagLower === 'label' ? node.querySelector('input[type="radio"], input[type="checkbox"]') : null;
 
           safeSetAttr(node, 'data-clive-idx', String(idx));
+          if (snapTok) {
+            safeSetAttr(node, 'data-clive-snap', String(snapTok));
+          }
           const inputType = tagLower === 'input' ? String(node.type || 'text').toLowerCase() : '';
           const autoAttr = String(safeGetAttr(node, 'autocomplete') || '').toLowerCase();
           const roleAttr = String(safeGetAttr(node, 'role') || '').trim().toLowerCase();
@@ -4528,13 +4801,36 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
           excerpt
         };
       },
-      args: [maxItems, scopeSelector]
+      args: [maxItems, scopeSelector, snapToken]
     });
+
+    const snapPayload = execRes?.[0]?.result || {};
+    const snapMap = new Map();
+    if (Array.isArray(snapPayload.elements)) {
+      for (const elItem of snapPayload.elements) {
+        if (elItem && typeof elItem.index === 'number') {
+          snapMap.set(elItem.index, {
+            snapToken,
+            tag: String(elItem.tag || '').toLowerCase(),
+            inputType: String(elItem.type || '').toLowerCase(),
+            role: String(elItem.role || '').toLowerCase(),
+            label: String(elItem.label || '').slice(0, 90)
+          });
+        }
+      }
+    }
+    entry.lastSnapshotToken = snapToken;
+    entry.lastSnapshotMap = snapMap;
 
     await verifyEntryStillControllable(entry);
     await captureQuickFrame(entry.tabId, entry);
     notifyPanelAndDaemon();
-    return { tabId: entry.tabId, ...(execRes?.[0]?.result || {}) };
+    return {
+      tabId: entry.tabId,
+      ...(profileInstanceId ? { profileInstanceId } : {}),
+      ...(entry.grantSeq ? { grantSeq: entry.grantSeq } : {}),
+      ...snapPayload
+    };
   }
 
   if (method === 'click') {
@@ -4542,7 +4838,15 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
     if (typeof target !== 'number' && typeof target !== 'string') {
       throw new Error('[GUARDRAIL] click target must be an element index (number) or selector/label (string)');
     }
-    if (typeof target === 'string') {
+    let expectedSnapMeta = null;
+    if (typeof target === 'number') {
+      if (!(entry.lastSnapshotMap instanceof Map) || !entry.lastSnapshotMap.has(target)) {
+        throw new Error(
+          `[GUARDRAIL:ELEMENT_IDENTITY_MISMATCH] Snapshot index [${target}] has no active fingerprint on tab #${entry.tabId}; run snapshot first`
+        );
+      }
+      expectedSnapMeta = entry.lastSnapshotMap.get(target);
+    } else if (typeof target === 'string') {
       assertSafeModelSelector(target);
     }
     entry.activity = tr().clicking(typeof target === 'number' ? `[${target}]` : String(target).slice(0, 24));
@@ -4578,7 +4882,7 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
     let clickTimer = null;
     const execRes = await Promise.race([
       chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
-      func: async (tgt, isTabActiveFg) => {
+      func: async (tgt, isTabActiveFg, expectedMeta = null) => {
         function getOpenShadow(n) {
           if (!n) return null;
           try {
@@ -4943,8 +5247,40 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
         if (!el) return { ok: false, error: `Element not found for target: ${tgt}` };
         const elTagLower = safeTagLower(el);
         const elInputType = elTagLower === 'input' ? String(el.type || 'text').toLowerCase() : '';
+        const elExplicitType = String(safeGetAttr(el, 'type') || '').toLowerCase();
         const elAutoAttr = String(safeGetAttr(el, 'autocomplete') || '').toLowerCase();
         const elRoleAttr = String(safeGetAttr(el, 'role') || '').trim().toLowerCase();
+        if (typeof tgt === 'number' && expectedMeta && typeof expectedMeta === 'object') {
+          const domSnapTok = String(safeGetAttr(el, 'data-clive-snap') || '');
+          if (expectedMeta.snapToken && domSnapTok !== expectedMeta.snapToken) {
+            return {
+              ok: false,
+              error: `[GUARDRAIL:ELEMENT_IDENTITY_MISMATCH] Element [${tgt}] snapshot token tampered or replaced by page script`
+            };
+          }
+          if (expectedMeta.tag && elTagLower !== expectedMeta.tag) {
+            return {
+              ok: false,
+              error: `[GUARDRAIL:ELEMENT_IDENTITY_MISMATCH] Element [${tgt}] tag mutated from <${expectedMeta.tag}> to <${elTagLower}>`
+            };
+          }
+          if ((expectedMeta.role || '') !== elRoleAttr) {
+            return {
+              ok: false,
+              error: `[GUARDRAIL:ELEMENT_IDENTITY_MISMATCH] Element [${tgt}] role mutated from "${expectedMeta.role || ''}" to "${elRoleAttr}"`
+            };
+          }
+          if (
+            (elTagLower === 'input' || elTagLower === 'button') &&
+            (expectedMeta.inputType || '') !== elExplicitType &&
+            /^(?:submit|file|password|reset)$/i.test(elExplicitType || elInputType)
+          ) {
+            return {
+              ok: false,
+              error: `[GUARDRAIL:ELEMENT_IDENTITY_MISMATCH] Element [${tgt}] type mutated to "${elExplicitType || elInputType}"`
+            };
+          }
+        }
         let elHasTextSecurity = false;
         if (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function' && typeof Element !== 'undefined' && el instanceof Element) {
           const elCs = window.getComputedStyle(el);
@@ -4986,6 +5322,17 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
           const dLabel = safeElemLabel(60);
           return { ok: false, error: `Element is disabled: ${dLabel}` };
         }
+        if (typeof tgt === 'number' && expectedMeta && typeof expectedMeta === 'object') {
+          const HIGH_RISK_ACTION_RX =
+            /(?:delete|remove|destroy|pay\b|purchase|buy\s+now|checkout|place\s+order|transfer|withdraw|authorize|approve|grant\s+access|confirm\s+payment|submit\s+order|删除|移除|销毁|立即支付|确认支付|付款|立即购买|提交订单|转账|提现|确认授权|允许访问)/i;
+          const curLiveLabel = safeElemLabel(90);
+          if (!HIGH_RISK_ACTION_RX.test(String(expectedMeta.label || '')) && HIGH_RISK_ACTION_RX.test(curLiveLabel)) {
+            return {
+              ok: false,
+              error: `[GUARDRAIL:ELEMENT_IDENTITY_MISMATCH] Element [${tgt}] label mutated into high-risk action: ${curLiveLabel}`
+            };
+          }
+        }
         el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
         const rect = el.getBoundingClientRect();
 
@@ -4996,6 +5343,48 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
         const safeSpanY = Math.max(0, Math.min(rect.height * 0.36, rect.height - 6));
         const cx = Math.round((rect.left + rect.width / 2 + g1 * safeSpanX) * 10) / 10;
         const cy = Math.round((rect.top + rect.height / 2 + g2 * safeSpanY) * 10) / 10;
+
+        if (
+          typeof document.elementFromPoint === 'function' &&
+          rect.width >= 4 &&
+          rect.height >= 4 &&
+          cx >= 0 &&
+          cy >= 0 &&
+          cx <= (window.innerWidth || 99999) &&
+          cy <= (window.innerHeight || 99999)
+        ) {
+          const hudHost = window.__chromeLiveHudController__?.hostEl || null;
+          const prevPe = hudHost ? hudHost.style.pointerEvents : '';
+          if (hudHost) hudHost.style.pointerEvents = 'none';
+          let topHit = null;
+          try {
+            topHit = document.elementFromPoint(cx, cy);
+          } catch {}
+          if (hudHost) hudHost.style.pointerEvents = prevPe;
+          if (topHit && topHit instanceof Element && !safeClosest(topHit, '[data-chrome-live-hud]')) {
+            const isRelatedTarget = (a, b) => {
+              if (!a || !b) return true;
+              if (a === b || a.contains(b) || b.contains(a)) return true;
+              if (a.tagName === 'LABEL' && a.control === b) return true;
+              if (b.tagName === 'LABEL' && b.control === a) return true;
+              let cur = a;
+              for (let d = 0; cur && d < 8; d++) {
+                const rn = safeRoot(cur);
+                const host = rn && rn.host ? rn.host : null;
+                if (!host) break;
+                if (host === b || host.contains(b) || b.contains(host)) return true;
+                cur = host;
+              }
+              return false;
+            };
+            if (!isRelatedTarget(topHit, el)) {
+              return {
+                ok: false,
+                error: `[GUARDRAIL:CLICK_OCCLUDED] Target element is covered by overlay <${safeTagLower(topHit)}>`
+              };
+            }
+          }
+        }
 
         const isVisibleForeground = Boolean(isTabActiveFg) && !document.hidden && rect.width >= 4 && rect.height >= 4;
         const ctrl = window.__chromeLiveHudController__;
@@ -5066,7 +5455,7 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
           learnedSelector
         };
       },
-      args: [target, clickTabForeground]
+      args: [target, clickTabForeground, expectedSnapMeta]
     }),
       new Promise((resolve) => {
         clickTimer = setTimeout(() => {
@@ -5245,7 +5634,15 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
     if (typeof text !== 'string') {
       throw new Error('type text must be a string');
     }
-    if (typeof target === 'string') {
+    let expectedTypeMeta = null;
+    if (typeof target === 'number') {
+      if (!(entry.lastSnapshotMap instanceof Map) || !entry.lastSnapshotMap.has(target)) {
+        throw new Error(
+          `[GUARDRAIL:ELEMENT_IDENTITY_MISMATCH] Snapshot index [${target}] has no active fingerprint on tab #${entry.tabId}; run snapshot first`
+        );
+      }
+      expectedTypeMeta = entry.lastSnapshotMap.get(target);
+    } else if (typeof target === 'string') {
       assertSafeModelSelector(target);
     }
     entry.lastHandledDialog = null;
@@ -5262,7 +5659,7 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
 
     const typeTabForeground = await isTabTrulyForeground(entry.tabId);
     const execRes = await chrome.scripting.executeScript({ target: { tabId: entry.tabId  }, injectImmediately: true,
-      func: async (tgt, val, shouldSubmit, isTabActiveFg) => {
+      func: async (tgt, val, shouldSubmit, isTabActiveFg, expectedMeta = null) => {
         function getOpenShadow(n) {
           if (!n) return null;
           try {
@@ -5454,7 +5851,32 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
         let el = null;
         if (typeof tgt === 'number') {
           const hit = queryDeep(document, `[data-clive-idx="${tgt}"]`);
-          if (isValidTypeTarget(hit)) el = hit;
+          if (isValidTypeTarget(hit)) {
+            if (expectedMeta && typeof expectedMeta === 'object') {
+              const domSnapTok = String(safeGetAttr(hit, 'data-clive-snap') || '');
+              const hitTag = safeTagLower(hit);
+              const hitRole = String(safeGetAttr(hit, 'role') || '').trim().toLowerCase();
+              if (expectedMeta.snapToken && domSnapTok !== expectedMeta.snapToken) {
+                return {
+                  ok: false,
+                  error: `[GUARDRAIL:ELEMENT_IDENTITY_MISMATCH] Input [${tgt}] snapshot token tampered by page script`
+                };
+              }
+              if (expectedMeta.tag && hitTag !== expectedMeta.tag) {
+                return {
+                  ok: false,
+                  error: `[GUARDRAIL:ELEMENT_IDENTITY_MISMATCH] Input [${tgt}] tag mutated from <${expectedMeta.tag}> to <${hitTag}>`
+                };
+              }
+              if ((expectedMeta.role || '') !== hitRole) {
+                return {
+                  ok: false,
+                  error: `[GUARDRAIL:ELEMENT_IDENTITY_MISMATCH] Input [${tgt}] role mutated from "${expectedMeta.role || ''}" to "${hitRole}"`
+                };
+              }
+            }
+            el = hit;
+          }
         } else if (typeof tgt === 'string') {
           const raw = tgt.trim();
           if (raw) {
@@ -5786,12 +6208,13 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
         const cmHost = safeClosest(el, '.CodeMirror');
         let cmTargetToken = '';
         if (cmHost) {
-          cmTargetToken = `cm-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+          const cmRand = Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, '0')).join('');
+          cmTargetToken = `cm-${Date.now()}-${cmRand}`;
           Element.prototype.setAttribute.call(cmHost, 'data-clive-cm-target', cmTargetToken);
         }
         return { ok: true, x: cx, y: cy, learnedSelector, learnedName, cmTargetToken };
       },
-      args: [target, String(text ?? ''), Boolean(submit), typeTabForeground]
+      args: [target, String(text ?? ''), Boolean(submit), typeTabForeground, expectedTypeMeta]
     });
 
     const out = execRes?.[0]?.result;
@@ -5867,7 +6290,21 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
       const fStr = String(rawFile || '').trim();
       const withoutDrive = fStr.replace(/^[A-Za-z]:/, '');
       const base = fStr.split(/[\\/]/).pop()?.replace(/[.\s]+$/, '') || '';
-      if (!base || withoutDrive.includes(':') || EXT_SENSITIVE_BASE_RX.test(base)) {
+      let decBase = base;
+      if (fStr.includes('%')) {
+        try {
+          decBase = decodeURIComponent(base).replace(/[.\s]+$/, '');
+        } catch {}
+      }
+      const nfkcBase = decBase.normalize('NFKC');
+      if (
+        !base ||
+        withoutDrive.includes(':') ||
+        /[\x00-\x1f\x7f\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/.test(fStr) ||
+        EXT_SENSITIVE_BASE_RX.test(base) ||
+        EXT_SENSITIVE_BASE_RX.test(decBase) ||
+        EXT_SENSITIVE_BASE_RX.test(nfkcBase)
+      ) {
         throw new Error(`[GUARDRAIL] Blocked sensitive or malformed upload path: ${base || 'invalid'}`);
       }
     }
@@ -6347,6 +6784,8 @@ async function executeBridgeRpc(method, params, rpcMeta = {}) {
     await verifyEntryStillControllable(entry);
     // Pre-stop any active screencast BEFORE navigating so transitional frames on pages embedding protected frames are never streamed
     await stopCdpForTab(entry.tabId, entry);
+    entry.lastSnapshotMap = null;
+    entry.lastSnapshotToken = '';
     entry.activity = tr().navigating;
     entry.navigating = true;
     try {
@@ -6565,6 +7004,145 @@ chrome.debugger.onDetach.addListener(async (source, reason) => {
   }
 });
 
+const DERIVED_CHILD_TTL_MS = 20000;
+
+function trackDerivedChildTab(childTabId, openerTabId) {
+  if (typeof childTabId !== 'number' || typeof openerTabId !== 'number') return;
+  const now = Date.now();
+  for (const [cid, meta] of Array.from(derivedChildTabs.entries())) {
+    if (!meta || now - meta.createdAt > DERIVED_CHILD_TTL_MS) {
+      derivedChildTabs.delete(cid);
+    }
+  }
+  derivedChildTabs.set(childTabId, { openerTabId, createdAt: now });
+}
+
+async function inspectAndGuardDerivedChildTab(childTabId, rawUrl, openerTabId, viaEvent = 'popup') {
+  if (typeof childTabId !== 'number' || !rawUrl || rawUrl === 'about:blank') return false;
+  const safety = checkTabUrlAllowed(rawUrl);
+  if (!safety.allowed) {
+    derivedChildTabs.delete(childTabId);
+    managedTabs.delete(childTabId);
+    await chrome.tabs.remove(childTabId).catch(() => {});
+    const reason = `Derived popup blocked (${viaEvent}): ${safety.reason}`;
+    pushLocalAudit(
+      'derived_popup_blocked',
+      { openerTabId, childTabId, url: rawUrl, reason: safety.reason, via: viaEvent },
+      'blocked'
+    );
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: 'guardrail_trip',
+          tabId: openerTabId,
+          childTabId,
+          url: redactAuditUrl(rawUrl),
+          reason
+        })
+      );
+    }
+    return true;
+  }
+  return false;
+}
+
+if (chrome.tabs?.onCreated) {
+  chrome.tabs.onCreated.addListener(async (newTab) => {
+    if (!newTab || typeof newTab.id !== 'number') return;
+    const openerId = typeof newTab.openerTabId === 'number' ? newTab.openerTabId : null;
+    if (openerId !== null && managedTabs.has(openerId)) {
+      trackDerivedChildTab(newTab.id, openerId);
+      const initUrl = newTab.pendingUrl || newTab.url || '';
+      if (initUrl && initUrl !== 'about:blank') {
+        await inspectAndGuardDerivedChildTab(newTab.id, initUrl, openerId, 'tabs.onCreated');
+      }
+    }
+  });
+}
+
+if (chrome.webNavigation?.onCreatedNavigationTarget) {
+  chrome.webNavigation.onCreatedNavigationTarget.addListener(async (details) => {
+    if (!details || typeof details.tabId !== 'number' || typeof details.sourceTabId !== 'number') return;
+    await ensureSwInitialized();
+    if (managedTabs.has(details.sourceTabId)) {
+      trackDerivedChildTab(details.tabId, details.sourceTabId);
+      if (details.url && details.url !== 'about:blank') {
+        await inspectAndGuardDerivedChildTab(
+          details.tabId,
+          details.url,
+          details.sourceTabId,
+          'onCreatedNavigationTarget'
+        );
+      }
+    }
+  });
+}
+
+if (chrome.tabs?.onReplaced) {
+  chrome.tabs.onReplaced.addListener(async (addedTabId, removedTabId) => {
+    await ensureSwInitialized();
+    derivedChildTabs.delete(removedTabId);
+    if (!managedTabs.has(removedTabId)) return;
+    const prevEntry = managedTabs.get(removedTabId);
+    lastAnyTabRevokedAt = Math.max(Date.now(), lastAnyTabRevokedAt);
+    await stopCdpForTab(removedTabId, prevEntry);
+    managedTabs.delete(removedTabId);
+    if (typeof syncTabActionBadge === 'function') syncTabActionBadge(removedTabId);
+    rememberDetachedTab(removedTabId, 'Replaced by browser prerender', false);
+
+    const nextTab = await chrome.tabs.get(addedTabId).catch(() => null);
+    const nextUrl = nextTab?.pendingUrl || nextTab?.url || '';
+    const nextSafety = checkTabUrlAllowed(nextUrl);
+    let sameOrigin = false;
+    try {
+      if (prevEntry?.url && nextUrl) {
+        sameOrigin = new URL(prevEntry.url).origin === new URL(nextUrl).origin;
+      }
+    } catch {}
+    if (!nextTab || !nextSafety.allowed || !sameOrigin) {
+      if (prevEntry?.substate === 'worker' && !prevEntry.relayPopoutWinId) {
+        await chrome.tabs.remove(addedTabId).catch(() => {});
+      } else if (typeof syncTabActionBadge === 'function') {
+        syncTabActionBadge(addedTabId);
+      }
+      pushLocalAudit(
+        'tab_replaced_revoked',
+        {
+          removedTabId,
+          addedTabId,
+          url: nextUrl,
+          reason: !nextSafety.allowed ? nextSafety.reason : 'Cross-origin prerender replacement'
+        },
+        'blocked'
+      );
+      await syncLiveTabGroups();
+      notifyPanelAndDaemon();
+      return;
+    }
+
+    const migratedEntry = {
+      ...prevEntry,
+      tabId: addedTabId,
+      ...allocateTabGrant(),
+      replacedTabId: removedTabId,
+      attachedCdp: false,
+      screencastActive: false,
+      lastSnapshotMap: null,
+      lastSnapshotToken: '',
+      title: nextTab.title || prevEntry.title || '',
+      url: nextTab.url || nextUrl
+    };
+    managedTabs.set(addedTabId, migratedEntry);
+    await syncHud(addedTabId, {
+      visible: true,
+      mode: migratedEntry.paused ? 'paused' : migratedEntry.uiMode || 'working',
+      activity: migratedEntry.activity
+    });
+    await syncLiveTabGroups();
+    notifyPanelAndDaemon();
+  });
+}
+
 async function handleWebNavGuardrail(details) {
   if (!details || typeof details.tabId !== 'number') return;
   // Synchronous pre-await kill switch for already-loaded managedTabs so concurrent `Page.screencastFrame` drops at 0us!
@@ -6584,7 +7162,17 @@ async function handleWebNavGuardrail(details) {
     }
   }
   await ensureSwInitialized();
-  if (!managedTabs.has(details.tabId)) return;
+  if (!managedTabs.has(details.tabId)) {
+    const derivedMeta = derivedChildTabs.get(details.tabId);
+    if (derivedMeta && Date.now() - derivedMeta.createdAt <= DERIVED_CHILD_TTL_MS) {
+      if (details.url && details.url !== 'about:blank' && !(details.frameId !== 0 && isPassiveTelemetrySubframeUrl(details.url))) {
+        await inspectAndGuardDerivedChildTab(details.tabId, details.url, derivedMeta.openerTabId, 'webNavigation');
+      }
+    } else if (derivedMeta) {
+      derivedChildTabs.delete(details.tabId);
+    }
+    return;
+  }
   if (!details.url || details.url === 'about:blank') return;
   if (details.frameId !== 0 && isPassiveTelemetrySubframeUrl(details.url)) return;
   const safety = checkTabUrlAllowed(details.url);
@@ -6637,8 +7225,23 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (tab?.active && (changeInfo.url || changeInfo.title || changeInfo.status === 'complete')) {
     chrome.runtime.sendMessage({ type: 'sw:state_updated' }).catch(() => {});
   }
-  if (!managedTabs.has(tabId)) return;
+  if (!managedTabs.has(tabId)) {
+    const derivedMeta = derivedChildTabs.get(tabId);
+    if (derivedMeta && Date.now() - derivedMeta.createdAt <= DERIVED_CHILD_TTL_MS) {
+      const childCandidateUrl = changeInfo.url || tab?.pendingUrl || tab?.url || '';
+      if (childCandidateUrl && childCandidateUrl !== 'about:blank') {
+        await inspectAndGuardDerivedChildTab(tabId, childCandidateUrl, derivedMeta.openerTabId, 'tabs.onUpdated');
+      }
+    } else if (derivedMeta) {
+      derivedChildTabs.delete(tabId);
+    }
+    return;
+  }
   const entry = managedTabs.get(tabId);
+  if (changeInfo.url && changeInfo.url !== entry.url) {
+    entry.lastSnapshotMap = null;
+    entry.lastSnapshotToken = '';
+  }
   if (changeInfo.url || tab?.pendingUrl || changeInfo.status === 'complete') {
     entry.title = tab.title || entry.title;
     entry.url = tab.url || entry.url;
@@ -6781,6 +7384,7 @@ async function autoMergeClosedRelayTab(closedEntry) {
 }
 
 chrome.tabs.onRemoved.addListener(async (tabId, removeInfo) => {
+  derivedChildTabs.delete(tabId);
   await ensureSwInitialized();
   if (managedTabs.has(tabId)) {
     const entry = managedTabs.get(tabId);
@@ -6898,6 +7502,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           entry.paused = true;
           entry.uiMode = 'paused';
           entry.activity = currentLang === 'zh' ? '已暂停 · 人工接管中' : 'Paused · Manual control';
+          if (typeof syncTabActionBadge === 'function') syncTabActionBadge(senderTabId);
           await stopCdpForTab(senderTabId, entry);
           await syncLiveTabGroups();
           notifyPanelAndDaemon();
@@ -6909,6 +7514,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             entry.paused = false;
             entry.uiMode = 'working';
             entry.activity = currentLang === 'zh' ? '已恢复锁定操控' : 'Resumed automation';
+            if (typeof syncTabActionBadge === 'function') syncTabActionBadge(senderTabId);
             await syncLiveTabGroups();
             notifyPanelAndDaemon();
             await persistSessionState();
@@ -7116,6 +7722,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === 'panel:clear_audit') {
       localAudit = [];
       sendResponse({ ok: true });
+      return;
+    }
+    if (msg.type === 'panel:copy_token_concealed') {
+      if (!bridgeConfig.token || !wsAuthed) {
+        sendResponse({ ok: false });
+        return;
+      }
+      try {
+        const r = await signedDaemonFetch('/api/copy-token', 'POST', {});
+        const json = await r.json();
+        sendResponse({ ok: Boolean(json?.ok) });
+      } catch {
+        sendResponse({ ok: false });
+      }
       return;
     }
     if (msg.type === 'panel:detach_tab') {

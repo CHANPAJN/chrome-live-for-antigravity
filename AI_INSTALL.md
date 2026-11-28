@@ -24,6 +24,11 @@
    cd chrome-live-for-antigravity-main
    ```
    *(Zero `npm install` is needed — the project uses 100% Node.js standard library modules with zero external dependencies.)*
+3. **Supply-Chain Verification Gate (Mandatory before running any script):**
+   Verify that `package.json` contains **zero** external `dependencies`, `devDependencies`, or lifecycle install hooks, and **never** run `npm install`:
+   ```bash
+   node -e "const p=JSON.parse(require('fs').readFileSync('package.json','utf8')); if(p.dependencies||p.devDependencies||p.scripts?.postinstall||p.scripts?.preinstall) process.exit(1); console.log('Supply-chain check: OK (zero npm dependencies)');"
+   ```
 
 ---
 
@@ -57,7 +62,7 @@ Modern stable Chrome (`137+` / `157+`) disables `--load-extension` CLI flags for
 3. Click **Load unpacked** (加载已解压的扩展程序) — or drag and drop the folder — and select:
    `<ABSOLUTE_PATH_TO_REPO>/extension`
 
-*(Because `setup` already wrote `extension/.local-runtime.json`, the extension pairs with `127.0.0.1:28196` automatically as soon as it is loaded — no manual token copy-paste required.)*
+*(Because `setup` already wrote `extension/.local-runtime.json`, the extension pairs with `127.0.0.1:28196` automatically as soon as it is loaded — no manual token copy-paste required. Never read or print `~/.chrome-live-antigravity/auth.token` or `extension/.local-runtime.json` into the chat transcript.)*
 
 ---
 

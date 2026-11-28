@@ -736,8 +736,11 @@
             }
           };
           try {
+            const lockHex = Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) =>
+              b.toString(16).padStart(2, '0')
+            ).join('');
             navigator.locks
-              .request(`clive_active_${Math.random().toString(36).slice(2, 10)}`, () => p)
+              .request(`clive_active_${lockHex}`, () => p)
               .catch(() => {});
           } catch {
             this._releaseFreezeLock = null;

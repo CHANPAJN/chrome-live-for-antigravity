@@ -1081,11 +1081,25 @@ els.toggleTokenVisBtn.addEventListener('click', () => {
   els.tokenInput.type = els.tokenInput.type === 'password' ? 'text' : 'password';
 });
 
+let clipboardScrubTimer = null;
+
 els.copyTokenBtn.addEventListener('click', async () => {
   const val = els.tokenInput.value.trim();
   if (!val) return;
   try {
-    await navigator.clipboard.writeText(val);
+    const concealed = await sendSw('panel:copy_token_concealed', { token: val }).catch(() => null);
+    if (!concealed || !concealed.ok) {
+      await navigator.clipboard.writeText(val);
+    }
+    if (clipboardScrubTimer) clearTimeout(clipboardScrubTimer);
+    // Auto-scrub pairing secret from clipboard after 20s so transient paste succeeds without permanent clipboard exposure
+    clipboardScrubTimer = setTimeout(async () => {
+      clipboardScrubTimer = null;
+      try {
+        const cur = await navigator.clipboard.readText();
+        if (cur === val) await navigator.clipboard.writeText('');
+      } catch {}
+    }, 20000);
     showToast(t().toastCopied);
   } catch {}
 });

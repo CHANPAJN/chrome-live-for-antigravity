@@ -593,9 +593,20 @@ function splitBalancedUrlSuffix(rawMatch) {
   return { coreUrl: rawMatch.slice(0, end), suffix: rawMatch.slice(end) };
 }
 
+const INLINE_BEARER_OR_SECRET_RX =
+  /\b(Bearer\s+)[A-Za-z0-9._~+/=-]{16,}|\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,}|sk-(?:live-|proj-|ant-)?[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{31,})\b/gi;
+
 export function redactUrlsInText(rawText) {
-  if (typeof rawText !== 'string' || !/https?:\/\//i.test(rawText)) return rawText;
-  return rawText.replace(/https?:\/\/[^\s"'<>`\u3000-\u303f\uff00-\uffef\u4e00-\u9fff]+/gi, (match) => {
+  if (typeof rawText !== 'string' || !rawText) return rawText;
+  let out = rawText;
+  if (INLINE_BEARER_OR_SECRET_RX.test(out)) {
+    INLINE_BEARER_OR_SECRET_RX.lastIndex = 0;
+    out = out.replace(INLINE_BEARER_OR_SECRET_RX, (_m, bearerPrefix) =>
+      bearerPrefix ? `${bearerPrefix}REDACTED` : 'REDACTED'
+    );
+  }
+  if (!/https?:\/\//i.test(out)) return out;
+  return out.replace(/https?:\/\/[^\s"'<>`\u3000-\u303f\uff00-\uffef\u4e00-\u9fff]+/gi, (match) => {
     const { coreUrl, suffix } = splitBalancedUrlSuffix(match);
     return redactUrlForAudit(coreUrl) + suffix;
   });
@@ -792,14 +803,35 @@ export function evaluateUploadFileSafety(rawFilePath, options = {}) {
       reason: 'Network UNC paths are blocked by local guardrails'
     };
   }
-  // Reject NTFS Alternate Data Streams (`file.env::$DATA`), control chars, or trailing dots/spaces used to evade basename regexes
+  // Reject NTFS Alternate Data Streams (`file.env::$DATA`), zero-width/control chars, or percent-encoded path traversal/evasion (`%2e%2e`, `%69d_rsa`)
   const withoutDrive = rawTrimmed.replace(/^[A-Za-z]:/, '');
-  if (withoutDrive.includes(':') || /[\x00-\x1f]/.test(rawTrimmed) || /[.\s]$/.test(rawTrimmed)) {
+  if (
+    withoutDrive.includes(':') ||
+    /[\x00-\x1f\x7f\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/.test(rawTrimmed) ||
+    /[.\s]$/.test(rawTrimmed)
+  ) {
     return {
       allowed: false,
       code: 'INVALID_FILE',
-      reason: 'File path contains restricted stream syntax, control characters, or trailing dots/spaces'
+      reason: 'File path contains restricted stream syntax, control/zero-width characters, or trailing dots/spaces'
     };
+  }
+  let pctDecodedRaw = rawTrimmed;
+  if (rawTrimmed.includes('%')) {
+    try {
+      pctDecodedRaw = decodeURIComponent(rawTrimmed);
+    } catch {}
+  }
+  const nfkcRaw = pctDecodedRaw.normalize('NFKC');
+  if (/(?:^|[\\/])\.\.(?:[\\/]|$)/.test(pctDecodedRaw) || /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(nfkcRaw)) {
+    const pctBase = path.basename(nfkcRaw).replace(/[.\s]+$/, '');
+    if (SENSITIVE_FILE_NAME_RX.test(pctBase) || SENSITIVE_FILE_DIR_RX.test(nfkcRaw.replace(/\\/g, '/'))) {
+      return {
+        allowed: false,
+        code: 'SENSITIVE_FILE',
+        reason: 'Encoded sensitive file path is blocked by local guardrails'
+      };
+    }
   }
 
   const expandedPath = expandLeadingTilde(rawTrimmed);
@@ -829,14 +861,24 @@ export function evaluateUploadFileSafety(rawFilePath, options = {}) {
   for (const candidate of realPath === resolvedPath ? [resolvedPath] : [resolvedPath, realPath]) {
     const normalized = candidate.replace(/\\/g, '/');
     const baseName = path.basename(candidate).replace(/[.\s]+$/, '');
-    if (SENSITIVE_FILE_NAME_RX.test(baseName)) {
+    let decodedBase = baseName;
+    let decodedNorm = normalized;
+    if (candidate.includes('%')) {
+      try {
+        decodedNorm = decodeURIComponent(normalized);
+        decodedBase = path.basename(decodedNorm).replace(/[.\s]+$/, '');
+      } catch {}
+    }
+    const nfkcBase = decodedBase.normalize('NFKC');
+    const nfkcNorm = decodedNorm.normalize('NFKC');
+    if (SENSITIVE_FILE_NAME_RX.test(baseName) || SENSITIVE_FILE_NAME_RX.test(decodedBase) || SENSITIVE_FILE_NAME_RX.test(nfkcBase)) {
       return {
         allowed: false,
         code: 'SENSITIVE_FILE',
         reason: `Uploading sensitive credential or key file "${baseName}" is blocked by local guardrails`
       };
     }
-    if (SENSITIVE_FILE_DIR_RX.test(normalized)) {
+    if (SENSITIVE_FILE_DIR_RX.test(normalized) || SENSITIVE_FILE_DIR_RX.test(decodedNorm) || SENSITIVE_FILE_DIR_RX.test(nfkcNorm)) {
       return {
         allowed: false,
         code: 'SENSITIVE_FILE',
@@ -957,6 +999,12 @@ export function assertSafeAutomationSelector(rawSelector) {
   }
   const s = rawSelector.trim();
   if (!s) return;
+  if (/[\x00-\x1f\x7f\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/.test(s)) {
+    throw new Error('[GUARDRAIL] Control and zero-width characters are blocked in automation selectors');
+  }
+  if (/[\uFF01-\uFF5E]/.test(s)) {
+    throw new Error('[GUARDRAIL] Fullwidth compatibility syntax characters are blocked in automation selectors');
+  }
   if (s.includes('\\') || s.includes('/*') || s.includes('*/')) {
     throw new Error('[GUARDRAIL] CSS escape sequences and comments are blocked in automation selectors');
   }
